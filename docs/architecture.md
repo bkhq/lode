@@ -1,0 +1,615 @@
+# lode architecture
+
+**English** · [中文](architecture.zh-CN.md)
+
+> A general-purpose "update + launch" component: a **small static Rust binary** (a few MB), language-agnostic.
+> It verifies **file integrity (sha256)** and **publisher identity (ed25519 / ECDSA signature)**, then launches and manages the service, supporting seamless hot-update and rollback.
+> Universal image = `zzci/ubase` + the lode binary (no language runtime required; the runtime, if any, is downloaded and cached at boot); one instance = **single program, single channel**.
+
+This document describes how lode works: its model, behaviour, file formats and configuration.
+
+---
+
+## 1. Goals and positioning
+
+- **loader (lode)**: a fixed, unchanging "update + launch" component, compiled into a small static binary, baked into the universal image once and never rebuilt. Responsibilities: configuration → PID lock → decide which version to run → download/**verify (integrity + identity)**/install when necessary → atomic activation → launch and **manage the service** as a **child process** → hot-update/rollback per policy → communicate with the app via **`state.json`**.
+- **app**: a program in any language, packaged and signed by a trusted publisher, published to a manifest; lode runs it after verification passes. **lode is not tied to the application language** (how it runs is specified by `[command]` in `lode.toml`).
+- **Footprint**: lode is a static musl binary of a few MB that runs on **any** base (scratch, distroless, or a fuller image like `zzci/ubase`).
+- **Relationship**: `universal image (zzci/ubase + lode)` + `remote manifest/signed packages` → on container start, verify and run the application per policy. Switching apps = switching `[update].manifest` (env `LODE_MANIFEST`), with zero image rebuilds.
+
+### Design principles
+
+1. **Single program, follows a single channel**: one lode manages exactly one app; a manifest may define **multiple channels** (`[channels.*]`), and a lode instance **follows one of them** per `LODE_CHANNEL`; a version exposes **named assets**, and the operator picks the exact one for this host by filename (`[update].asset`) — no platform detection.
+2. **Three-file division of labor**: `lode.toml` (local TOML, pure configuration, **the app does not write it**), `state.json` (local JSON, **written by both lode and app**, the communication hub), `manifest.json` (**remote JSON**, not persisted locally). The app communicates with lode by **reading/writing `state.json`** (reads `available`, writes `target`/`restart_nonce`); other realtime/RPC communication is out-of-band and handled by the app itself. See §7.
+3. **Download driven by the manifest, run driven by lode.toml**: an artifact's `format` determines how it lands on disk; the run commands `run`/`exec` (+ optional `[runtime]`) are written in lode.toml, with **no `kind`**.
+4. **Never jump versions on its own**: only download the latest when no installed version exists locally; if a version exists, start the existing version first, and leave updates to policy and app/CLI triggers.
+5. **Two-layer verification**: integrity (sha256) + publisher identity (ed25519 by default, or ECDSA P-256/P-384), enforced per `trust.require_signature`.
+6. **Child-process launch + service management**: lode always spawns and supervises as a child process, providing start/stop/restart/status; readiness/stop handshakes avoid killing the process prematurely.
+7. **Unified configuration**: `CLI > environment variables (LODE_*) > lode.toml (TOML) > defaults`.
+8. **Private sources**: `[http].headers` pass through authentication; private keys/credentials never go into the image.
+9. **One binary, three crates**: `lode-core` and `lode-supervisor` are embeddable libraries; `lode` is the binary built on them (see §14).
+
+---
+
+## 2. Overall architecture
+
+```
+universal image (built once)      ┌──────────────────────────────────┐
+zzci/ubase                        │  lode (static Rust binary, a few MB) │
+                                  └────────────────┬─────────────────┘
+                  lode.toml (local config) │ read CLI / env / lode.toml
+                                           ▼
+   update.manifest ──HTTPS(+headers)──► remote manifest.json (channels + versions→assets[name])
+                                           │  (remote, not persisted locally)
+                       ┌───────────────────┼────────────────────────────┐
+                       ▼                   ▼                            ▼
+              select asset by filename ([update].asset)  download → verify sha256 + ed25519   trusted public key
+                       │                            │ all pass → land/unpack per format
+                       ▼                            ▼
+            current ─► versions/<ver>  (rename = atomic switch; metadata stored per version for offline use)
+                       │
+                       ▼
+            lode spawns and manages as a child process:  <lode.toml [command].run/exec>  (start/stop/restart/hot-update/rollback)
+                       │                        ▲
+            $LODE_DIR/state.json (written by lode+app) │ poll state.json mtime
+                       └────────► app ◄───────────┘ app reads state.available as a hint / writes state.target|restart_nonce to trigger
+```
+
+---
+
+## 3. Runtime form: one small static binary
+
+- lode is a **single static binary**: `*-unknown-linux-musl` with `+crt-static` on Linux (x86_64 / aarch64), plus macOS builds (x86_64 / arm64). There is also a Windows build (x86_64); what differs there is listed in [operations](operations.md#windows).
+- **Image**: `FROM zzci/ubase` (a general-purpose base with libc/shell/tools, so it can also host a runtime lode downloads at boot) → `COPY lode /usr/bin/lode` → `ENTRYPOINT ["/usr/bin/lode"]`. lode's TLS roots are bundled (webpki-roots), so no system CA certificates are required. lode is a static binary that also runs on a minimal base (`scratch`/distroless) when the app brings its own runtime or is itself static.
+- **TLS**: rustls with the aws-lc-rs provider; no OpenSSL. HTTP is synchronous — lode runs no async runtime.
+- **No `unsafe`**: every crate forbids unsafe code. Children are spawned from an argv array, never through a shell.
+
+---
+
+## 4. Language-agnostic application model: format (packaging) + run/exec (running)
+
+Division of labor: **landing is delegated to the manifest's `format`, running is delegated to `[command]` in `lode.toml`**. lode itself only does selection/download/verification/activation/supervision.
+
+### format — packaging format (how the downloaded item lands on disk)
+
+| format | Meaning | Landing action |
+|---|---|---|
+| `raw` | URL is the final single file (binary or script) | download → store as `versions/<v>/<asset filename>` |
+| `gz` | single-file gzip (`.gz`) | download → gunzip → single file |
+| `tar.gz` | gzip tar of a directory tree (`.tar.gz`/`.tgz`) | download → unpack into `versions/<v>/` |
+| `zip` | zip archive | download → extract into `versions/<v>/` |
+
+**`format` is always derived from the asset filename's extension** (longest match — `.tar.gz`/`.tgz`→`tar.gz`, `.gz`→`gz`, `.zip`→`zip`, else `raw`; see §12). It is never stored in the manifest nor signed. **sha256 is always computed over the "raw downloaded file (before unpacking)."**
+
+### How to run (`run` / `exec` in the `[command]` section, no `kind`)
+
+"How to run" is configured by the operator in the `[command]` section of `lode.toml`; the manifest only declares "what to download" (`name`/`url`/`sha256`). Both `run` and `exec` are **literal commands** (whitespace-split into argv; cwd = `workdir`, default: the version dir). The only placeholder is **`{dir}`** = the version directory. **argv is executed directly, not through a shell; no `kind` is needed.**
+
+- **`run`**: **the command that launches the app when `lode` runs bare**. E.g. `"bun run"` or `"./myapp serve"`.
+- **`exec`**: **the base command for `lode <args>` passthrough**, with the CLI arguments appended after it. E.g. `"bun"` → `lode run db:init` means `bun run db:init`.
+- **`workdir`**: the child process's cwd, `{dir}` (default) or an absolute path. stdio is inherited from lode.
+- **Manifest asset overrides**: a manifest asset may carry optional `run` and `exec` string fields. When present they **override** the operator's `[command].run`/`exec`. These fields are bound into the per-artifact signed message and the catalog signature — a tampered catalog cannot inject a malicious launch command under `require_signature = auto` (with keys) or `enforce`.
+- **Auto chmod+x**: after extraction, lode chmod+x the first whitespace token of the effective `run` (and `exec` if different) when it names a relative path that resolves to a file inside the version directory.
+- **Missing run → hard error**: if neither `[command]` nor the manifest asset supplies a `run` command, launch fails with `no run command: set [command].run or publish \`run\` in the manifest asset`.
+
+### Runtime download (`[runtime]`, optional)
+
+When `run`/`exec` depends on a runtime (such as `bun`), it can be declared in the `[runtime]` section of `lode.toml`. Resolution order is **PATH → cache → download**: lode first checks PATH; otherwise it reuses a previously downloaded runtime from `$LODE_DIR/runtime/<key>/<name>`; otherwise it downloads `download`. A self-contained binary omits this table.
+
+- **Format / hoist**: the `format` is inferred from the URL extension (`raw`/`gz`/`zip`/`tar.gz`); after extraction the named binary is hoisted to `runtime/<key>/<name>`, so nested official archives work (bun's `bun-linux-x64/bun`, node's `node-vX/bin/node`) as well as flat ones (deno) and single files.
+- **Cache, keyed by the configured runtime**: the cache directory is `runtime/<key>/`, where `<key>` is **always** a 12-hex digest of the `download` URL, prefixed by the pinned `version` when it is a safe path component — `1.1.38-9f2c0a4b6d18`, else `url-9f2c0a4b6d18`. The digest makes the key exact (repointing `download` at other bytes invalidates the cache even when `version` is unchanged); the prefix keeps the directory readable. The placed `runtime/<key>/<name>` is reused on later boots — with a persistent `$LODE_DIR` the download is a one-time cost — but **only for the same `[runtime]` config**: repointing `version`/`download` at a new runtime changes the key, so that runtime is downloaded into its own directory instead of being served from (or unpacked on top of) the previous one. Once the current key resolves, the other `runtime/` entries are reclaimed. Delete `runtime/<key>/` to force a re-download.
+- **Unverified**: unlike an app artifact, a runtime download carries **no `sha256`/`sig`** and is **not** integrity/identity-checked. Pin a version, host on a trusted origin, and add its host to `[http].credential_hosts` if it needs credentials.
+- **Version pin** (`version` + `version_check`): when `version` is set, lode probes the runtime it's about to use (PATH/cache/downloaded) by running it with `version_check` (default `--version`) and requires the output to **contain** `version`. A wrong-version PATH/cache entry is bypassed for a fresh download; a downloaded mismatch is a hard error.
+- lode then **prepends `$LODE_DIR/runtime/` to the child's PATH**.
+
+```toml
+[runtime]
+runtime       = "bun"                                    # the executable name used by run/exec
+download      = "https://example.com/bun-linux-x64.zip"  # downloaded when bun is not found on PATH/cache
+version       = "1.3.14"                                 # optional: require this version (substring of the probe output)
+# version_check = "--version"                            # optional: arg(s) that print the version (default --version)
+```
+
+### Asset selection (by filename)
+
+A version's `assets[]` are keyed by **filename** (`name`, e.g. `myapp-linux-x86_64.tar.gz`). The operator sets `[update].asset` to the exact asset for this host; lode matches it against the source's asset list by `name`. There is **no platform auto-detection and no arch-alias table** — the filename is the single selection key (the same key in both the native and GitHub sources), and its extension fixes the `format`. The filename carries the brand/platform by convention. See §6/§12 and [`docs/source-adapters.md`](source-adapters.md).
+
+---
+
+## 5. Version lifecycle and update strategy
+
+### Startup decision (never jump versions on its own)
+
+```
+read state.json to get current
+┌─ current does not exist (first run / brand-new data disk)
+│     → bootstrap: fetch remote manifest → take latest → select artifact → download + verify (sha256+sig) + land
+│     → current = latest, last_good = latest → spawn child process
+└─ current already exists
+      → activate and start current directly (don't wait for the network, fast startup)
+      → afterwards handle updates in the background per policy
+```
+
+If current does not exist and there is neither `[update].manifest` nor a locally available version → error and exit. Offline/air-gapped: no local manifest is ever read — install the version locally with `lode-cli seed` (or ship `versions/<ver>/` with its `.lode.json` marker) and lode starts `current` with no network; see `docs/dev-local-testing.md`.
+
+### Update strategy `update.policy` = `off` | `check` | `auto`
+
+| Value | Name | Behavior |
+|---|---|---|
+| `off` | Off | No background checks; only runs current/pinned. Still honors an explicit `target` (fetches the remote once on demand to resolve the entry). |
+| `check` (default) | Check | Periodically fetch remote → refresh the local catalog, write `state.available`, **does not auto-apply**; once the app reads it, it prompts → writes `state.target` → lode executes. |
+| `auto` | Auto | Periodically fetch remote → if `latest > current`, automatically set `target=latest` and hot-update. |
+
+`update.pin` locks a version (equivalent to `off` + a fixed target); under any policy an explicit `state.target` is honored and executed (provided verification passes). The check cadence is `update.check_interval` seconds (0 = check only once at startup; `off` does not time). 
+
+### Applying a target (hot-update + rollback)
+
+```
+target ≠ current and available (stop-start mode):
+  1. ensure it is installed (if missing, download + verify + land into versions/<target>)
+  2. (readiness=state AND the running app opted in by reporting serving as "<LODE_INSTANCE>-0") app-paced cut-over — STAGE, don't swap yet: prompt the running app with state.ready="<LODE_INSTANCE>-1", set status=updating, and WAIT (app-paced; `prepare_timeout`=0 default — a non-zero `[supervise].prepare_timeout` bounds the wait); the app prepares (drain/checkpoint/warm) at its own pace and acks with state.ready="<LODE_INSTANCE>-2". The old child keeps serving and is supervised throughout (a crash here simply applies the staged target). readiness=none, or an app on the bare token, skips this and cuts over immediately.
+  3. write state.status=updating → send SIGTERM to the old child process (the app cleans up and exits) → SIGKILL only after STOP_TIMEOUT
+  4. atomically switch the current symlink → versions/<target>
+  5. spawn the new child process; wait for readiness (§8: readiness=none → alive for the full grace; readiness=state → wait for state.ready="<new LODE_INSTANCE>-0")
+  6. ready → status=running, last_good=target; **a single failure triggers rollback**: readiness timeout / exiting or crashing once within the observation window (health_grace) → switch back to last_good and observe it the same way; if last_good also fails within its grace → lode **pauses** (status=error, keep-alive, §8) rather than exiting; under `restart = off` it mirror-exits instead
+```
+
+### Startup cleanup (GC + orphan child processes)
+
+`lode` startup (service mode) runs a cleanup pass before determining the version:
+
+- **Orphan child processes**: a previous lode crash may have left an app child process still running. After taking over the stale lock, read `state.json.pid`, and if that process is still alive → terminate it gracefully (SIGTERM → SIGKILL on timeout) before starting a new one, avoiding port/resource conflicts and dual instances.
+- **Garbage collection**: clean up interrupted `downloads/<v>/*.part` and `versions/<v>.tmp` half-finished artifacts left by interruptions (the verified per-version download cache is kept); per `keep_versions`, retain current + last_good + the most recent N versions, deleting the rest of the version directories **and their `downloads/<v>/` caches**; `$LODE_DIR/runtime/` likewise keeps only the cache key in use.
+- **Verify on-disk consistency**: if the version the `current` symlink points to is missing/corrupted → fall back to last_good or re-bootstrap.
+
+---
+
+## 6. Verification and trust: file integrity + publisher identity
+
+- **Integrity**: compute sha256 over the raw downloaded file; it must equal the artifact's `sha256` (lowercase hex).
+- **Identity**: a publisher signature — ed25519 by default, or ECDSA (P-256 / P-384); the algorithm travels with the key (see *Trusted public keys* below). The publisher's private key signs a "release record," and lode verifies the signature with the pre-placed **trusted public key** → even if the CDN/mirror is poisoned or the transfer is MITM'd, it can confirm that the publisher issued it and that it has not been tampered with.
+
+### Signature canonical bytes (exact, UTF-8, `\n`-separated, no trailing newline)
+
+The signature message for an asset-level `sig`:
+```
+lode.artifact.v2
+{app}
+{name}
+{version}
+{sha256}
+{run}
+{exec}
+```
+`{app}` is the **app name** (the manifest `name` = the loader's `[global].app`), `{name}` is the **asset filename** (the selection key), `{version}` the release version, `{sha256}` the lowercase-hex digest of the raw downloaded file, `{run}` and `{exec}` the manifest-published launch overrides (empty string when absent). The signature binds *which app*, *which asset*, *which release*, *which bytes*, and *which launch commands*; `format`/`url` are derived from the filename or are operator-local and are **not** signed, so a tampered catalog cannot move a genuine signature onto different bytes, a different asset, a different version, or inject malicious run/exec commands. Verify with the trusted public key corresponding to `key_id` (asset.key_id ?? manifest.key_id).
+
+> **What is signed is the sha256 (digest), not the bin stream directly.** The publisher key signs the canonical text string above (which contains `{sha256}`) — equivalent to "signing the digest + identity fields." The full verify chain: **downloaded bytes → recompute sha256 → (integrity) == artifact.sha256 → (identity) verify this signature**. The sha256 already binds the content, so there is no need to stream the entire binary through the signer; this is also the conventional approach for release signing (such as signing `SHA256SUMS`).
+
+Optional top-level manifest `sig`, set by `lode-cli manifest-sign` and verified before any version is resolved/downloaded, preventing the addition/removal of versions, a swapped channel `latest`, or rewritten URLs:
+```
+lode.manifest.v1
+{name}
+{key_id}
+{canonical}     # deterministic, sig-free serialization of channels + versions
+```
+`{canonical}` is built from the parsed manifest (sorted `channels`/`versions`), so signer and verifier produce identical bytes regardless of JSON key order or whitespace; the top-level `sig` itself is excluded from the signed body. The key is selected by the manifest's `key_id` (falling back to trying every trusted key).
+
+Optional top-level `expires` (Unix seconds) with its own signature `expires_sig`, set by `lode-cli manifest-sign --expires-in <duration>`. lode rejects a manifest at or past its `expires`, under every policy, so a source that keeps serving an old copy cannot hold a host on an old `latest` indefinitely; the publisher re-signs before the date passes. `expires_sig` is over:
+```
+lode.manifest-expiry.v1
+{name}
+{key_id}
+{expires}
+{canonical}     # the same serialization as above
+```
+It is a second signature, not part of the `lode.manifest.v1` message: a lode that predates `expires` ignores both fields and still verifies the unchanged `sig`. Such a lode gets no expiry protection.
+
+`[trust].require_manifest` sets what the manifest itself must prove:
+
+| Value | Behavior |
+|---|---|
+| `off` (default) | `sig` and `expires_sig` are verified when present; neither is required. |
+| `signed` | A valid `sig` is required. |
+| `fresh` | A valid `sig` and a signed, unexpired `expires` are required. |
+
+Only `fresh` stops a source from stripping `expires`/`expires_sig` and replaying a catalog whose `sig` is still valid. `signed` and `fresh` need trusted keys and a native manifest; a GitHub source has no manifest to sign and is rejected with them at config time. A running lode treats a rejected manifest as a failed update check: it keeps running the current version.
+
+### Trusted public keys / strength
+
+- `LODE_TRUSTED_KEYS` = comma-separated `[<alg>:]<key_id>:<base64 public key>`, where `alg` is `ed25519` (raw 32-byte key; the default when omitted), `ecdsa-p256` or `ecdsa-p384` (SEC1 point, compressed canonical); or `LODE_TRUSTED_KEYS_FILE` (each line `[<alg>:]<key_id> <base64>`). Multiple keys are supported (rotation), of mixed algorithms. `key_id` = the first 16 hex digits of `sha256(public key bytes)`. **The algorithm is pinned on the trusted key**: a signature is checked with that key's algorithm, never with one the manifest names (its `alg` is advisory).
+- Base64 values (public keys, seeds, signatures) are emitted as unpadded **base64url** (RFC 4648 §5, alphabet `A-Z a-z 0-9 - _`); standard base64, padded or not, is accepted on input.
+- `LODE_REQUIRE_SIGNATURE` = `off` (sha256 only) | `auto` (default) | `enforce` (recommended for production). **It gates the per-artifact signature only.** The catalog (manifest-level) signature is *verify-if-present* — verified when a catalog carries one, never required, and so independent of this setting (see *Catalog signature* below).
+  - **`auto` is fail-closed once any trusted key is configured**: the *artifact* signature is then required — a missing *or* invalid signature is rejected. Only when **no** trusted key is configured does `auto` skip the artifact check and log the source as **UNVERIFIED**.
+  - **`enforce`** always requires trusted keys plus a valid *artifact* signature.
+  - **Catalog signature (verify-if-present).** A manifest's optional top-level `sig` is verified when present (a present-but-invalid one is rejected) but is **never required** — an unsigned catalog installs fine under `enforce`. Rollback of the channel `latest` pointer is instead caught client-side by the **downgrade floor**: following `latest` never resolves a version older than `max(current, last_good)`; an explicit `--version`/`pin`/`rollback` is a deliberate choice and is exempt.
+
+### CLI (publisher)
+
+`lode-cli keygen` / `lode-cli sign <asset> --app <app> --version <ver> --key <priv> [--run <cmd>] [--exec <cmd>]` (or `--key-env <VAR>`; prints `sha256`/`sig`/`key_id`, where `sig` is what you publish beside the asset as `<asset>.sig` — or as the GitHub asset `label`; `--run`/`--exec` bind launch overrides into the signature) / `lode-cli verify <asset> --version <ver> --pubkey <b64> --sig <b64>` / `lode-cli manifest <asset> --version <ver> --url <url> [--run <cmd>] [--exec <cmd>] --key <priv> --into manifest.json` / `lode-cli manifest-sign --into manifest.json --key <priv>` (stamp the catalog's top-level `key_id` + `sig`). The private key stays offline; lode holds only the public key.
+
+---
+
+## 7. File model and lode ↔ app communication
+
+Three concepts, with clear responsibilities:
+
+| File | Location | Format | Who writes | Role |
+|---|---|---|---|---|
+| **`lode.toml`** | local | TOML | **only the lode side** (written by the operator; the app does not write it) | **the app's configuration**: how to launch and configure the program (manifest URL/channel/exec/workdir/headers/policy/trust/`pin`) |
+| **`state.json`** | local | JSON | **both lode and app can write** | runtime communication hub: lode writes the actual state, the app writes update/restart requests |
+| **`manifest.json`** | **remote** | JSON | publisher | the remote program's version catalog; lode fetches it per policy, **not persisted locally** (each version's metadata is stored in the version directory for offline running) |
+
+All communication goes through **`state.json`** (bidirectional, each side writing its own fields + atomic temp+rename write; lode polls its mtime):
+
+- **lode writes**: `current`/`last_good`/`available`/`status`/`pid`/`last_check`/`last_error`/`history`/`channel`/`config_generation`/`checked_nonce`/`check_error`.
+  - **`last_error` reports *persistent* failures only.** A fetch that fails on the network layer (connect/TLS/redirect/status, or a truncated body) is retried on the next check, so it is written only after **3 consecutive** failures and is cleared by the next successful fetch — a single failed attempt is logged, never synced to the app. Failures that will not fix themselves (a malformed manifest, a bad signature, a full disk, a version that cannot start) are reported on the first strike.
+- **app writes** (requests): `target` (the version to upgrade/downgrade to, or `"latest"`), `restart_nonce` (incremented = restart request), `check_nonce` (incremented = check for an update now; lode answers by raising `checked_nonce` to it, with `check_error` set if the check failed and `available` updated otherwise — under `off` or a `pin` too, where it advertises without applying).
+- **app-owned** `hold`: set `true` to ask lode **not** to (re)start the process — planned maintenance that must finish before the app comes up. lode reports `status = held` and waits (at boot, after a child exit, and for `restart_nonce`/`target` requests) until it is cleared. It gates a *start* only; a running child is never killed by it.
+- **co-owned** (`readiness=state` handshake, §8): `ready` = `{LODE_INSTANCE}-{phase}`. The app reports it can serve with `-0`; on a staged update lode prompts the running app with `-1`; the app acks "prepared, cut over now" with `-2`. lode reads `-0`/`-2`, writes the `-1` prompt, and clears the field at cut-over. An app may instead write the bare `{LODE_INSTANCE}` — it then opts out of the prepare window and cuts over immediately.
+- Typical flow (`policy=check`): lode writes the newly discovered version into `available` → **once the app reads it, it decides on its own to upgrade by writing `target` to that version (or `"latest"`)** → lode applies and hot-updates.
+
+**Notification mechanism (bidirectional, neither needs an extra signal):**
+
+- **app → lode** (request a restart/upgrade): the app **atomically writes `state.json`** (changing `target` or incrementing `restart_nonce`); **lode polls `state.json`'s mtime at a short interval (~1s)**, and on a change re-reads and executes. **The file itself is the notification**, so there's no need to send a signal to lode (which also avoids conflicting with signals forwarded to the child process).
+- **lode → app** (request a restart, letting the app clean up): lode first sets `state.status` to `updating` (hot-update) or `stopping` (shutdown) so the app can distinguish them, then sends **`SIGTERM`** to the child process; in its SIGTERM handler the app does cleanup (draining/flush/release) and then `exit(0)`, which must happen within `supervise.stop_timeout`, otherwise `SIGKILL`. After exit, lode switches the version and starts a new process (§5).
+- **lode → app** (config changed, **no auto-restart**): when `lode.toml` is edited while the app is **running**, lode does **not** restart it (a running app is never disturbed) — it bumps **`config_generation`** (a monotonic counter) so the app learns a restart is needed to apply the change. The app applies it at its own pace by bumping `restart_nonce`, which makes lode **re-read `lode.toml`** on the relaunch (new `[env]`/config takes effect). A *paused* app instead auto-reloads on an edit; host-process env (`-e`/k8s) requires restarting lode itself.
+
+> `lode.toml` is pure configuration, **the app does not write it** (only the lode side/operator writes it); to lock a version, use `pin` in it. For a complete `lode.toml`, see `docs/lode.example.toml`.
+
+### `$LODE_DIR/state.json` (written by lode+app)
+
+```json
+{
+  "current": "1.4.2",
+  "last_good": "1.4.2",
+  "available": "1.5.0",
+  "channel": "stable",
+  "status": "running",
+  "pid": 12345,
+  "last_check": "2026-06-04T22:00:00Z",
+  "last_error": null,
+  "history": [ { "version": "1.4.2", "at": "2026-06-04T21:00:00Z", "result": "good" } ],
+  "config_generation": 0,
+  "checked_nonce": 0,
+
+  "target": null,
+  "restart_nonce": 0,
+  "check_nonce": 0,
+  "hold": false,
+
+  "ready": "12345-k3x9q2-0"
+}
+```
+The fields owned by lode vs. the fields owned by the app (`target`/`restart_nonce`/`check_nonce`/`hold`) do not overlap; `ready` is co-owned (§8); `status` ∈ `starting|running|held|updating|rolling-back|stopping|stopped|error`; `result` ∈ `good|bad`.
+
+---
+
+## 8. Child-process supervision and service management
+
+- The full lifecycle is managed by lode: start / graceful stop / restart / status / hot-update / rollback, exposed via the CLI (§13) and `state.json` (§7).
+- **Container init responsibilities (often runs as PID 1)**: lode installs signal handlers (PID 1 has no default handlers) and **reaps zombies** — it sets itself as a child subreaper and loops `waitpid` to harvest reparented grandchildren, preventing zombie buildup. `docker stop` sends `SIGTERM` to PID 1 (default `SIGKILL` after 10s): lode must forward it and exit within that grace period (`stop_timeout` should be < Docker's grace).
+- **Signal passthrough (service mode)**: lode acts as the master, **forwarding externally received signals to the child process as much as possible**, without deciding behavior on the app's behalf:
+  - Termination-class `SIGTERM`/`SIGINT`/`SIGQUIT`: lode initiates a **graceful shutdown** — forward to the child process → wait for it to exit (SIGKILL on timeout) → release the lock → lode exits with the child process's exit code.
+  - Passthrough-class `SIGHUP`/`SIGUSR1`/`SIGUSR2`/`SIGWINCH`/`SIGCONT`/`SIGTSTP`/…: **forwarded as-is to the child process** (e.g. an app using `SIGHUP` to reload); lode does not consume them.
+  - Optional `signals.restart` (env `LODE_RESTART_SIGNAL`, e.g. `SIGUSR2`): once set, that signal instead **triggers a graceful lode restart** (equivalent to `restart_nonce++`) and is no longer forwarded; **unset by default**, to avoid occupying an app signal (restart goes via state.json/CLI).
+  - `SIGKILL`/`SIGSTOP` cannot be caught (OS restriction); lode does not rely on `SIGCHLD` — it reaps with a non-blocking `waitpid` on its ~200 ms supervise tick (which also harvests re-parented grandchildren). The passthrough set can be adjusted with `signals.forward` (env `LODE_FORWARD_SIGNALS`).
+- **Restart policy `supervise.restart`** (`off`|`on-failure`|`always`, default `on-failure` — **keep-alive**):
+  - `on-failure` (default) = restart on **failure** (a non-zero exit, a kill-by-signal, or a failure to even start) with **exponential backoff**; on a clean `exit(0)`, lode follows and exits. **Keep-alive**: after `restart_max` failed retries lode does **not** exit — it **PAUSES** (status=error), staying alive so PID 1 never crash-loops the container. A clean `exit(0)` still exits lode (the app intentionally stopped).
+  - `always` = like `on-failure` but also restarts a clean `exit(0)` (a service that should never stop); pauses the same way at the cap.
+  - `off` = lode **mirrors the child process's lifecycle** — when the child exits on its own, lode exits with its exit code (`exit(code)` → `code`; `signal(sig)` → `128+sig`), leaving whole-process restart to the orchestrator; it does **not** auto-relaunch (opt back into this for systemd-style supervision).
+  - Backoff: base `RESTART_BACKOFF`, capped at `..._MAX`; `RESTART_MAX` retries then pause (`0` = retry forever); the consecutive count resets once the child stays alive for the full `health_grace`. These keys **take effect only when `restart != off`**.
+  - **Recovering a paused app** (no exit needed): edit **`lode.toml`** (lode reloads it + re-attempts — the fix for a bad `[command]`/config; a *running* app is never disturbed by edits), bump **`restart_nonce`**, or write a new **`target`**.
+  - **Regardless of policy**, transitions initiated by lode restart the child process as usual: updates (applying `state.target` / a `policy=auto` update), rollback, an explicit restart (`restart_nonce` or the restart signal). When the child process exits and there is a **pending update** (`state.target` points to a different installable version, or a latest update under `policy=auto`), the new version is launched per the update rather than restarting the original version.
+- **Health/rollback**: see §5 (rollback is **single-shot**; if the rollback target itself fails, lode pauses rather than exiting).
+
+### Run modes — bare = launch, with arguments = passthrough (no flags/subcommands needed)
+
+A minimal rule:
+
+- **`lode` (bare) = launch and supervise the service**: lock (single instance) → determine/install the version (+ download the runtime if needed) → run the effective **`run`** command (from lode.toml `[command].run` or the manifest asset override) → supervise (per the `supervise.restart` policy, default keep-alive: retry then pause, never exit on app failure) → poll for hot-update/rollback per policy → signal passthrough as above. Suited to a server/daemon. With image `ENTRYPOINT ["/usr/bin/lode"]`, `docker run img` launches it.
+- **`lode <args...>` (with any arguments) = CLI passthrough**: **no lock, no supervision, no polling**. Verify the target version (bootstrap if none) → **exec replace** with **`exec` + `<args>`**, passing through stdin/stdout/stderr (including TTY), with signals and exit codes handled natively by the OS.
+  - `lode run db:init` → `exec + ["run","db:init"]` (if `exec="bun"`, then ≡ `bun run db:init`). **No `--` needed**; **no `run` subcommand is used**, so it doesn't conflict with `bun run`.
+  - Positional arguments pass through via clap `trailing_var_arg` + `allow_hyphen_values` (`lode` has no subcommands; all arguments belong to the app).
+  - exec replacement uses the safe `std::os::unix::process::CommandExt::exec`, preserving `#![forbid(unsafe_code)]`.
+- **`lode` itself has no subcommands at all**; operations and publishing actions (status/update/…/keygen/sign/manifest/init) all live under the symlink **`lode-cli`** (see §13). Therefore `run`/`migrate` and the like are always passed through to the app and never shadowed.
+
+### Restart mode `supervise.restart_mode`
+
+lode restarts and updates with **`stop-start`**: stop the old process, then start the new one, with a very short gap. It needs no cooperation from the app and suits non-network services too.
+
+`restart_mode` also accepts `reuseport-overlap` and `socket-activation`, and `[supervise].listen` exists for the latter. Neither is implemented: selecting one logs `restart_mode is not yet supported; using stop-start` and lode uses `stop-start`.
+
+### Readiness / stop handshake (key: don't kill the process before the app is ready)
+
+To avoid "switching traffic before the new process is up, or killing the old process before it finishes cleanup," two handshakes are agreed upon:
+
+**① Readiness handshake (startup direction) `supervise.readiness`**
+
+Every time lode spawns the child process, it injects a unique instance id **`LODE_INSTANCE`** = `{pid}-{nanoid}` (env). The app composes its `state.ready` value as `{LODE_INSTANCE}-{phase}`, where the trailing phase digit carries the handshake: `-0` = serving, `-1` = lode's staged-update prompt, `-2` = the app's "prepared" ack.
+
+| `readiness` | When lode considers it "ready/successful" |
+|---|---|
+| `none` (default) | **Alive for the full `health_grace` seconds** counts as ready/good (suitable for programs with no readiness signal). |
+| `state` | **Wait for the app to write `state.ready == "{LODE_INSTANCE}-0"`** (or the bare `{LODE_INSTANCE}`, without the phased handshake) — the app self-reports "I can serve now"; if it isn't received within `supervise.ready_timeout` (default 30s) → judged a failure (rollback/restart). |
+
+Before readiness, lode does **not** set `status=running` and does not mark last_good.
+
+**①′ Staged-update prepare handshake (`readiness=state`, opt-in)** — the app paces the cut-over. It opts in by reporting serving with the phased token `"{LODE_INSTANCE}-0"`; an app still on the bare `{LODE_INSTANCE}` opts out (lode cuts over immediately). When an opted-in app's `target` is requested, lode installs it but does **not** swap; it sets `status=updating` and prompts the **running** app by writing `state.ready="{LODE_INSTANCE}-1"`. The app does its pre-cut-over work (drain in-flight requests, checkpoint, warm the new data) and, when ready, acks by writing `state.ready="{LODE_INSTANCE}-2"`. Only then does lode begin the cut-over (§5). The wait is **app-paced by default** (`prepare_timeout = 0`); an optional non-zero `[supervise].prepare_timeout` (seconds) forces the cut-over if the app never acks within the deadline. Either way the old child keeps serving and stays supervised the whole time (if it crashes while preparing, the staged target is applied directly, since there is nothing left to drain). The cut-over clears `ready` so the new spawn's `-0` is unambiguous.
+
+**② Stop handshake (shutdown direction) `supervise.stop_timeout`**
+
+After lode sends `SIGTERM`, it **absolutely will not SIGKILL within `stop_timeout` seconds**, giving the app ample time to clean up. The agreement:
+- The operator sets `stop_timeout` to ≥ the app's worst-case cleanup time, and **< the container/orchestrator's stop grace** (e.g. Docker's default 10s, otherwise the container layer will SIGKILL first).
+- On receiving `SIGTERM`, the app must finish up as quickly as possible and `exit(0)`; only a timeout results in SIGKILL.
+
+---
+
+## 9. PID lock
+
+- A non-blocking exclusive `flock` on `$LODE_DIR/lode.pid.lock` guards the data directory. The supervisor holds it for its whole run, and the kernel releases it even after a forced exit. The lock file itself is never removed.
+- `$LODE_DIR/lode.pid` is created with O_EXCL (`create_new`) and contains only the lode pid (a plain pid file: `kill -TERM "$(cat lode.pid)"` works). It is removed on exit.
+- When `lode.pid` already exists, lode probes the recorded pid. A live lode means another instance owns the directory, and this one exits. A dead process, a pid that now belongs to another executable (checked through `/proc/<pid>/exe` on Linux), an unreadable file, or lode's own pid is a stale lock and is reclaimed.
+- Only bare `lode` takes the lock; `lode <args>` passthrough and `lode-cli` do not.
+
+---
+
+## 10. Configuration system
+
+**Priority: `CLI > environment variables > lode.toml config file (`LODE_CONFIG`, TOML) > defaults`.**
+
+Key names: `lode.toml` uses snake_case (see `docs/lode.example.toml`); environment variables use `LODE_*`.
+
+| Environment variable | CLI | lode.toml key | Default | Meaning |
+|---|---|---|---|---|
+| `LODE_CONFIG` | `--config <path>` | — | `$LODE_DIR/lode.toml`, else `./lode.toml` | path to the lode.toml config file (TOML) |
+| **`[global]`** | | | | |
+| `LODE_APP_NAME` | `--app <name>` | `global.app` | `app` | application name (names the data directory/lock; must match the manifest `name`) |
+| `LODE_DIR` | `--dir <path>` | `global.dir` | `/srv/lode` | runtime/base directory: `lode.toml` + versions/state/lock + `runtime/`; by default `lode.toml` is also looked up here, and if missing a starter config is auto-generated |
+| `LODE_LOG_LEVEL` | `--log-level <lvl>` | `global.log_level` | `info` | trace/debug/info/warn/error |
+| **`[update]` — source + upgrade strategy** | | | | |
+| `LODE_MANIFEST` | `--manifest <url>` | `update.manifest` | — | **native source**: lode/v1 manifest URL (mutually exclusive with `github`) |
+| `LODE_GITHUB` | `--github <owner/name>` | `update.github` | — | **github source**: the repository (mutually exclusive with `manifest`) |
+| `LODE_GITHUB_API` | `--github-api <url>` | `update.github_api` | `https://api.github.com` | (github) API base URL (GHE) |
+| `LODE_ASSET` | `--asset <file>` | `update.asset` | — | the asset **filename** to install on this host (the selection key, §4/§12) |
+| `LODE_CHANNEL` | `--channel <name>` | `update.channel` | `stable` | the channel to follow (a manifest may define multiple) |
+| `LODE_UPDATE_POLICY` | `--policy <off\|check\|auto>` | `update.policy` | `check` | update strategy, §5 |
+| `LODE_CHECK_INTERVAL` | `--interval <sec>` | `update.check_interval` | `300` | check interval in seconds; 0 = only once at startup |
+| `LODE_KEEP_VERSIONS` | `--keep <n>` | `update.keep_versions` | `3` | number of old versions to retain |
+| `LODE_PIN_VERSION` | `--pin <ver>` | `update.pin` | — | lock a version (operator) |
+| **`[http]` — fetch credentials** | | | | |
+| `LODE_HEADERS` | `--header <h>` (repeatable) | `http.headers` | — | HTTP headers passed through to manifest/artifact/runtime downloads (`"Name: Value"`), supporting `${ENV}` expansion, §11; the env var is **newline-separated** |
+| `LODE_CREDENTIAL_HOSTS` | `--credential-host <host>` | `http.credential_hosts` | — | extra trusted hosts that receive `[http].headers` credentials (same-origin always trusted; runtime download hosts need listing too); the env var is **newline-separated** |
+| `LODE_ALLOW_INSECURE_HTTP` | `--allow-insecure-http` | `http.allow_insecure` | `false` | allow plain-HTTP fetches (loopback always allowed; credentials travel in the clear) |
+| **`[trust]` — signature verification** | | | | |
+| `LODE_REQUIRE_SIGNATURE` | `--require-signature <off\|auto\|enforce>` | `trust.require_signature` | `auto` | signature-verification strength, §6 |
+| `LODE_REQUIRE_MANIFEST` | `--require-manifest <off\|signed\|fresh>` | `trust.require_manifest` | `off` | what the manifest must prove (signature, expiry), §6 |
+| `LODE_TRUSTED_KEYS` | `--trusted-keys <list>` | `trust.trusted_keys` | — | trusted public keys `key_id:base64`, comma-separated |
+| `LODE_TRUSTED_KEYS_FILE` | `--trusted-keys-file <path>` | `trust.trusted_keys_file` | — | trusted public keys file |
+| **`[command]` — how to run** | | | | |
+| `LODE_RUN` | `--run <cmd>` | `command.run` | — | **literal bare-run launch command** (whitespace-split; only `{dir}` expands); manifest asset may override, see §4 |
+| `LODE_EXEC` | `--exec <cmd>` | `command.exec` | — | **literal CLI passthrough base command** (`lode <args>` appended after it); manifest asset may override, see §4 |
+| `LODE_WORKDIR` (injected) | — (no flag) | `command.workdir` | `{dir}` | child process cwd (version dir by default, or an absolute path via `[command].workdir`); lode **injects** the resolved value as `LODE_WORKDIR`, see §4 |
+| **`[env]` — extra child env** (config-file only; no CLI/env override) | | | | |
+| — | — | `[env]` (table) | — | extra env vars for the child, as **defaults** — an inherited host env var of the same name wins (lode's own `LODE_*` win over all), see §4 |
+| **`[runtime]` — optional runtime** | | | | |
+| `LODE_RUNTIME` | `--runtime <name>` | `runtime.runtime` | — | runtime executable name (used by run/exec), see §4 |
+| `LODE_RUNTIME_DOWNLOAD` | `--runtime-download <url>` | `runtime.download` | — | download URL when the runtime is missing (cached + reused; not signature-verified) |
+| `LODE_RUNTIME_VERSION` | `--runtime-version <ver>` | `runtime.version` | — | required runtime version; probed and matched as a substring of the probe output, §4 |
+| `LODE_RUNTIME_VERSION_CHECK` | `--runtime-version-check <args>` | `runtime.version_check` | `--version` | arg(s) that print the runtime version (used only with `version`) |
+| **`[supervise]` — supervision (restart policy/health/rollback/stop/restart mode)** | | | | |
+| `LODE_RESTART` | `--restart <off\|on-failure\|always>` | `supervise.restart` | `on-failure` | restart policy (keep-alive): `on-failure` = retry on failure then **pause** (stay alive); `always` = also retry a clean exit; `off` = mirror the child (lode exits with it), §8 |
+| `LODE_RESTART_BACKOFF` | `--restart-backoff <seconds>` | `supervise.restart_backoff` | `1` | restart backoff base in **seconds** (exponential); effective only when `restart != off` |
+| `LODE_RESTART_BACKOFF_MAX` | `--restart-backoff-max <seconds>` | `supervise.restart_backoff_max` | `30` | backoff cap in **seconds**; effective only when `restart != off` |
+| `LODE_RESTART_MAX` | `--restart-max <n>` | `supervise.restart_max` | `3` | retry cap before lode **pauses** (keep-alive), 0 = retry forever; effective only when `restart != off` |
+| `LODE_READINESS` | `--readiness <none\|state>` | `supervise.readiness` | `none` | readiness determination: `none` = alive for the full grace; `state` = wait for the app to write `state.ready`, §8 |
+| `LODE_READY_TIMEOUT` | `--ready-timeout <sec>` | `supervise.ready_timeout` | `30` | with `readiness=state`, the max wait for readiness; a timeout is judged a failure |
+| `LODE_HEALTH_GRACE` | `--health-grace <sec>` | `supervise.health_grace` | `15` | (readiness=none) the new version must stay alive for this many seconds to be good; also the observation window for single-shot rollback |
+| `LODE_STOP_TIMEOUT` | `--stop-timeout <sec>` | `supervise.stop_timeout` | `10` | SIGKILL after the graceful-stop timeout |
+| `LODE_RESTART_MODE` | `--restart-mode <mode>` | `supervise.restart_mode` | `stop-start` | restart strategy, §8 (**only `stop-start` is implemented; `reuseport-overlap`/`socket-activation` fall back to it**) |
+| `LODE_LISTEN` | `--listen <addr>` | `supervise.listen` | — | socket-activation listen address (**socket-activation not yet implemented; this key is currently inert**) |
+| **`[signals]` — signals** | | | | |
+| `LODE_FORWARD_SIGNALS` | `--forward-signals <list>` | `signals.forward` | (standard set) | the set of signals forwarded to the child process, §8 |
+| `LODE_RESTART_SIGNAL` | `--restart-signal <sig>` | `signals.restart` | — | the signal that triggers a graceful restart (unset by default), §8 |
+
+Child-process environment: pass through the host environment and **strip configuration-class `LODE_*`**; apply the operator's `[env]` table as **defaults** (only for keys the host env doesn't already set); prepend the runtime dir to PATH; then inject the read-only introspection variables `LODE_ACTIVE_VERSION`, `LODE_DIR`, `LODE_WORKDIR` (the resolved cwd), `LODE_CONFIG` (the loaded `lode.toml` path; only when a config file was loaded), `LODE_READINESS` (`none`|`state`) and `LODE_INSTANCE` (`{pid}-{nanoid}`, the unique id for this startup that the app suffixes with the handshake phase, §8). Precedence low→high: `[env]` defaults < inherited host env < runtime PATH-prepend < injected `LODE_*`.
+
+---
+
+## 11. Private packages / authentication (header list passthrough)
+
+When downloading the manifest and artifacts, the HTTP headers in the `headers` list are **passed through as-is** to the request — one mechanism covers any authentication (Bearer, `X-Api-Key`, custom headers all work), with no need to model each scheme separately:
+
+```toml
+# lode.toml
+headers = [
+  "Authorization: Bearer ${RELEASE_TOKEN}",   # ${ENV} is expanded from lode's environment, so the secret never lands in a file
+  "X-Api-Key: ${API_KEY}",
+]
+```
+
+- `${VAR}` is expanded from the lode process environment at request time (it's recommended to inject via container secret/env, not writing plaintext in the header). Each `${VAR}` must be set at fetch time — an unset variable is a hard error, which is why the starter `lode.toml` ships this block commented out.
+- Setting `"auth": false` on an artifact → that URL has **no** headers added (e.g. a pre-signed link that already carries its own signature).
+- CLI: `--header "Name: Value"` (repeatable); env: `LODE_HEADERS` (newline-separated).
+- Authentication (the transport layer's "able to download") and signature (the trust layer's "really issued by them," §6) are orthogonal; for private sources, using both is recommended.
+- headers (including their expanded values) / private keys are **never written to logs/`state.json`**; logs redact URL query strings.
+
+---
+
+## 12. Manifest format spec (lode/v1) — the complete contract
+
+The remote manifest is provided by the publisher, in **JSON format** (UTF-8), fetched by lode from `[update].manifest`, and **not stored locally**. **For a complete maximal example, see [`docs/manifest.example.json`](./manifest.example.json)**. Structural contract:
+
+- Top level: `schema` (required, `"lode/v1"`), `name` (required, must match `app` in `lode.toml`), `key_id` (optional, the default signing public-key id), `alg` (optional, advisory: that key's algorithm, `ed25519` when absent), `sig` (optional, the catalog signature, §6 — *verify-if-present*: checked when present, never required).
+- `channels` (required): an object, keyed by channel name, with values containing `latest` (a version id). **Multiple channels are allowed**, and lode follows one per `channel`.
+- `versions` (required): an object, keyed by version id (referenced by a channel's `latest`), with values containing `notes` (optional) + an `assets` array (≥1).
+- Each asset is keyed by its **filename** (`name`); the operator selects one via `[update].asset`:
+
+| Field | Required | Description |
+|---|---|---|
+| `name` | ✓ | the asset **filename** (e.g. `myapp-linux-x86_64.tar.gz`) — the selection key and the signed identity; its extension fixes the `format` (§4) |
+| `url` | ✓ | absolute download URL |
+| `sha256` | ✓ | lowercase hex digest of the downloaded file (before unpacking) |
+| `sig` | conditional | base64 signature (the key's algorithm) over the §6 message `(name, version, sha256, run, exec)`; required under `require_signature=enforce` (and under `auto` once a trusted key is set) |
+| `key_id` | | overrides the top-level `key_id` |
+| `alg` | | advisory: the signing key's algorithm (`ed25519` when absent); verification uses the trusted key's own algorithm |
+| `run` | | optional literal launch command override (signed; overrides `[command].run`; see §4) |
+| `exec` | | optional CLI-passthrough command override (signed; overrides `[command].exec`; see §4) |
+| `size` | | expected byte count (an extra layer of protection) |
+| `auth` | | default `true`; `false` = no passthrough headers added to this URL (pre-signed) |
+
+> **No `platform`, no `format`, no `kind`**: the asset is chosen by filename, the format is derived from its extension, and the base run commands (`run`/`exec`/`workdir` + optional `[runtime]`) live in `lode.toml` (§4/§7/§10); a manifest asset may publish signed `run`/`exec` overrides. The manifest declares "what to download" (`name`/`url`/`sha256`) and optionally "how to launch" (`run`/`exec`); the operator decides the rest. After extraction, `chmod +x` is applied to the first whitespace token of the effective `run` (and `exec` if different) when it names a version-dir file.
+
+**Minimal example (single-file JS script, public source, unsigned)**:
+```json
+{
+  "schema": "lode/v1",
+  "name": "hello",
+  "channels": { "stable": { "latest": "1.0.0" } },
+  "versions": {
+    "1.0.0": { "assets": [
+      { "name": "hello.js",
+        "url": "https://releases.example.com/hello-1.0.0.js",
+        "sha256": "<hex>" }
+    ] }
+  }
+}
+```
+(The operator sets `[update].asset = "hello.js"`. The run command is configured in `lode.toml`: for a script use `run = "bun run"`, `exec = "bun"`; add `[runtime]` to download bun as needed.)
+
+### Packaging (release flow, language-agnostic)
+
+```bash
+# binary (Go/Rust/bun --compile): name the asset so its extension fixes the format
+tar -czf myapp-linux-x86_64.tar.gz -C build myapp
+lode-cli sign myapp-linux-x86_64.tar.gz --app myapp --version 1.5.0 --key publisher.key
+#  → prints sha256 + sig + key_id (publish sig as `<asset>.sig` beside the asset, or as the GitHub asset label)
+lode-cli manifest myapp-linux-x86_64.tar.gz --app myapp --version 1.5.0 \
+    --url https://releases.example.com/1.5.0/myapp-linux-x86_64.tar.gz \
+    --run ./myapp --key publisher.key --into manifest.json   # upsert the asset by name (--run/--exec are optional)
+lode-cli manifest-sign --into manifest.json --key publisher.key   # §6 catalog signature
+
+# single-file JS (bun build --outfile): no packaging extension → raw
+bun build ./src/index.ts --target bun --outfile hello.js
+lode-cli sign hello.js --app hello --version 1.0.0 --key publisher.key
+```
+
+Packaging and signing are **handled by the publisher** (any tooling in their own CI); lode ships no packaging script, only the convention; for the flow see [`docs/source-adapters.md`](source-adapters.md) and [`docs/integration.md`](integration.md) (build → sha256 → sign `(name, version, sha256)` → assemble the manifest). `lode-cli keygen`/`sign`/`manifest`/`manifest-sign` are the reference implementation.
+
+### Manifest source: native / GitHub — determined by "which key is set" (mutually exclusive, no separate `source`)
+
+The native manifest is the authoritative format (explicit, signable, and placeable on any static hosting: S3 / OSS / GitHub raw / gh-release asset). For "simple and universal," it also supports using **GitHub Releases** directly as a source, adapted into the same internal model, with the subsequent download/verify/install flow unchanged. **The source is determined by which key is set in `[update]`** (the two are mutually exclusive; setting both is an error):
+
+| Key set | Source | lode behavior |
+|---|---|---|
+| `[update].manifest = "<url>"` | native | fetch the `lode/v1` JSON specified above. |
+| `[update].github = "owner/name"` (configure `github_api` separately for GHE) | github | **use GitHub's native endpoints directly**, with no need to compute "the latest" yourself; map one release to one version. |
+
+**channel ↔ GitHub endpoint** (use GitHub's built-in `latest`/`tags`, without reinventing the wheel):
+
+| Scenario | GitHub endpoint | Description |
+|---|---|---|
+| `channel=stable` | `GET /repos/{repo}/releases/latest` | GitHub's `latest` = the most recent non-prerelease/non-draft release |
+| `channel=beta`/others | `GET /repos/{repo}/releases` → take the most recent `prerelease==true` | pre-release channel |
+| `pin=<tag>` | `GET /repos/{repo}/releases/tags/{tag}` | lock a specific tag |
+
+**The release's own assets are the catalog** — there is **no `manifest.json` asset**. The adapter:
+1. selects the release per the table above (latest/prerelease/tag);
+2. maps each release asset to an internal asset: `name` = the asset filename, `sha256` = the asset `digest` (GitHub-computed, re-verified against the downloaded bytes), `sig` = the release's **`<name>.sig`** sidecar asset when the asset has no **`label`** (the label — the only free-string slot the API returns — wins when set), `url` = `browser_download_url`;
+3. afterwards it is exactly the same as native (select the asset whose `name` matches `[update].asset` → verify sha256 + ed25519 → install).
+
+- **Version number**: use the release's `tag_name` (with a leading `v` before a digit stripped) — GitHub is authoritative for the version. A `pin` (or `--version`) given as the raw tag resolves to that same stripped id, so `versions/<id>` and the signed `version` never depend on how the release was selected — publishers sign with the stripped id.
+- **No catalog (manifest-level) signature on GitHub**: freshness comes from tag authority; per-asset `sig` (sidecar or label) still protects each download.
+- **Private repo**: put the GitHub token in `[http].headers` (`Authorization: Bearer <PAT>`), carried by the API and same-host asset downloads.
+
+> The simplest usage needs only `github = "owner/repo"` + `asset = "<filename>"`; `stable` goes straight to `/releases/latest`. Both sources produce the same internal asset list → the same verify/install path. Signing in CI is optional — see the release-workflow recipe in [`docs/source-adapters.md`](source-adapters.md) §5.
+
+---
+
+## 13. CLI — multi-call binary (`lode` / `lode-cli`)
+
+lode is a **multi-call binary**, dispatching by `argv[0]`: `lode-cli` is a **symlink** to the same binary, released together with it; inside the image both `/usr/bin/lode` and `/usr/bin/lode-cli` are on PATH.
+
+```
+# invoked as lode = pure loader, no subcommands at all
+lode                       # bare run = launch and supervise the service (runs lode.toml's run)
+lode <app args...>         # with arguments = CLI passthrough (runs exec + args); lode run db:init ≡ bun run db:init
+
+# invoked as lode-cli (symlink) = operations + publishing toolbox
+lode-cli <subcommand> [args]
+
+loader lode (no subcommands, so each argument clearly belongs to the app and never steals the app's run etc.):
+  (bare run)    launch and supervise the service: lock → determine version → launch `run` → poll for hot-update/rollback per policy
+  <app args>    CLI passthrough: verify version → exec-replace with `exec` + args; no lock/no supervision
+
+lode-cli management (writes state.json, communicates with the running service instance):
+  status       print state.json + a remote manifest summary, then exit
+  update       install the latest (or --version <v>); if a service is running, write target in state.json to hot-update, otherwise just install
+  rollback     set target in state.json to last_good (or --version <v>)
+  restart      increment restart_nonce in state.json, having the service restart the child process
+  versions     list the locally installed versions
+  seed         dev/testing: install a LOCAL executable/archive as a version (no manifest, no download, no signature check) and activate it, so bare `lode` runs it fully offline
+  self-update  replace this lode binary with the newest lode release, verified against the release keys built into the binary
+
+lode-cli publishing/signing (publisher, see docs/integration.md):
+  keygen       generate a publisher keypair + key_id (--alg ed25519 [default] | ecdsa-p256 | ecdsa-p384)
+  sign         compute sha256 for an artifact + produce a sig
+  verify       verify an artifact's sha256 + sig locally
+  manifest     sign one asset and generate / merge (--into) a lode/v1 manifest
+  manifest-sign  stamp a complete lode/v1 manifest's top-level key_id + sig in place (--into); --expires-in adds a signed expiry
+  publish      release a version to a lode-server registry: draft, upload the assets, publish to a channel
+  init         write out a starter lode.toml (example config)
+```
+
+The global arguments are the `--xxx` of §10 (parsed by clap, with `env` fallback), overriding env and lode.toml.
+
+---
+
+## 14. Crates
+
+lode is a workspace of three crates that compile into the one binary:
+
+| Crate | Role |
+|---|---|
+| `lode-core` | Config, manifest resolution (both sources), verified download and install, state, the PID lock and the `Engine` facade. No CLI parsing and no signal handling, so it can be embedded. |
+| `lode-supervisor` | The supervise loop: spawn, restart with backoff, signal forwarding, graceful stop, the readiness and stop handshakes, hot-update and rollback. Signals arrive through an injected source, so a host process can own them. |
+| `lode` | The binary: the `lode` / `lode-cli` multi-call dispatch, argument parsing and the publisher commands. |
+
+Process-wide effects (crypto provider, core-dump suppression, logging, panic hook) are opt-in for embedders through `InitOptions`.
+
+---
+
+## 15. Data directory layout
+
+```
+$LODE_DIR/
+  lode.toml                # local config (operator writes, app doesn't; can also be placed elsewhere and pointed to with --config)
+  lode.pid                 # the holder's pid (a plain pid file)
+  lode.pid.lock            # single-instance flock; never removed
+  state.json               # runtime state, written by lode and the app
+  state.json.lock          # flock that serialises state.json read-modify-writes
+  downloads/<ver>/<asset>    # verified download cache (kept; re-extractable, pruned with the version)
+  downloads/<ver>/<asset>.part  # in-progress download staging
+  runtime/<key>/<name>       # downloaded runtime; key = <version>-<url digest> (or url-<digest> when unpinned)
+  versions/<ver>/            # each version (raw/gz lands a single file / tar.gz/zip unpacked / binary chmod)
+    .lode.json             #   that version's metadata (run/exec/format etc.) for offline running
+  current -> versions/<ver>  # the atomically switched current symlink
+# Note: manifest.json is remote, not stored locally.
+```
+
+---
+
+## 16. Security and boundaries
+
+- Two-layer verification: sha256 + publisher signature (ed25519 / ECDSA); `enforce` rejects anything unsigned/with a failed signature.
+- Failure isolation: download is decoupled from launch. A verified artifact is cached at `downloads/<ver>/<asset>` and kept, so a failed extract/launch loses nothing — the next attempt re-extracts from the cache without re-downloading, and a fetch happens only when the cache is absent or fails its integrity check. An interrupted `*.part` is reaped by the startup GC; the cache is reclaimed only by version pruning. A new version crashing triggers automatic rollback — none of this affects the running version.
+- Atomicity: `state.json` is written temp+rename; version switching is a symlink rename, with no intermediate state.
+- Credentials: tokens/private keys never land in logs/state; URL query strings are redacted; the private key stays only on the publishing side.
+- Process: the child process uses an argv array, not through a shell; `#![forbid(unsafe_code)]`; `rlimit` suppresses core dumps; the panic hook emits structured logs.
+- Offline-capable: with no network, lode starts the locally installed `current` version (its `.lode.json` marker, or a `lode-cli seed` install); no manifest is read until the next update check.
+
+---
+
+## 17. App integration
+
+For app authors: the graceful-exit contract, sensing updates and triggering upgrades are in **`docs/integration.md`**.
+

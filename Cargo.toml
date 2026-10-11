@@ -1,0 +1,106 @@
+[workspace]
+members = ["crates/*"]
+# Bare `cargo build` / `cargo nextest run` at the root must cover the whole
+# workspace; `crates/lode` is included, so `cargo build` still yields
+# `target/debug/lode`.
+default-members = ["crates/*"]
+resolver = "3"
+
+[workspace.package]
+version = "0.0.1"
+edition = "2024"
+rust-version = "1.96.0"
+license = "MIT"
+repository = "https://github.com/bkhq/lode"
+authors = ["bkhq"]
+readme = "README.md"
+keywords = ["updater", "supervisor", "launcher", "self-update", "signing"]
+categories = ["command-line-utilities"]
+
+# Shared dependency versions: every crate pulls these via `dep = { workspace = true }`
+# so the three crates can never drift apart.
+[workspace.dependencies]
+lode-core = { path = "crates/lode-core", version = "0.0.1" }
+lode-supervisor = { path = "crates/lode-supervisor", version = "0.0.1" }
+lode-winproc = { path = "crates/lode-winproc", version = "0.0.1" }
+# CLI / config — clap backs only the `lode` binary's CLI surface (never lode-core).
+clap = { version = "4", features = ["derive", "env"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "1"
+# errors / logging
+thiserror = "2"
+anyhow = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", default-features = false, features = ["fmt", "env-filter", "ansi", "std"] }
+# verification
+sha2 = "0.11"
+ed25519-dalek = "3"
+# ECDSA (P-256 / P-384) publisher keys — RustCrypto, same digest generation as sha2.
+p256 = { version = "0.14", default-features = false, features = ["ecdsa", "std"] }
+p384 = { version = "0.14", default-features = false, features = ["ecdsa", "std"] }
+base64 = "0.23"
+zeroize = "1"
+getrandom = "0.4"
+# manifest / versions
+semver = "1"
+# packaging / extraction (pure Rust)
+flate2 = "1"
+tar = "0.4"
+zip = { version = "9", default-features = false, features = ["deflate"] }
+# tls / http (rustls + aws-lc-rs provider per pma-rust Lock 2)
+rustls = "0.23"
+ureq = { version = "3", default-features = false, features = ["rustls"] }
+# process / signals / hardening: Unix-only (see each crate's cfg(unix) table)
+signal-hook = "0.4"
+nix = { version = "0.31", default-features = false, features = ["signal", "process", "fs"] }
+rlimit = "0.11"
+
+# === Lock 4 — workspace lints (deny-warnings policy lives here, not on the CLI) ===
+[workspace.lints.rust]
+warnings = { level = "deny", priority = -2 }
+unsafe_code = "forbid"
+missing_debug_implementations = "warn"
+unreachable_pub = "warn"
+elided_lifetimes_in_paths = "warn"
+
+# Docs are built with `--document-private-items`, so links to private items resolve.
+[workspace.lints.rustdoc]
+private_intra_doc_links = "allow"
+
+[workspace.lints.clippy]
+pedantic = { level = "warn", priority = -1 }
+nursery = { level = "warn", priority = -1 }
+cargo = { level = "warn", priority = -1 }
+unwrap_used = "deny"
+expect_used = "deny"
+panic = "deny"
+dbg_macro = "deny"
+print_stdout = "deny"
+print_stderr = "deny"
+disallowed_methods = "deny"
+disallowed_types = "deny"
+module_name_repetitions = "allow"
+assert_is_empty = "allow"
+must_use_candidate = "allow"
+missing_errors_doc = "allow"
+missing_panics_doc = "allow"
+multiple_crate_versions = "allow"
+# Conflicts with rustc `unreachable_pub`; for a binary crate we prefer `pub(crate)`.
+redundant_pub_crate = "allow"
+todo = "warn"
+
+[profile.release]
+lto = "fat"
+codegen-units = 1
+debug = "line-tables-only"
+
+[profile.dist]
+inherits = "release"
+opt-level = "z"
+strip = "symbols"
+panic = "abort"
+debug = false
+
+[profile.dev]
+debug = "line-tables-only"

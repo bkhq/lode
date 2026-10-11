@@ -1,0 +1,184 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  fmt:
+    name: rustfmt
+    runs-on: ubuntu-26.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Install toolchain
+        run: rustup show active-toolchain
+      - name: cargo fmt
+        run: cargo fmt --all -- --check
+
+  clippy:
+    name: clippy
+    runs-on: ubuntu-26.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - name: Install toolchain
+        run: rustup show active-toolchain
+      - name: cargo clippy
+        run: cargo clippy --workspace --all-targets --all-features --locked
+
+  test:
+    name: test
+    runs-on: ubuntu-26.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - name: Install toolchain
+        run: rustup show active-toolchain
+      - name: Install nextest
+        uses: taiki-e/install-action@ab6895351a88b908e96a4697860d4ffea5e57dbe # v2.87.27
+        with:
+          tool: cargo-nextest
+      - name: cargo nextest
+        run: cargo nextest run --workspace --all-features --locked --profile ci
+      - name: cargo test --doc
+        run: cargo test --doc --workspace --all-features --locked
+
+  doc:
+    name: rustdoc
+    runs-on: ubuntu-26.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - name: Install toolchain
+        run: rustup show active-toolchain
+      - name: cargo doc
+        run: cargo doc --workspace --no-deps --document-private-items --locked
+
+  msrv:
+    name: msrv
+    runs-on: ubuntu-26.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - name: Install cargo-hack
+        uses: taiki-e/install-action@ab6895351a88b908e96a4697860d4ffea5e57dbe # v2.87.27
+        with:
+          tool: cargo-hack
+      # cargo-hack installs the toolchain named by `rust-version` on demand.
+      - name: cargo hack check --rust-version
+        run: cargo hack check --rust-version --workspace --ignore-private --locked
+
+  e2e:
+    name: bun e2e
+    runs-on: ubuntu-26.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - name: Install toolchain
+        run: rustup show active-toolchain
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
+        with:
+          bun-version: 1.4.3
+      - name: Build binaries
+        run: cargo build --bins --locked
+      - name: Install e2e dependencies
+        run: cd tests && bun install --frozen-lockfile
+      - name: Run e2e tests
+        run: cd tests && LODE_BIN=../target/debug/lode bun test --timeout 30000 src/
+
+  build:
+    name: release build
+    runs-on: ubuntu-26.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - name: Install toolchain
+        run: rustup show active-toolchain
+      - name: cargo build --release
+        run: cargo build --workspace --release --locked
+      # The embedding example is its own workspace; keep it compiling against the crates.
+      - name: cargo check (examples/embed)
+        run: cargo check --manifest-path examples/embed/Cargo.toml --locked
+
+  # Runs the built binaries end to end, including a supervised service. This job
+  # is the only place the Windows build is exercised.
+  smoke:
+    name: cli smoke (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-26.04, windows-latest]
+    env:
+      # aws-lc-sys: use its prebuilt assembly objects instead of requiring NASM.
+      AWS_LC_SYS_PREBUILT_NASM: "1"
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - name: Install toolchain
+        run: rustup show active-toolchain
+      - name: cargo clippy (Windows)
+        if: runner.os == 'Windows'
+        run: cargo clippy --workspace --locked
+      - name: Build binaries
+        run: cargo build --bins --locked
+      - name: Smoke test
+        shell: bash
+        env:
+          SMOKE_GITHUB_TOKEN: ${{ github.token }}
+          SMOKE_RELEASE_KEYS: crates/lode/release-keys.txt
+          # The release the GitHub update step installs; empty skips the step.
+          # Set it to v0.0.1 once that release is published.
+          SMOKE_RELEASE_TAG: ""
+          SMOKE_RUNTIME: "1"
+        run: |
+          set -eu
+          if [ "$RUNNER_OS" = Windows ]; then
+            cp target/debug/lode.exe target/debug/lode-cli.exe
+          else
+            ln -sf lode target/debug/lode-cli
+          fi
+          tests/smoke/cli.sh target/debug
+
+  typos:
+    name: typos
+    runs-on: ubuntu-26.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Check spelling
+        uses: crate-ci/typos@7f9d0819ca1c008ade73f4b41fa9d258d48f605b # v1.51.1
+
+  shear:
+    name: cargo shear
+    runs-on: ubuntu-26.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Install cargo-shear
+        uses: taiki-e/install-action@ab6895351a88b908e96a4697860d4ffea5e57dbe # v2.87.27
+        with:
+          tool: cargo-shear
+      - name: cargo shear
+        run: cargo shear
+
+  audit:
+    name: cargo audit + deny
+    runs-on: ubuntu-26.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - name: Install cargo-deny
+        uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25 # v2.1.1
+        with:
+          command: check
+          arguments: --all-features
+      - name: Install cargo-audit
+        uses: taiki-e/install-action@ab6895351a88b908e96a4697860d4ffea5e57dbe # v2.87.27
+        with:
+          tool: cargo-audit
+      - name: cargo audit
+        run: cargo audit

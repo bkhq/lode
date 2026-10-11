@@ -1,0 +1,657 @@
+//! Command-line surface (clap).
+//!
+//! lode is a **multi-call binary** (the [`crate::run`] entry dispatches on the
+//! program name):
+//!
+//! - invoked as **`lode`** → the loader. It has **no subcommands**: bare `lode`
+//!   starts and supervises the app; `lode <args>` is transparent passthrough
+//!   (exec-replace into the app). See [`LoaderCli`].
+//! - invoked as **`lode-cli`** (a symlink to the same binary) → the operator /
+//!   publisher multitool: management (`status`/`update`/…), lode's own
+//!   `self-update`, and authoring (`keygen`/`sign`/`verify`/`manifest`/`init`).
+//!   See [`ToolCli`].
+//!
+//! [`Globals`] (shared options) fall back to `LODE_*` env vars; the full
+//! precedence (CLI > env > TOML > default) is resolved in [`crate::config_cli`].
+//!
+//! The enum-valued flags use the `*Arg` mirrors below rather than the
+//! `lode_core::config` enums: `ValueEnum` is clap's trait and `lode-core` is
+//! deliberately clap-free, so the derive lives here and each mirror converts into
+//! its core twin. Variant names (and their doc comments, which clap renders as
+//! value help) match the core enums, so `--help` is unchanged.
+
+use clap::{Args, Parser, Subcommand, ValueEnum};
+
+use lode_core::config::{
+    Policy, Readiness, RequireManifest, RequireSignature, RestartMode, RestartPolicy,
+};
+
+/// `--policy` (mirror of [`Policy`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub(crate) enum PolicyArg {
+    /// No background checks; run current/pinned only.
+    Off,
+    /// Periodically check and advertise, but never auto-apply (default).
+    Check,
+    /// Periodically check and auto-apply newer versions.
+    Auto,
+}
+
+impl From<PolicyArg> for Policy {
+    fn from(v: PolicyArg) -> Self {
+        match v {
+            PolicyArg::Off => Self::Off,
+            PolicyArg::Check => Self::Check,
+            PolicyArg::Auto => Self::Auto,
+        }
+    }
+}
+
+/// `--require-signature` (mirror of [`RequireSignature`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub(crate) enum RequireSignatureArg {
+    /// Integrity only (sha256), no signature check.
+    Off,
+    /// Enforce when keys are configured, else warn-and-skip (default).
+    Auto,
+    /// Always require a valid signature.
+    Enforce,
+}
+
+/// `--require-manifest` (mirror of [`RequireManifest`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub(crate) enum RequireManifestArg {
+    /// A manifest signature or expiry is verified when present, never required (default).
+    Off,
+    /// The manifest must carry a valid top-level signature.
+    Signed,
+    /// As `signed`, and the manifest must carry a signed expiry that has not passed.
+    Fresh,
+}
+
+impl From<RequireManifestArg> for RequireManifest {
+    fn from(v: RequireManifestArg) -> Self {
+        match v {
+            RequireManifestArg::Off => Self::Off,
+            RequireManifestArg::Signed => Self::Signed,
+            RequireManifestArg::Fresh => Self::Fresh,
+        }
+    }
+}
+
+impl From<RequireSignatureArg> for RequireSignature {
+    fn from(v: RequireSignatureArg) -> Self {
+        match v {
+            RequireSignatureArg::Off => Self::Off,
+            RequireSignatureArg::Auto => Self::Auto,
+            RequireSignatureArg::Enforce => Self::Enforce,
+        }
+    }
+}
+
+/// `--readiness` (mirror of [`Readiness`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub(crate) enum ReadinessArg {
+    /// Alive for `health_grace` seconds counts as ready (default).
+    None,
+    /// Wait for the app to write `state.ready`.
+    State,
+}
+
+impl From<ReadinessArg> for Readiness {
+    fn from(v: ReadinessArg) -> Self {
+        match v {
+            ReadinessArg::None => Self::None,
+            ReadinessArg::State => Self::State,
+        }
+    }
+}
+
+/// `--restart` (mirror of [`RestartPolicy`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub(crate) enum RestartPolicyArg {
+    /// Mirror the child: lode exits with the child's code, never restarting. The
+    /// orchestrator owns whole-process restart.
+    Off,
+    /// Restart on failure (non-zero exit or killed by a signal); a clean `exit(0)`
+    /// makes lode exit too. After `restart_max` failed retries lode PAUSES (stays
+    /// alive — does not exit) until a recovery trigger. The default.
+    OnFailure,
+    /// Like `on-failure` but restart on *any* child exit, including a clean
+    /// `exit(0)`; pauses after `restart_max` retries.
+    Always,
+}
+
+impl From<RestartPolicyArg> for RestartPolicy {
+    fn from(v: RestartPolicyArg) -> Self {
+        match v {
+            RestartPolicyArg::Off => Self::Off,
+            RestartPolicyArg::OnFailure => Self::OnFailure,
+            RestartPolicyArg::Always => Self::Always,
+        }
+    }
+}
+
+/// `--restart-mode` (mirror of [`RestartMode`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub(crate) enum RestartModeArg {
+    /// Stop the old child before starting the new one (default).
+    StopStart,
+    /// systemd socket-activation protocol; needs `listen`.
+    SocketActivation,
+    /// Overlap old and new via `SO_REUSEPORT`.
+    ReuseportOverlap,
+}
+
+impl From<RestartModeArg> for RestartMode {
+    fn from(v: RestartModeArg) -> Self {
+        match v {
+            RestartModeArg::StopStart => Self::StopStart,
+            RestartModeArg::SocketActivation => Self::SocketActivation,
+            RestartModeArg::ReuseportOverlap => Self::ReuseportOverlap,
+        }
+    }
+}
+
+/// Shared options for both the loader and `lode-cli`. Every option is `global`
+/// and falls back to its `LODE_*` env var.
+#[derive(Debug, Args)]
+pub(crate) struct Globals {
+    /// Log level: trace | debug | info | warn | error (default: info).
+    /// `None` means "not set via CLI/env", so `lode.toml`'s `[global].log_level`
+    /// can take effect (precedence CLI/env > TOML > default, resolved in config).
+    #[arg(long = "log-level", env = "LODE_LOG_LEVEL", global = true)]
+    pub(crate) log_level: Option<String>,
+
+    /// Path to the `lode.toml` config file (TOML).
+    #[arg(long = "config", env = "LODE_CONFIG", global = true)]
+    pub(crate) config: Option<String>,
+
+    // --- [global] ---
+    /// Application name (namespaces the data dir + lock; matches the manifest `name`).
+    #[arg(long = "app", env = "LODE_APP_NAME", global = true)]
+    pub(crate) app: Option<String>,
+    /// Data directory holding versions/, `state.json` and the PID lock.
+    #[arg(long = "dir", env = "LODE_DIR", global = true)]
+    pub(crate) dir: Option<String>,
+
+    // --- [update] ---
+    /// Native source: lode/v1 manifest URL (mutually exclusive with `--github`).
+    #[arg(long = "manifest", env = "LODE_MANIFEST", global = true)]
+    pub(crate) manifest: Option<String>,
+    /// GitHub source: owner/name (mutually exclusive with `--manifest`).
+    #[arg(long = "github", env = "LODE_GITHUB", global = true)]
+    pub(crate) github: Option<String>,
+    /// GitHub API base URL (for GitHub Enterprise).
+    #[arg(long = "github-api", env = "LODE_GITHUB_API", global = true)]
+    pub(crate) github_api: Option<String>,
+    /// Asset filename to install on this host (the source-agnostic selection key).
+    #[arg(long = "asset", env = "LODE_ASSET", global = true)]
+    pub(crate) asset: Option<String>,
+    /// Channel to follow.
+    #[arg(long = "channel", env = "LODE_CHANNEL", global = true)]
+    pub(crate) channel: Option<String>,
+    /// Update policy: off | check | auto.
+    #[arg(long = "policy", env = "LODE_UPDATE_POLICY", global = true)]
+    pub(crate) policy: Option<PolicyArg>,
+    /// Check interval in seconds (0 = check once at startup).
+    #[arg(long = "interval", env = "LODE_CHECK_INTERVAL", global = true)]
+    pub(crate) interval: Option<u64>,
+    /// Number of old versions to keep.
+    #[arg(long = "keep", env = "LODE_KEEP_VERSIONS", global = true)]
+    pub(crate) keep: Option<u32>,
+    /// Pin to a specific version/tag (disables auto-update).
+    #[arg(long = "pin", env = "LODE_PIN_VERSION", global = true)]
+    pub(crate) pin: Option<String>,
+
+    // --- [http] ---
+    /// HTTP header passed to downloads (`Name: Value`); repeatable.
+    #[arg(
+        long = "header",
+        env = "LODE_HEADERS",
+        value_delimiter = '\n',
+        global = true
+    )]
+    pub(crate) header: Vec<String>,
+    /// Extra host allowed to receive `--header` credentials on an artifact
+    /// download (beyond the manifest/source origin); repeatable.
+    #[arg(
+        long = "credential-host",
+        env = "LODE_CREDENTIAL_HOSTS",
+        value_delimiter = '\n',
+        global = true
+    )]
+    pub(crate) credential_host: Vec<String>,
+    /// Allow non-HTTPS (plain http) remote fetches. Loopback http is always allowed.
+    #[arg(
+        long = "allow-insecure-http",
+        env = "LODE_ALLOW_INSECURE_HTTP",
+        global = true
+    )]
+    pub(crate) allow_insecure_http: bool,
+
+    // --- [trust] ---
+    /// Signature enforcement: off | auto | enforce.
+    #[arg(
+        long = "require-signature",
+        env = "LODE_REQUIRE_SIGNATURE",
+        global = true
+    )]
+    pub(crate) require_signature: Option<RequireSignatureArg>,
+    /// What the manifest itself must prove: off | signed | fresh.
+    #[arg(
+        long = "require-manifest",
+        env = "LODE_REQUIRE_MANIFEST",
+        global = true
+    )]
+    pub(crate) require_manifest: Option<RequireManifestArg>,
+    /// Trusted public keys, comma-separated `key_id:base64`.
+    #[arg(long = "trusted-keys", env = "LODE_TRUSTED_KEYS", global = true)]
+    pub(crate) trusted_keys: Option<String>,
+    /// Path to a trusted-keys file (one `key_id base64` per line).
+    #[arg(
+        long = "trusted-keys-file",
+        env = "LODE_TRUSTED_KEYS_FILE",
+        global = true
+    )]
+    pub(crate) trusted_keys_file: Option<String>,
+
+    // --- [command] ---
+    /// Bare-run launch command (literal, whitespace-split, cwd = `workdir`; a
+    /// manifest asset `run` overrides it).
+    #[arg(long = "run", env = "LODE_RUN", global = true)]
+    pub(crate) run: Option<String>,
+    /// CLI-passthrough base command (`lode <args>` appended; a manifest asset
+    /// `exec` overrides it).
+    #[arg(long = "exec", env = "LODE_EXEC", global = true)]
+    pub(crate) exec: Option<String>,
+    // The child's working directory is auto-set to the running version dir and
+    // exposed to the app as `LODE_WORKDIR`; override (rarely) via `[command].workdir`
+    // in lode.toml — no CLI flag.
+
+    // --- [runtime] ---
+    /// Runtime executable name used by run/exec.
+    #[arg(long = "runtime", env = "LODE_RUNTIME", global = true)]
+    pub(crate) runtime: Option<String>,
+    /// Download URL for the runtime when it is absent from PATH.
+    #[arg(
+        long = "runtime-download",
+        env = "LODE_RUNTIME_DOWNLOAD",
+        global = true
+    )]
+    pub(crate) runtime_download: Option<String>,
+    /// Expected runtime version; probed and required to match (substring).
+    #[arg(long = "runtime-version", env = "LODE_RUNTIME_VERSION", global = true)]
+    pub(crate) runtime_version: Option<String>,
+    /// Arg(s) that print the runtime version (default `--version`).
+    #[arg(
+        long = "runtime-version-check",
+        env = "LODE_RUNTIME_VERSION_CHECK",
+        global = true
+    )]
+    pub(crate) runtime_version_check: Option<String>,
+    /// Expected sha256 (64 hex chars) of the runtime download; a mismatch is refused.
+    #[arg(long = "runtime-sha256", env = "LODE_RUNTIME_SHA256", global = true)]
+    pub(crate) runtime_sha256: Option<String>,
+
+    // --- [supervise] ---
+    /// Restart policy: off | on-failure | always (default on-failure).
+    #[arg(long = "restart", env = "LODE_RESTART", global = true)]
+    pub(crate) restart: Option<RestartPolicyArg>,
+    /// Crash-restart backoff base, seconds (only used when restart != off).
+    #[arg(long = "restart-backoff", env = "LODE_RESTART_BACKOFF", global = true)]
+    pub(crate) restart_backoff: Option<u64>,
+    /// Crash-restart backoff cap, seconds (only used when restart != off).
+    #[arg(
+        long = "restart-backoff-max",
+        env = "LODE_RESTART_BACKOFF_MAX",
+        global = true
+    )]
+    pub(crate) restart_backoff_max: Option<u64>,
+    /// Max consecutive restarts, 0 = unlimited (only used when restart != off).
+    #[arg(long = "restart-max", env = "LODE_RESTART_MAX", global = true)]
+    pub(crate) restart_max: Option<u32>,
+    /// Readiness check: none | state.
+    #[arg(long = "readiness", env = "LODE_READINESS", global = true)]
+    pub(crate) readiness: Option<ReadinessArg>,
+    /// `readiness=state`: seconds to wait for ready before failing.
+    #[arg(long = "ready-timeout", env = "LODE_READY_TIMEOUT", global = true)]
+    pub(crate) ready_timeout: Option<u64>,
+    /// `readiness=none`: seconds a new version must survive to be good.
+    #[arg(long = "health-grace", env = "LODE_HEALTH_GRACE", global = true)]
+    pub(crate) health_grace: Option<u64>,
+    /// Graceful-stop seconds before SIGKILL.
+    #[arg(long = "stop-timeout", env = "LODE_STOP_TIMEOUT", global = true)]
+    pub(crate) stop_timeout: Option<u64>,
+    /// Restart mode: stop-start | socket-activation | reuseport-overlap.
+    #[arg(long = "restart-mode", env = "LODE_RESTART_MODE", global = true)]
+    pub(crate) restart_mode: Option<RestartModeArg>,
+    /// socket-activation listen address (e.g. 0.0.0.0:3000).
+    #[arg(long = "listen", env = "LODE_LISTEN", global = true)]
+    pub(crate) listen: Option<String>,
+
+    // --- [signals] ---
+    /// Signals forwarded to the child, comma-separated.
+    #[arg(long = "forward-signals", env = "LODE_FORWARD_SIGNALS", global = true)]
+    pub(crate) forward_signals: Option<String>,
+    /// Signal that triggers a graceful restart instead of being forwarded.
+    #[arg(long = "restart-signal", env = "LODE_RESTART_SIGNAL", global = true)]
+    pub(crate) restart_signal: Option<String>,
+}
+
+/// The **loader** CLI (`lode`). No subcommands: bare `lode` starts the supervised
+/// service; `lode <args>` forwards everything to the app via exec passthrough.
+#[derive(Debug, Parser)]
+#[command(name = "lode", version, about, long_about = None)]
+pub(crate) struct LoaderCli {
+    #[command(flatten)]
+    pub(crate) globals: Globals,
+
+    /// App arguments — forwarded verbatim to the child via exec passthrough.
+    /// Empty (bare `lode`) starts the supervised service instead.
+    #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+    pub(crate) args: Vec<String>,
+}
+
+/// The **`lode-cli`** multitool (a symlink to the `lode` binary). Management +
+/// publisher subcommands; same global options as the loader.
+#[derive(Debug, Parser)]
+#[command(name = "lode-cli", version, about = "lode operator + publisher toolkit", long_about = None)]
+pub(crate) struct ToolCli {
+    #[command(flatten)]
+    pub(crate) globals: Globals,
+
+    #[command(subcommand)]
+    pub(crate) command: ToolCommand,
+}
+
+/// `lode-cli` subcommands. See `docs/architecture.md` §13 and `docs/integration.md`.
+#[derive(Debug, Subcommand)]
+pub(crate) enum ToolCommand {
+    /// Print current/available version and lode state, then exit.
+    Status,
+    /// Install the latest (or a specific) version; hot-update a running instance.
+    Update {
+        /// Install this version instead of the channel latest.
+        #[arg(long = "version")]
+        version: Option<String>,
+    },
+    /// Roll back to the last known-good (or a specific) version.
+    Rollback {
+        /// Roll back to this version instead of the recorded `last_good`.
+        #[arg(long = "version")]
+        version: Option<String>,
+    },
+    /// Ask a running instance to restart the child process.
+    Restart,
+    /// List locally installed versions.
+    Versions,
+    /// Update THIS lode binary: download the newest lode release (or `--version`),
+    /// verify it against the release keys built into the binary, and replace the
+    /// running executable in place. Restart lode to run the new version. Never
+    /// reads the app's `lode.toml` / `LODE_*` source.
+    SelfUpdate {
+        /// Release tag to install (e.g. `v0.0.1`) instead of the newest stable
+        /// release; also the way to downgrade deliberately.
+        #[arg(long = "version")]
+        version: Option<String>,
+        /// Trust this release-key entry (`<key_id>:<base64>`, as printed by
+        /// `keygen`) instead of the built-in list — key-rotation recovery.
+        #[arg(long = "release-key")]
+        release_key: Option<String>,
+    },
+    /// Dev/testing: install a LOCAL executable (or archive) as a version — no
+    /// manifest, no download, no signature check — and activate it, so bare `lode`
+    /// runs it fully offline. Scaffolds a sourceless `lode.toml` if the data dir has
+    /// none. NOT for production installs (those go through `update`, which verifies).
+    Seed {
+        /// The local executable (or `.tar.gz`/`.zip`/`.gz`) to install as a version.
+        app_bin: String,
+        /// Version id to install as (keys `versions/<id>`; use semver so rollback /
+        /// the downgrade floor order correctly).
+        #[arg(long = "version", default_value = "0.0.0-dev")]
+        version: String,
+        /// Install into `versions/` but do not flip `current` / write `state.json`.
+        #[arg(long)]
+        no_activate: bool,
+    },
+
+    /// Generate a publisher keypair (ed25519 by default).
+    Keygen {
+        /// Write `<prefix>.key` (private) and `<prefix>.pub` (public) instead of only printing.
+        #[arg(long)]
+        out: Option<String>,
+        /// Signature algorithm: `ed25519` (default), `ecdsa-p256`, or `ecdsa-p384`.
+        /// Non-ed25519 keys are written and printed tagged (`<alg>:…`), so every
+        /// consumer knows how to use them.
+        #[arg(long, default_value = "ed25519")]
+        alg: String,
+    },
+    /// Sign an asset (emit sha256 + signature; publish the signature as a
+    /// `<asset>.sig` sidecar next to the asset, or as the GitHub asset `label`).
+    /// Provide the key with exactly one of `--key` (file) or `--key-env` (env var).
+    /// Needs `--app`: the signature binds the app name, which must be the
+    /// loader's `[global].app`.
+    Sign {
+        /// Path to the asset file (its basename is the signed `name`).
+        artifact: String,
+        /// Release version (bound into the signature).
+        #[arg(long = "version")]
+        version: String,
+        /// Launch-command override published with this asset (bound into the
+        /// signature; the loader runs it instead of `[command].run`).
+        #[arg(long)]
+        run: Option<String>,
+        /// Passthrough-command override published with this asset (bound into the
+        /// signature; the loader uses it instead of `[command].exec`).
+        #[arg(long)]
+        exec: Option<String>,
+        /// Path to the private key file (from `keygen`: base64 seed, or
+        /// `<alg>:<base64>` for an ECDSA key).
+        #[arg(long)]
+        key: Option<String>,
+        /// Read the private key (same form as the key file) from this env var (e.g.
+        /// a CI secret) instead of a key file — the key never touches disk.
+        #[arg(long = "key-env")]
+        key_env: Option<String>,
+    },
+    /// Verify an asset's sha256 + signature locally. Needs `--app`, as `sign` does.
+    Verify {
+        /// Path to the asset file (its basename is the signed `name`).
+        artifact: String,
+        /// Release version (bound into the signature).
+        #[arg(long = "version")]
+        version: String,
+        /// The asset's published `run` override, if any (part of the signed message).
+        #[arg(long)]
+        run: Option<String>,
+        /// The asset's published `exec` override, if any (part of the signed message).
+        #[arg(long)]
+        exec: Option<String>,
+        /// Public key: base64 (ed25519), or `<alg>:<base64>` as printed by `keygen`.
+        // base64url values may start with `-`.
+        #[arg(long, allow_hyphen_values = true)]
+        pubkey: String,
+        /// Base64 signature.
+        #[arg(long, allow_hyphen_values = true)]
+        sig: String,
+    },
+    /// Sign an asset and emit (or create-or-merge with `--into`) a `lode/v1` manifest.
+    Manifest {
+        /// Path to the asset file (its basename is the asset `name`).
+        artifact: String,
+        /// Release version this asset belongs to.
+        #[arg(long = "version")]
+        version: String,
+        /// Download URL for this asset in the manifest (runtime; not signed).
+        #[arg(long)]
+        url: String,
+        /// Launch-command override published with this asset (signed; overrides
+        /// the operator's `[command].run`).
+        #[arg(long)]
+        run: Option<String>,
+        /// Passthrough-command override published with this asset (signed;
+        /// overrides the operator's `[command].exec`).
+        #[arg(long)]
+        exec: Option<String>,
+        /// Expected byte size (optional integrity guard).
+        #[arg(long)]
+        size: Option<u64>,
+        /// Channel whose `latest` is set to this version.
+        #[arg(long, default_value = "stable")]
+        channel: String,
+        /// Path to the private key file (from `keygen`: base64 seed, or
+        /// `<alg>:<base64>` for an ECDSA key).
+        #[arg(long)]
+        key: String,
+        /// Create-or-merge into this `manifest.json` instead of printing.
+        #[arg(long)]
+        into: Option<String>,
+    },
+    /// Publish a release to a lode-server registry: create the draft version,
+    /// upload every asset and publish it to a channel. The token is read from
+    /// `LODE_REGISTRY_TOKEN`. Re-running after a failure continues the draft.
+    Publish(PublishArgs),
+    /// Sign a complete `lode/v1` manifest in place (set its top-level `key_id` + `sig`).
+    ManifestSign(ManifestSignArgs),
+    /// Write a minimal starter `lode.toml` (see docs/lode.example.toml for the
+    /// full documented reference).
+    Init {
+        /// Destination path; prints to stdout if omitted.
+        path: Option<String>,
+    },
+}
+
+/// Arguments of `lode-cli publish`.
+#[derive(Debug, Args)]
+pub(crate) struct PublishArgs {
+    /// Base URL of the registry, including a base path if it has one.
+    #[arg(long, default_value = crate::publish::DEFAULT_REGISTRY)]
+    pub(crate) registry: String,
+    /// The package, as `<namespace>/<slug>`.
+    #[arg(long)]
+    pub(crate) package: String,
+    /// The version to release.
+    #[arg(long = "version")]
+    pub(crate) version: String,
+    /// Channel that will point at the version.
+    #[arg(long, default_value = "stable")]
+    pub(crate) channel: String,
+    /// Release notes, stored when the draft is created.
+    #[arg(long)]
+    pub(crate) notes: Option<String>,
+    /// Path to an ed25519 private key file (from `keygen`); signs every asset.
+    #[arg(long)]
+    pub(crate) key: Option<String>,
+    /// Read the ed25519 private key from this env var instead of a file.
+    #[arg(long = "key-env")]
+    pub(crate) key_env: Option<String>,
+    /// Launch-command override published with every asset (signed).
+    #[arg(long)]
+    pub(crate) run: Option<String>,
+    /// Passthrough-command override published with every asset (signed).
+    #[arg(long)]
+    pub(crate) exec: Option<String>,
+    /// Permit a plain-`http` registry that is not on loopback.
+    #[arg(long = "allow-insecure")]
+    pub(crate) allow_insecure: bool,
+    /// The asset files; each is stored under its file name.
+    #[arg(required = true)]
+    pub(crate) files: Vec<String>,
+}
+
+/// `lode-cli manifest-sign` arguments.
+#[derive(Debug, clap::Args)]
+pub(crate) struct ManifestSignArgs {
+    /// The `manifest.json` to sign in place.
+    #[arg(long = "into")]
+    pub(crate) into: String,
+    /// Path to the private key file (from `keygen`: base64 seed, or
+    /// `<alg>:<base64>` for an ECDSA key).
+    #[arg(long)]
+    pub(crate) key: String,
+    /// Also stamp a signed expiry this far from now: a number with a unit
+    /// `m`, `h` or `d` (e.g. `30d`). Re-sign before it passes — loaders refuse
+    /// an expired manifest. Without it any existing expiry is removed.
+    #[arg(long = "expires-in", value_name = "DURATION", value_parser = parse_duration)]
+    pub(crate) expires_in: Option<u64>,
+}
+
+/// Parse `--expires-in`: a positive whole number followed by `m`, `h` or `d`,
+/// returned in seconds.
+fn parse_duration(text: &str) -> Result<u64, String> {
+    let usage = || format!("{text:?} is not a duration (use e.g. 90m, 12h, 30d)");
+    let unit = match text.chars().last() {
+        Some('m') => 60,
+        Some('h') => 3600,
+        Some('d') => 86_400,
+        _ => return Err(usage()),
+    };
+    let count: u64 = text[..text.len() - 1].parse().map_err(|_| usage())?;
+    if count == 0 {
+        return Err(usage());
+    }
+    count.checked_mul(unit).ok_or_else(usage)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn expires_in_takes_a_count_and_a_unit() {
+        assert_eq!(parse_duration("90m"), Ok(5400));
+        assert_eq!(parse_duration("12h"), Ok(43_200));
+        assert_eq!(parse_duration("30d"), Ok(2_592_000));
+        for bad in [
+            "",
+            "30",
+            "d",
+            "0d",
+            "-1d",
+            "1.5h",
+            "3w",
+            "99999999999999999999d",
+        ] {
+            assert!(parse_duration(bad).is_err(), "{bad:?} should be refused");
+        }
+        let cli = ToolCli::try_parse_from([
+            "lode-cli",
+            "manifest-sign",
+            "--into",
+            "m.json",
+            "--key",
+            "k",
+            "--expires-in",
+            "7d",
+        ])
+        .unwrap();
+        assert!(matches!(
+            cli.command,
+            ToolCommand::ManifestSign(ManifestSignArgs {
+                expires_in: Some(604_800),
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn verify_accepts_base64url_values_that_start_with_a_hyphen() {
+        let cli = ToolCli::try_parse_from([
+            "lode-cli",
+            "verify",
+            "a.bin",
+            "--version",
+            "1.0.0",
+            "--pubkey",
+            "-pub_",
+            "--sig",
+            "-sig_",
+        ])
+        .unwrap();
+        assert!(matches!(
+            cli.command,
+            ToolCommand::Verify { pubkey, sig, .. } if pubkey == "-pub_" && sig == "-sig_"
+        ));
+    }
+}

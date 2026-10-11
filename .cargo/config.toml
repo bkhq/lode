@@ -1,0 +1,15 @@
+# Build environment only. Lint policy lives in Cargo.toml [workspace.lints] (Lock 4).
+
+[net]
+git-fetch-with-cli = true
+
+# Static musl builds for portable, FROM-scratch/distroless distribution.
+[target.x86_64-unknown-linux-musl]
+rustflags = ["-C", "target-feature=+crt-static"]
+
+[target.aarch64-unknown-linux-musl]
+rustflags = ["-C", "target-feature=+crt-static"]
+
+# Static CRT, so the Windows binaries need no Visual C++ runtime installed.
+[target.x86_64-pc-windows-msvc]
+rustflags = ["-C", "target-feature=+crt-static"]

@@ -1,0 +1,61 @@
+# deno.lode.toml — run a Deno app under lode without building a per-app image.
+#
+# Model: a generic base image (e.g. zzci/ubase) carries only lode; lode downloads
+# `deno` ONCE into its runtime cache ($LODE_DIR/runtime/<key>/deno) and reuses it on every
+# later boot. Each app ships only this lode.toml + a release artifact. Deno runs
+# TypeScript and remote/`npm:` imports natively, so usually no bundling is needed.
+#
+# Deno is the easy one: its official release .zip is a single `deno` binary at the
+# archive root, so lode places it directly at runtime/<key>/deno — no self-hosting needed.
+#
+#   docker run --rm -e PORT=8080 -p 8080:8080 \
+#     -v lode-myapp:/srv/lode \                      # persist the runtime cache + versions
+#     -v "$PWD/deno.lode.toml:/srv/lode/lode.toml:ro" \
+#     -e LODE_TRUSTED_KEYS="<key_id>:<base64-pubkey>" \
+#     docker.io/bkhq/lode:latest
+
+[global]
+app      = "myapp"
+dir = "/srv/lode"    # MUST be a persistent volume so the runtime cache survives restarts
+
+[update]
+github = "owner/myapp"
+# manifest = "https://releases.example.com/myapp/manifest.json"
+asset   = "main.ts"       # a single .ts/.js file. Tarball instead: asset = "myapp-1.0.0.tar.gz"
+channel = "stable"
+policy  = "auto"
+# pin   = "1.4.2"
+
+[trust]
+require_signature = "enforce"
+trusted_keys = ["<key_id>:<base64-pubkey>"]
+
+# `deno run -A main.ts` for bare `lode` (cwd = the version dir, where the file
+# lands under its asset name); `deno <args>` for `lode <args>`. Prefer
+# least-privilege flags over -A, e.g. "deno run --allow-net --allow-env main.ts".
+[command]
+run     = "deno run -A main.ts"
+exec    = "deno"
+# workdir = "{dir}"   # optional; omit for the version dir (default), or set an absolute path
+
+# lode downloads deno if absent from PATH, caches it at $LODE_DIR/runtime/<key>/deno
+# (keyed by version + download URL), and reuses it next boot; bump `version`/`download`
+# to roll it forward.
+# Runtime downloads are UNVERIFIED — pin the version (swap arch for arm64).
+[runtime]
+runtime  = "deno"
+download = "https://github.com/denoland/deno/releases/download/v2.8.3/deno-x86_64-unknown-linux-gnu.zip"   # arm64: deno-aarch64-unknown-linux-gnu.zip
+version  = "2.8.3"   # probed via `deno --version` (output contains "deno 2.8.3 …")
+
+# Extra env for the child, as DEFAULTS — a per-deploy `-e KEY=VALUE` overrides them
+# (lode's LODE_* always win).
+[env]
+# DENO_DIR = "/srv/lode/deno-cache"   # persist Deno's module cache on the data volume
+# PORT     = "8080"                   # or just pass `-e PORT=8080` to `docker run`
+
+[supervise]
+readiness     = "state"   # app writes state.ready = $LODE_INSTANCE once it can serve
+ready_timeout = 20
+health_grace  = 5
+stop_timeout  = 10
+restart       = "on-failure"

@@ -1,0 +1,170 @@
+# Security Policy
+
+## Supported Versions
+
+lode is pre-1.0 software (`0.x.y` versioning; a minor bump may break compatibility). Only the **latest
+released version** receives security updates. Older releases are not patched —
+please upgrade to the most recent release before reporting an issue.
+
+| Version | Supported          |
+| ------- | ------------------ |
+| latest `0.x` release | :white_check_mark: |
+| any older release | :x:           |
+
+## Reporting a Vulnerability
+
+**Please do not open a public GitHub issue for security vulnerabilities.**
+Public disclosure before a fix is available puts all users at risk.
+
+Report vulnerabilities privately through GitHub Security Advisories:
+
+1. Go to <https://github.com/bkhq/lode/security/advisories>.
+2. Click **"Report a vulnerability"**.
+3. Fill in the advisory form with the details below.
+
+This opens a private channel visible only to the maintainers and you.
+
+### What to include
+
+To help us triage and reproduce quickly, please provide:
+
+- A clear description of the vulnerability and its impact.
+- The affected version (and platform/OS, if relevant).
+- Step-by-step reproduction instructions or a proof of concept.
+- Any relevant logs, manifests, or configuration (with secrets redacted).
+- Your assessment of severity and possible mitigations, if known.
+
+## Response Timeline
+
+- **Acknowledgement:** we aim to acknowledge your report within **72 hours**.
+- **Triage:** we will assess and confirm the issue, and share an initial
+  severity assessment, within **7 days** of acknowledgement.
+- **Fix:** for confirmed vulnerabilities we target a fix or mitigation in the
+  next release, prioritized by severity. We will keep you updated on progress.
+
+## Coordinated Disclosure
+
+We follow coordinated disclosure. Please give us a reasonable window to
+investigate and ship a fix before any public disclosure. Once a fix is
+released, we will publish a security advisory and credit the reporter (unless
+you prefer to remain anonymous). We ask that you do not disclose the issue
+publicly until the advisory is published.
+
+## Scope
+
+This policy covers the lode loader/supervisor and its update and verification
+path, including:
+
+- The loader/supervisor binary and its process-management behavior.
+- The update mechanism (manifest handling, download, and version selection).
+- The verification path: integrity checking (hashes) and publisher-identity
+  verification (signatures).
+
+Issues in third-party dependencies should be reported upstream, but you are
+welcome to notify us if lode's use of a dependency is exploitable.
+
+## Threat Model Summary
+
+- **Artifact verification:** every installed artifact is verified by **sha256**
+  and, when configured, a **publisher signature** (ed25519 by default, or
+  ECDSA P-256 / P-384 — the algorithm is pinned on the trusted key, never read
+  from the manifest) over a minimal message (asset name / version / sha256 / `run` / `exec`). `[trust].require_signature = off | auto |
+  enforce` gates **artifacts only**; `auto` (the default) enforces only when
+  trusted keys are configured — set `enforce` for production (the starter
+  config written by `lode-cli init` / first run pins it). Without trusted keys,
+  `auto` still refuses an asset that publishes a `run`/`exec` launch override:
+  an override nothing can verify is a command of the manifest source's
+  choosing and is never run (only `off` runs it).
+- **Trust anchors pinned per process:** `[trust]`, the `[update]` source
+  (`manifest`/`github`/`github_api`), the `[http]` credential scope
+  (`allow_insecure`, `credential_hosts`) and the `[runtime]` download
+  (`download`/`sha256`) are fixed when lode starts. A `lode.toml` reload —
+  triggered by the app-owned `restart_nonce`, or by an edit while paused —
+  applies every other section but never these: an edit that weakens
+  verification, repoints the catalog or redirects credentials is refused with
+  an error until lode itself is restarted.
+- **Catalog/manifest signature:** *verify-if-present* — checked when a
+  signature exists, never required (so GitHub-source catalogs and unsigned
+  native catalogs install, while a present signature must still verify).
+- **Downgrade floor on `latest`:** a rolled-back (or compromised) channel
+  `latest` cannot move an instance below `max(current, last_good)`.
+- **Same-origin credential gating:** `[http].headers` credentials are attached
+  only to same-origin downloads (or hosts explicitly listed in
+  `credential_hosts`) and are stripped on cross-host redirects, so a tampered
+  manifest cannot redirect tokens to an attacker.
+- **HTTPS by default:** plain-http remote fetches are refused unless
+  `allow_insecure` is set; loopback http is always allowed.
+- **Self-update:** `lode-cli self-update` fetches lode's own releases from
+  `github.com/bkhq/lode` only, always under `require_signature = enforce`
+  against the release keys compiled into the binary
+  (`crates/lode/release-keys.txt`); the app's `lode.toml` / `LODE_*` source
+  and trusted keys are never consulted. The verified binary is probed
+  (`--version` must report the target) and atomically renamed over the
+  running executable, which keeps its old inode until lode restarts.
+
+## Artifact extraction safety
+
+Even a verified artifact is treated as untrusted bytes during landing, so a
+malicious or malformed archive cannot escape the data dir, smuggle in dangerous
+permissions, or exhaust the host. These guards are implemented:
+
+- **Path-component validation** (`crates/lode-core/src/idval.rs`): every untrusted id that becomes
+  a filesystem path — a manifest `versions` key, a GitHub release tag, the
+  `[runtime].runtime` name — is validated before any path join. It must be one
+  safe component: no `..`, no `/` or `\`, not absolute, no control characters, no
+  leading `.` or `-`, and nothing outside `[A-Za-z0-9._-]`.
+- **Archive containment** (`crates/lode-core/src/install.rs`): `tar.gz` is unpacked entry-by-entry
+  via the `tar` crate's `unpack_in`, which skips any entry whose path contains
+  `..` or is absolute (and keeps symlink targets inside the destination); `zip`
+  uses `enclosed_name()`, rejecting any entry that would traverse out; and the
+  `safe_join` helper rejects absolute or `..` landing paths for raw/gz files.
+- **Decompression / size caps (zip-bomb & DoS guards):** cumulative *decompressed*
+  output is capped at `MAX_DECOMPRESSED_BYTES` = 2 GiB for `tar.gz`/`gz`/`zip`
+  (enforced independently of the manifest `size`, which only bounds the
+  compressed download), the archive entry count is capped at
+  `MAX_ARCHIVE_ENTRIES` = 100,000, and the streamed download body itself is
+  capped at `MAX_DOWNLOAD_BYTES` = 2 GiB (`crates/lode-core/src/download.rs`). A bomb is rejected
+  mid-stream — at most one byte past a cap ever reaches disk — so a tiny artifact
+  cannot expand to fill the disk or exhaust memory/inodes.
+- **Permission clamping** (`crates/lode-core/src/install.rs`): archive-supplied unix modes are NOT
+  trusted. setuid/setgid/sticky (`0o7000`) and group/other-write bits are
+  stripped; each extracted file is clamped to `0o644` (or `0o755` when it carries
+  an execute bit) and directories to `0o755`. The effective launch command's
+  target file is then `chmod +x`'d explicitly.
+
+## Manifest-supplied `run`/`exec`
+
+A manifest asset may publish optional `run` and `exec` fields that override the operator's `[command]` launch commands. These fields control arbitrary command execution. lode binds them into the per-artifact signed message and the catalog signature — a tampered `run`/`exec` will fail verification under `require_signature = auto` (with keys) or `enforce`. Without signatures, a compromised manifest delivery can inject arbitrary run commands. **Recommendation:** configure `[trust].trusted_keys` and `require_signature = "enforce"` when the manifest is network-served.
+
+## Known Limitations
+
+- **`[runtime].download` artifacts are NOT signature-verified.** Set
+  `[runtime].sha256` — a download whose digest differs is refused and discarded
+  before it reaches the child's PATH. Without it the only protections are TLS
+  and the operator-pinned URL, and a compromised runtime host runs arbitrary
+  code under the app, whatever `require_signature` says. Further mitigations:
+  - pin `[runtime].version` so a swapped runtime fails the version probe;
+  - serve runtimes from a host you control, over HTTPS;
+  - list that host in `credential_hosts` only if it actually needs
+    credentials.
+- **lode and the app share one user and one data directory.** The child is
+  spawned with lode's uid (there is no privilege drop), and the app contract
+  requires write access to `$LODE_DIR` (`state.json`). A compromised app can
+  therefore rewrite installed version directories (they are not re-verified at
+  launch), request any catalog version through `state.target`, or edit a
+  writable `lode.toml`. The per-process pinning above stops a reload from
+  weakening trust, but the edit would take effect on lode's next start. Run
+  the container so that `lode.toml` (and any `trusted_keys_file`) is read-only
+  to the app — the README's `-v …/lode.toml:/srv/lode/lode.toml:ro` — or pass
+  the trust settings as `LODE_*` environment variables / CLI flags, which an
+  app cannot change.
+- **A consumed `target` request is not replayed after a failed install**
+  (`crates/lode-supervisor/src/lib.rs`, `clear_target`): lode nulls
+  `state.target` unconditionally once it has processed an update request. When
+  the request was the raw alias `"latest"` and the install then fails, the
+  request is consumed — the app must write `target` again to retry.
+- **A `target` written concurrently with a cut-over can be lost**
+  (`write_pre_observe_state`): the pre-spawn state write nulls `target`
+  unconditionally, so a request the app writes in that same instant is cleared
+  without being applied. Apps that see `target` return to `null` with no update
+  following should re-issue the request.

@@ -1,0 +1,170 @@
+// Harness — one self-contained world per test: a writable manifest/artifact
+// server, a publisher keypair, a temp data dir, and a factory for lode processes.
+// publish() builds+signs+serves a version in one call; runLode() spawns lode wired
+// to this world. dispose() tears everything down (graceful child stop included).
+
+import { mkdirSync, writeFileSync } from "node:fs";
+import { join } from "node:path";
+
+import { type AppMode, buildApp } from "./app.ts";
+import { LodeRunner } from "./lode.ts";
+import { ManifestServer } from "./manifestServer.ts";
+import { Signer } from "./sign.ts";
+import { baseEnv, flipHex, mkTmp, rmTmp } from "./util.ts";
+
+export interface PublishVersionOpts {
+  mode?: AppMode;
+  exitCode?: number;
+  target?: string;
+  gate?: boolean;
+  preGate?: boolean;
+  /** Make channels.stable.latest point at this version (default true). */
+  latest?: boolean;
+  /** Serve a sha256 that does NOT match the bytes (tampered artifact). */
+  tamperSha?: boolean;
+  /** Publish without a signature (to be rejected under require_signature=enforce). */
+  omitSig?: boolean;
+  /** Manifest-published `run` launch override (signed — bound into the artifact
+   *  signature and published verbatim in the manifest asset). */
+  run?: string;
+  /** Manifest-published `exec` launch override (signed, like `run`). */
+  exec?: string;
+}
+
+const APP_NAME = "e2e-app";
+/** The asset filename every version is served under — the selection key (§3) that
+ *  lode matches via `[update].asset`, and the basename the §1 signature binds. */
+const ASSET_NAME = "app.sh";
+
+export class Harness {
+  readonly server: ManifestServer;
+  readonly signer: Signer;
+  readonly dataDir: string;
+  readonly #buildDir: string;
+  readonly #tmps: string[] = [];
+  readonly #lodes: LodeRunner[] = [];
+
+  private constructor(server: ManifestServer, signer: Signer, dataDir: string, buildDir: string, keysDir: string) {
+    this.server = server;
+    this.signer = signer;
+    this.dataDir = dataDir;
+    this.#buildDir = buildDir;
+    this.#tmps.push(dataDir, buildDir, keysDir);
+  }
+
+  /**
+   * Start a world. By default the server signs every manifest.json (catalog
+   * signature) so it is VERIFIED under `require_signature`. Pass
+   * `{ signCatalog: false }` to serve an *unsigned* catalog while still signing
+   * each artifact — the catalog signature is verify-if-present (never required), so
+   * this must still install/verify fine under `enforce`.
+   */
+  static async start(opts: { signCatalog?: boolean } = {}): Promise<Harness> {
+    const dataDir = mkTmp("lode-data-");
+    const buildDir = mkTmp("lode-build-");
+    const keysDir = mkTmp("lode-keys-");
+    const signer = await Signer.create(keysDir);
+    const catalogKey = (opts.signCatalog ?? true) ? signer.privPath : undefined;
+    const server = ManifestServer.start(APP_NAME, catalogKey);
+    return new Harness(server, signer, dataDir, buildDir, keysDir);
+  }
+
+  get trustedKey(): string {
+    return this.signer.trustedKey;
+  }
+
+  /** Build, sign, and serve a version. With tamperSha/omitSig, produce a bad artifact. */
+  async publish(version: string, opts: PublishVersionOpts = {}): Promise<void> {
+    // Build under a per-version dir so the artifact's basename is exactly the asset
+    // filename (ASSET_NAME): the §1 signature binds that basename, and lode
+    // reconstructs the signed message from the manifest asset `name`.
+    const versionDir = join(this.#buildDir, version);
+    mkdirSync(versionDir, { recursive: true });
+    const artifactPath = join(versionDir, ASSET_NAME);
+    buildApp(artifactPath, {
+      version,
+      mode: opts.mode ?? "service",
+      exitCode: opts.exitCode ?? 0,
+      target: opts.target ?? "",
+      gate: opts.gate ?? false,
+      preGate: opts.preGate ?? false,
+    });
+
+    // The signature binds the asset filename (basename) + version + sha256 + the
+    // optional run/exec overrides; it never sees the url. `name` is the selection
+    // key, so published overrides must ride the same sign call verbatim.
+    const signed = await this.signer.sign(artifactPath, version, { run: opts.run, exec: opts.exec });
+    const sha256 = opts.tamperSha ? flipHex(signed.sha256) : signed.sha256;
+    const sig = opts.omitSig ? undefined : signed.sig;
+    const keyId = opts.omitSig ? undefined : this.signer.keyId;
+
+    this.server.publish(version, {
+      artifactPath,
+      name: ASSET_NAME,
+      sha256,
+      sig,
+      keyId,
+      run: opts.run,
+      exec: opts.exec,
+      latest: opts.latest ?? true,
+    });
+  }
+
+  /** Base CLI flags shared by every lode invocation in this world. The artifact
+   *  lands under its asset filename (raw format), so the literal launch command
+   *  is "./app.sh" relative to the version dir. */
+  baseArgs(): string[] {
+    return [
+      "--app",
+      this.server.name,
+      "--dir",
+      this.dataDir,
+      "--manifest",
+      this.server.manifestUrl,
+      "--asset",
+      ASSET_NAME,
+      "--run",
+      `./${ASSET_NAME}`,
+      "--exec",
+      `./${ASSET_NAME}`,
+      "--log-level",
+      "info",
+    ];
+  }
+
+  /** --require-signature enforce + this world's trusted key. */
+  trustArgs(mode: "off" | "auto" | "enforce" = "enforce"): string[] {
+    return ["--require-signature", mode, "--trusted-keys", this.trustedKey];
+  }
+
+  /** Spawn a lode process wired to this world (baseArgs + extra flags). */
+  runLode(extraArgs: string[]): LodeRunner {
+    const runner = new LodeRunner([...this.baseArgs(), ...extraArgs], this.dataDir, baseEnv());
+    this.#lodes.push(runner);
+    return runner;
+  }
+
+  /** Spawn lode with EXACTLY these args (no baseArgs) — for driving it from a
+   *  `lode.toml` via `--config` so the file's `[command]`/source are authoritative. */
+  runLodeRaw(args: string[]): LodeRunner {
+    const runner = new LodeRunner(args, this.dataDir, baseEnv());
+    this.#lodes.push(runner);
+    return runner;
+  }
+
+  /** Drop the readiness gate file so a gated app announces serving readiness (-0). */
+  openReadinessGate(): void {
+    writeFileSync(join(this.dataDir, "ready_ok"), "ok");
+  }
+
+  /** Drop the prepare gate file so a pre-gated app acks the staged-update prompt (-2). */
+  openPrepareGate(): void {
+    writeFileSync(join(this.dataDir, "prepare_ok"), "ok");
+  }
+
+  async dispose(): Promise<void> {
+    for (const l of this.#lodes) await l.dispose();
+    this.server.stop();
+    for (const t of this.#tmps) rmTmp(t);
+  }
+}
