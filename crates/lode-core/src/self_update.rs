@@ -427,7 +427,7 @@ fn swap(staged: &Path, exe: &Path) -> std::io::Result<()> {
 
 /// Put `staged` in `exe`'s place. Windows refuses to overwrite or delete a
 /// running executable but lets it be renamed, so the old file moves aside
-/// first; see [`swap_keeping_old`].
+/// first; see `swap_keeping_old`.
 #[cfg(windows)]
 fn swap(staged: &Path, exe: &Path) -> std::io::Result<()> {
     swap_keeping_old(staged, exe)
@@ -449,7 +449,7 @@ fn swap_keeping_old(staged: &Path, exe: &Path) -> std::io::Result<()> {
     Ok(())
 }
 
-/// What the files [`swap_keeping_old`] moves aside for `exe` are named with.
+/// What the files `swap_keeping_old` moves aside for `exe` are named with.
 fn old_prefix(exe: &Path) -> String {
     let name = exe.file_name().and_then(OsStr::to_str).unwrap_or_default();
     format!(".{name}.old-")
