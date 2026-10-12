@@ -9,6 +9,7 @@ Most docs come in two single-language versions: `X.md` (English) and
 |---|---|---|
 | Project overview / quick start | [`../README.md`](../README.md) | [`../README.zh-CN.md`](../README.zh-CN.md) |
 | Integration — configure → run → publish | [`integration.md`](integration.md) | [`integration.zh-CN.md`](integration.zh-CN.md) |
+| Embedding — lode as a library: self-update of your own program, supervising another app | [`embedding.md`](embedding.md) | [`embedding.zh-CN.md`](embedding.zh-CN.md) |
 | Operations — install, commands, logs, exit status, common problems | [`operations.md`](operations.md) | [`operations.zh-CN.md`](operations.zh-CN.md) |
 | Architecture | [`architecture.md`](architecture.md) | [`architecture.zh-CN.md`](architecture.zh-CN.md) |
 | Local testing offline (`lode-cli seed`) | [`dev-local-testing.md`](dev-local-testing.md) | [`dev-local-testing.zh-CN.md`](dev-local-testing.zh-CN.md) |

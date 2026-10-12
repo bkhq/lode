@@ -441,7 +441,7 @@ headers = [
 
 - 顶层:`schema`(必填,`"lode/v1"`)、`name`(必填,须与 `lode.toml` 的 `app` 一致)、`key_id`(可选,默认签名公钥 id)、`alg`(可选,提示性:该密钥的算法,缺省为 `ed25519`)、`sig`(可选,catalog 的签名,§6 —— *present 才验*:存在时验证,永不强制)。
 - `channels`(必填):对象,键为通道名,值含 `latest`(版本 id)。**可多个通道**,lode 按 `channel` 跟随其一。
-- `versions`(必填):对象,键为版本 id(被通道 `latest` 引用),值含 `notes`(可选)+ `assets` 数组(≥1)。
+- `versions`(必填):对象,键为版本 id(被通道 `latest` 引用),值含 `notes`(可选)、`published_at`(可选,RFC 3339 时间;与 `notes` 一样仅供展示,不在签名范围内)+ `assets` 数组(≥1)。
 - 每个资产以**文件名**(`name`)为键;operator 用 `[update].asset` 选其一:
 
 | 字段 | 必填 | 说明 |

@@ -441,7 +441,7 @@ The remote manifest is provided by the publisher, in **JSON format** (UTF-8), fe
 
 - Top level: `schema` (required, `"lode/v1"`), `name` (required, must match `app` in `lode.toml`), `key_id` (optional, the default signing public-key id), `alg` (optional, advisory: that key's algorithm, `ed25519` when absent), `sig` (optional, the catalog signature, §6 — *verify-if-present*: checked when present, never required).
 - `channels` (required): an object, keyed by channel name, with values containing `latest` (a version id). **Multiple channels are allowed**, and lode follows one per `channel`.
-- `versions` (required): an object, keyed by version id (referenced by a channel's `latest`), with values containing `notes` (optional) + an `assets` array (≥1).
+- `versions` (required): an object, keyed by version id (referenced by a channel's `latest`), with values containing `notes` (optional), `published_at` (optional, an RFC 3339 time; like `notes` informational and not signed) + an `assets` array (≥1).
 - Each asset is keyed by its **filename** (`name`); the operator selects one via `[update].asset`:
 
 | Field | Required | Description |

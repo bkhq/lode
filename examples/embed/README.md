@@ -1,14 +1,70 @@
-# Embedding lode in a host program
+# Embedding lode: two host programs
 
-Most users run the `lode` binary. This example shows the alternative: a program that
-links lode as a library and keeps control of its own process.
+Most users run the `lode` binary. These two programs show the alternative: a
+Rust program that links lode as a library. The guide that explains every call
+is [`docs/embedding.md`](../../docs/embedding.md); this page says what the demos
+do and how to run them.
 
-Use it when the host already owns the process — it has its own signal handling,
-runs other work beside the supervised app, or is itself PID 1 of something larger.
+Both are offline and need nothing but a Rust toolchain. They live in a crate of
+their own, outside lode's workspace.
 
-## What the host does
+| Program | Shows | Crates |
+|---|---|---|
+| [`self_update`](src/bin/self_update.rs) | A program replacing its own executable with a signed release | `lode-core` |
+| [`supervise`](src/bin/supervise.rs) | A host running and updating another app as a supervised child | `lode-core`, `lode-supervisor` |
 
-[`src/main.rs`](src/main.rs) is a complete host in about 130 lines:
+## `self_update`
+
+```bash
+cargo run --manifest-path examples/embed/Cargo.toml --bin self_update
+```
+
+The demo plays both sides. As the publisher it builds release 2.0.0 of `myapp`,
+signs the asset and the manifest, and serves them on loopback. As the installed
+1.0.0 it then does what a real program does:
+
+| Step | API |
+|---|---|
+| Describe the update: source, asset, trusted key, manifest policy | `SelfUpdate::new(..).asset(..).trusted_keys(..).require_manifest(RequireManifest::Fresh).exe(..)` |
+| Look for a release and show its notes | `check()` → `Available { version, entry }` |
+| Download, verify and unpack it | `fetch()` → `Fetched` |
+| Take a file that ships beside the executable | `fetched.dir()` |
+| Prove the new binary runs, then replace the executable | `install(&fetched)` → `Outcome::Installed` |
+| Tell a refused update from a broken installation | `match` on `SelfUpdateError`, `is_untouched()` |
+
+```
+installed:  myapp 1.0.0
+available:  2.0.0 (published 2026-10-12T10:00:00Z): Faster startup.
+companion:  plugin for 2.0.0
+installed:  2.0.0 at /tmp/lode-demo-self-update-…/bin/myapp
+now runs:   myapp 2.0.0
+check:      None
+wrong key:  refused (verify: manifest signature did not match any trusted key); installation untouched: true
+```
+
+What a real program does differently:
+
+- It passes `lode_core::self_update::current_exe()`, resolved once at startup,
+  to `.exe(..)`, and calls `self_update::remove_replaced(&exe)` there too.
+- It compiles its trusted key in. The demo generates one because it is its own
+  publisher.
+- It calls `InitOptions::new().crypto_provider(true).install()` before the
+  first fetch: its source is HTTPS.
+- Its publisher signs with `lode-cli sign --app myapp` and
+  `lode-cli manifest-sign --expires-in`, where the demo signs in process. The
+  crates under "Only the self_update demo needs these" in `Cargo.toml` exist
+  for that and are not needed by a real program.
+- The stand-in program is a shell script, so this demo runs on Unix only. The
+  API is the same on Windows.
+
+## `supervise`
+
+```bash
+cargo run --manifest-path examples/embed/Cargo.toml --bin supervise
+```
+
+The host keeps control of its own process: its own signal handlers, its own
+decisions about when to switch versions, lode's supervise loop on a thread.
 
 | Step | API |
 |---|---|
@@ -21,21 +77,7 @@ runs other work beside the supervised app, or is itself PID 1 of something large
 | Restart the worker | `Engine::restart()` |
 | Stop it and collect the exit status | send `SIGTERM` through the channel, join the thread |
 
-`SuperviseOptions::host_owned()` means lode installs **no** signal handlers, does
-**not** become a subreaper and takes **no** single-instance lock. Everything else is
-the same loop the binary runs: restart with backoff, readiness, hot-update, rollback.
-
-The `Engine` calls do not talk to the loop directly. They write a request into
-`state.json`, exactly as `lode-cli` does, and the loop picks it up within about a
-second. A host in another process could make the same calls.
-
-## Run it
-
-```bash
-cargo run --manifest-path examples/embed/Cargo.toml
-```
-
-The demo is offline and takes about ten seconds:
+It takes about ten seconds:
 
 ```
 INFO spawned child version="1.1.0" …
@@ -53,77 +95,18 @@ worker 1.0.0: stopping
 host: the worker stopped with ExitCode(unix_exit_status(0))
 ```
 
-Press Ctrl-C at any point: the host's handler forwards it and the worker is stopped
-gracefully.
+Press Ctrl-C at any point: the host's handler forwards it and the worker is
+stopped gracefully.
 
-## Using a real release source
-
-The demo seeds its versions locally so that it runs anywhere. For a real app, point
-the config at a source and let lode download and verify:
-
-```toml
-[update]
-manifest = "https://lode.bk.io/r/<namespace>/<slug>/manifest.json"   # or: github = "owner/repo"
-asset    = "worker-linux-x64.tar.gz"
-policy   = "auto"
-
-[trust]
-require_signature = "enforce"
-trusted_keys = ["<key_id>:<base64-public-key>"]
-```
-
-Then:
-
-- call `InitOptions::new().crypto_provider(true)` before the first fetch, so rustls
-  has its provider;
-- drop the `seed` calls — with nothing installed, the loop bootstraps the channel's
-  latest version;
-- use `Engine::check()` to look for a newer version and `Engine::install(None)` to
-  install it, or leave it to `policy = "auto"`.
-
-## Updating the host binary itself
-
-Everything above updates a worker that the host supervises. A host that ships as
-one binary can also replace **itself** in place with
-`lode_core::self_update::SelfUpdate`:
-
-```rust
-use lode_core::self_update::{Outcome, SelfUpdate, Source};
-
-// Once, at startup: after an update the running file is reported as deleted.
-let exe = lode_core::self_update::current_exe()?;
-
-let update = SelfUpdate::new("myapp", Source::GitHub("owner/myapp".into()), env!("CARGO_PKG_VERSION"))
-    .asset("myapp-linux-x64.tar.gz")
-    .trusted_keys(["<key_id>:<base64-public-key>"])   // compiled in, not read from config
-    .exe(exe);
-
-if let Outcome::Installed { version, .. } = update.apply()? {
-    // The process is still the old binary: restart or re-exec when convenient.
-}
-```
-
-`check()` returns the version an update would install without downloading it.
-Following the newest release needs semver versions on both sides: with any other
-version id an update is refused unless `.version(...)` names it, because an id
-that cannot be ordered could be an older release. A
-release is always verified under `enforce`, the downloaded binary must answer
-`--version` with the target version before it replaces anything, and there is no
-automatic rollback — nothing outside the process watches the new version.
-
-On Windows a running executable cannot be overwritten, so the old file is renamed
-aside and stays until no process runs it. Call
-`lode_core::self_update::remove_replaced(&exe)` at startup to delete it, and name
-any second copy of the binary with `.alias(path)` so it is replaced as well.
+The demo seeds its versions locally so that it runs anywhere. A real host
+points the config at a release source, requires signatures, and drops the
+`seed` calls; see
+[Releases for the supervised app](../../docs/embedding.md#releases-for-the-supervised-app).
 
 ## In your own project
 
-The crates are not on crates.io. Depend on a release tag:
-
 ```toml
 [dependencies]
-lode-core       = { git = "https://github.com/bkhq/lode", tag = "v0.0.2" }
-lode-supervisor = { git = "https://github.com/bkhq/lode", tag = "v0.0.2" }
+lode-core       = { git = "https://github.com/bkhq/lode", tag = "v0.0.3" }
+lode-supervisor = { git = "https://github.com/bkhq/lode", tag = "v0.0.3" }   # only to supervise a child
 ```
-
-The demo's worker is a shell script, so the demo itself runs on Unix. The same API works on Windows.

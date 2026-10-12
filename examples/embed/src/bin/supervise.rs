@@ -16,7 +16,7 @@
 //! Press Ctrl-C at any time: the host's own handler forwards it to the loop.
 //!
 //! ```bash
-//! cargo run --manifest-path examples/embed/Cargo.toml
+//! cargo run --manifest-path examples/embed/Cargo.toml --bin supervise
 //! ```
 
 use std::path::{Path, PathBuf};

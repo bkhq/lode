@@ -3,17 +3,26 @@ name = "lode-demo-embed"
 version = "0.0.0"
 edition = "2024"
 publish = false
-description = "lode demo: a host program that embeds the supervise loop as a library."
+description = "lode demos: host programs that embed lode as a library."
 
 # Own workspace, so this demo is NOT pulled into lode's root workspace/gate.
 [workspace]
 
 # Path dependencies so the demo always builds against this checkout. In your own
 # project depend on a release tag instead:
-#   lode-core       = { git = "https://github.com/bkhq/lode", tag = "v0.0.2" }
-#   lode-supervisor = { git = "https://github.com/bkhq/lode", tag = "v0.0.2" }
+#   lode-core       = { git = "https://github.com/bkhq/lode", tag = "v0.0.3" }
+#   lode-supervisor = { git = "https://github.com/bkhq/lode", tag = "v0.0.3" }
 [dependencies]
 lode-core = { path = "../../crates/lode-core" }
 lode-supervisor = { path = "../../crates/lode-supervisor" }
 # The host owns its signals; signal-hook is how THIS host receives them.
 signal-hook = "0.4"
+
+# Only the self_update demo needs these: it plays the publisher as well and
+# builds and signs a release in process. A real program needs none of them.
+base64 = "0.23"
+ed25519-dalek = "3"
+flate2 = "1"
+getrandom = "0.4"
+serde_json = "1"
+tar = "0.4"

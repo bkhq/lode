@@ -145,6 +145,10 @@ pub struct VersionEntry {
     /// Human-readable release notes (shown by `update`).
     #[serde(default)]
     pub notes: Option<String>,
+    /// When the version was published, as the source states it (RFC 3339).
+    /// Like `notes` it is informational and covered by no signature.
+    #[serde(default)]
+    pub published_at: Option<String>,
     /// Assets of this version.
     pub assets: Vec<Asset>,
 }
@@ -529,7 +533,8 @@ fn map_release(app: &str, release: GhRelease, channel: &str) -> Result<Manifest>
         return Err(Error::Manifest(format!("release {ver:?} has no assets")));
     }
     let entry = VersionEntry {
-        notes: None,
+        notes: release.body.filter(|body| !body.trim().is_empty()),
+        published_at: release.published_at,
         assets,
     };
 
@@ -598,6 +603,10 @@ pub(crate) fn strip_v(tag: &str) -> &str {
 #[derive(Debug, Deserialize)]
 struct GhRelease {
     tag_name: String,
+    #[serde(default)]
+    body: Option<String>,
+    #[serde(default)]
+    published_at: Option<String>,
     #[serde(default)]
     prerelease: bool,
     #[serde(default)]

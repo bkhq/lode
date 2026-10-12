@@ -5,7 +5,8 @@
 //! The update source and the trusted keys come from the caller, who compiles
 //! them into the binary: [`SelfUpdate`] builds a self-contained [`Config`]
 //! (`require_signature = enforce` against those keys, no `lode.toml`, no
-//! `LODE_*` environment) and then reuses the ordinary chain — source adapter →
+//! `LODE_*` environment; a private source gets its credentials from
+//! [`SelfUpdate::header`]) and then reuses the ordinary chain — source adapter →
 //! download → sha256 + signature gate → unpack — that installs any app version.
 //! The verified binary is staged beside the executable, probed (`--version`
 //! must report the target), and moved into its place. Nothing changes for the
@@ -21,7 +22,7 @@
 //! ```no_run
 //! use lode_core::self_update::{Outcome, SelfUpdate, Source};
 //!
-//! # fn main() -> lode_core::Result<()> {
+//! # fn main() -> Result<(), lode_core::self_update::SelfUpdateError> {
 //! // Resolve the executable once at startup: after an update the kernel
 //! // reports the running (replaced) file as deleted.
 //! let exe = lode_core::self_update::current_exe()?;
@@ -49,7 +50,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use crate::config::{self, Config, Overrides, Policy, RequireSignature};
+use crate::config::{self, Config, Overrides, Policy, RequireManifest, RequireSignature};
 use crate::error::{Error, Result};
 use crate::{download, engine, install, manifest};
 
@@ -77,6 +78,205 @@ pub enum Outcome {
     },
 }
 
+/// A release an update would install, as [`SelfUpdate::check`] reports it.
+#[derive(Debug, Clone)]
+pub struct Available {
+    /// The version id.
+    pub version: String,
+    /// Its manifest entry: `notes`, `published_at` and the assets. Notes and
+    /// the publication time are not covered by any signature — show them as
+    /// untrusted text.
+    pub entry: manifest::VersionEntry,
+}
+
+/// A verified release, downloaded and unpacked, that [`SelfUpdate::install`]
+/// puts in place. Whatever else the asset holds is under [`dir`](Self::dir)
+/// until this value is dropped, which removes the scratch directory.
+#[derive(Debug)]
+pub struct Fetched {
+    version: String,
+    entry: manifest::VersionEntry,
+    dir: PathBuf,
+    binary: PathBuf,
+    scratch: PathBuf,
+}
+
+impl Fetched {
+    /// The version id.
+    #[must_use]
+    pub fn version(&self) -> &str {
+        &self.version
+    }
+
+    /// The version's manifest entry; see [`Available::entry`].
+    #[must_use]
+    pub const fn entry(&self) -> &manifest::VersionEntry {
+        &self.entry
+    }
+
+    /// The unpacked asset: every file of the archive whose digest and
+    /// signature were verified, the executable included.
+    #[must_use]
+    pub fn dir(&self) -> &Path {
+        &self.dir
+    }
+
+    /// The new executable inside [`dir`](Self::dir), for a program that puts
+    /// it in place itself instead of calling [`SelfUpdate::install`]. Copy it
+    /// out before this value is dropped. It has not been run: `install` is
+    /// what checks that it starts and reports [`version`](Self::version).
+    #[must_use]
+    pub fn binary(&self) -> &Path {
+        &self.binary
+    }
+}
+
+impl Drop for Fetched {
+    fn drop(&mut self) {
+        let _ = fs::remove_dir_all(&self.scratch);
+    }
+}
+
+/// Why an update did not go through. [`is_untouched`](Self::is_untouched) tells
+/// a failure that left the installation as it was from one that did not.
+#[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
+pub enum SelfUpdateError {
+    /// The update is not set up to run: no trusted key, no asset, a bad source.
+    #[error(transparent)]
+    Config(Error),
+    /// The source could not be reached, or its answer could not be read.
+    #[error(transparent)]
+    Source(Error),
+    /// The release was refused: a digest or signature that does not verify, or
+    /// a manifest that is unsigned or expired where
+    /// [`require_manifest`](SelfUpdate::require_manifest) asks for one.
+    #[error(transparent)]
+    Verify(Error),
+    /// A local failure before anything was replaced: scratch space, unpacking.
+    #[error(transparent)]
+    Local(Error),
+    /// The newest release is older than the running version.
+    #[error(
+        "the newest release ({latest}) is older than this binary ({current}); request that \
+         version explicitly to install it deliberately"
+    )]
+    Older {
+        /// The channel's latest version.
+        latest: String,
+        /// The running version.
+        current: String,
+    },
+    /// The newest release and the running version are not both semver.
+    #[error(
+        "the newest release ({latest}) cannot be ordered against this binary ({current}): both \
+         must be semver for an update to be followed; request that version explicitly to \
+         install it deliberately"
+    )]
+    Unordered {
+        /// The channel's latest version.
+        latest: String,
+        /// The running version.
+        current: String,
+    },
+    /// The asset does not hold the executable.
+    #[error("{asset} does not contain a `{binary}` binary")]
+    MissingBinary {
+        /// The asset filename.
+        asset: String,
+        /// The file that was looked for in it.
+        binary: String,
+    },
+    /// The downloaded binary could not be run.
+    #[error("run {} --version: {source} (is the release built for this platform?)", path.display())]
+    NotRunnable {
+        /// The staged copy that was run.
+        path: PathBuf,
+        /// What the operating system said.
+        source: std::io::Error,
+    },
+    /// The downloaded binary reports another version than the release's.
+    #[error("the downloaded binary reports {reported:?}, expected version {expected}")]
+    WrongVersion {
+        /// The release's version.
+        expected: String,
+        /// What `--version` printed.
+        reported: String,
+    },
+    /// The executable could not be replaced; it is as it was.
+    #[error("replace {}: {source}", path.display())]
+    Replace {
+        /// The executable.
+        path: PathBuf,
+        /// What the operating system said.
+        source: std::io::Error,
+    },
+    /// The executable was replaced, an [`alias`](SelfUpdate::alias) of it was
+    /// not: the two are now different versions.
+    #[error("the executable was replaced, its copy {} was not: {source}", path.display())]
+    Alias {
+        /// The copy that still holds the old version.
+        path: PathBuf,
+        /// What the operating system said.
+        source: std::io::Error,
+    },
+    /// Windows only: the executable was moved aside, the new one could not
+    /// take its place and the old one could not be moved back. Nothing sits at
+    /// `path`; the old executable is at `moved_to`.
+    #[error(
+        "{} is missing: the new executable could not be put in place ({source}) and the old one is left at {}",
+        path.display(),
+        moved_to.display()
+    )]
+    Displaced {
+        /// Where the executable belongs.
+        path: PathBuf,
+        /// Where the old executable is now.
+        moved_to: PathBuf,
+        /// What the operating system said.
+        source: std::io::Error,
+    },
+}
+
+impl SelfUpdateError {
+    /// Whether the failure left the installation exactly as it was. `false`
+    /// for [`Alias`](Self::Alias) and [`Displaced`](Self::Displaced), whose
+    /// fields say what has to be put right.
+    #[must_use]
+    pub const fn is_untouched(&self) -> bool {
+        !matches!(self, Self::Alias { .. } | Self::Displaced { .. })
+    }
+}
+
+/// File a lode error under the stage of an update it belongs to.
+impl From<Error> for SelfUpdateError {
+    fn from(error: Error) -> Self {
+        match error {
+            Error::Config(_) | Error::Toml(_) | Error::ParseInt(_) => Self::Config(error),
+            Error::Http(_) | Error::Manifest(_) | Error::Download(_) | Error::Json(_) => {
+                Self::Source(error)
+            }
+            Error::Verify(_) => Self::Verify(error),
+            _ => Self::Local(error),
+        }
+    }
+}
+
+impl From<SelfUpdateError> for Error {
+    fn from(error: SelfUpdateError) -> Self {
+        match error {
+            SelfUpdateError::Config(inner)
+            | SelfUpdateError::Source(inner)
+            | SelfUpdateError::Verify(inner)
+            | SelfUpdateError::Local(inner) => inner,
+            SelfUpdateError::Older { .. } | SelfUpdateError::Unordered { .. } => {
+                Self::Manifest(error.to_string())
+            }
+            other => Self::Install(other.to_string()),
+        }
+    }
+}
+
 /// An in-place update of the running executable; see the [module docs](self).
 #[derive(Debug, Clone)]
 pub struct SelfUpdate {
@@ -87,6 +287,9 @@ pub struct SelfUpdate {
     binary: Option<String>,
     trusted_keys: Vec<String>,
     version: Option<String>,
+    channel: Option<String>,
+    headers: Vec<String>,
+    require_manifest: Option<RequireManifest>,
     exe: Option<PathBuf>,
     aliases: Vec<PathBuf>,
 }
@@ -107,6 +310,9 @@ impl SelfUpdate {
             binary: None,
             trusted_keys: Vec::new(),
             version: None,
+            channel: None,
+            headers: Vec::new(),
+            require_manifest: None,
             exe: None,
             aliases: Vec::new(),
         }
@@ -151,6 +357,39 @@ impl SelfUpdate {
         self
     }
 
+    /// The channel whose latest release is followed. Defaults to `stable`; with
+    /// a GitHub source any other channel follows the newest pre-release.
+    #[must_use]
+    pub fn channel(mut self, name: impl Into<String>) -> Self {
+        self.channel = Some(name.into());
+        self
+    }
+
+    /// A request header, as a `Name: value` line, for a source that needs
+    /// credentials. `${VAR}` in the value is replaced from the environment when
+    /// the request is made, so a token need not be compiled in. The header is
+    /// sent to the source only — the manifest's host, or GitHub's API and
+    /// asset hosts — never to another host an asset url may name.
+    #[must_use]
+    pub fn header(mut self, line: impl Into<String>) -> Self {
+        self.headers.push(line.into());
+        self
+    }
+
+    /// What the manifest itself has to prove. By default its signature and
+    /// expiry are verified when present and never required, so a source that
+    /// keeps answering with an old, validly signed manifest holds the program
+    /// on an old version for good. [`RequireManifest::Fresh`] refuses a
+    /// manifest without a signed expiry that is still ahead;
+    /// [`RequireManifest::Signed`] one without a signature. Both need a
+    /// [`Source::Manifest`] whose publisher signs it; with a GitHub source,
+    /// which has no manifest to sign, the update is a configuration error.
+    #[must_use]
+    pub const fn require_manifest(mut self, policy: RequireManifest) -> Self {
+        self.require_manifest = Some(policy);
+        self
+    }
+
     /// The executable to replace. Defaults to [`current_exe`] at the time of the
     /// call; a long-running program should resolve it once at startup and pass
     /// it here, because the kernel reports a replaced running file as deleted.
@@ -170,32 +409,76 @@ impl SelfUpdate {
         self
     }
 
-    /// Look for an update without installing it: `Some(version)` when
-    /// [`apply`](Self::apply) would install `version`, `None` when the running
-    /// version is already the newest release.
+    /// Look for an update without installing it: the release
+    /// [`apply`](Self::apply) would install, `None` when the running version
+    /// is already the newest.
     ///
     /// # Errors
-    /// As [`apply`](Self::apply), short of the download and the replacement.
-    pub fn check(&self) -> Result<Option<String>> {
-        self.with_scratch(|cfg| Ok(resolve(cfg, &self.current_version)?.1))
+    /// As [`fetch`](Self::fetch), short of the download.
+    pub fn check(&self) -> std::result::Result<Option<Available>, SelfUpdateError> {
+        let scratch = self.scratch()?;
+        let result = self
+            .config(&scratch)
+            .map_err(SelfUpdateError::from)
+            .and_then(|cfg| resolve(&cfg, &self.current_version));
+        let _ = fs::remove_dir_all(&scratch);
+        let (manifest, target) = result?;
+        let Some(version) = target else {
+            return Ok(None);
+        };
+        let entry = manifest::version_entry(&manifest, &version)?.clone();
+        Ok(Some(Available { version, entry }))
     }
 
-    /// Install the newest release — or the [`version`](Self::version) named —
-    /// over the executable.
+    /// Download the newest release — or the [`version`](Self::version) named —
+    /// verify it and unpack it, without installing anything. `None` when the
+    /// running version is already the newest. For a program that takes more
+    /// from the asset than the executable: read the other files from
+    /// [`Fetched::dir`], then call [`install`](Self::install).
     ///
     /// # Errors
-    /// Returns an error when the source cannot be reached, the release is
-    /// unsigned or signed by another key, the newest release is older than the
-    /// running version or cannot be ordered against it (ids that are not both
-    /// semver), or the downloaded binary does not run and report the
-    /// target version. The executable is untouched in every error case.
-    pub fn apply(&self) -> Result<Outcome> {
+    /// Returns an error when the source cannot be reached, the manifest or the
+    /// release does not verify, the newest release is older than the running
+    /// version or cannot be ordered against it, or the asset does not hold
+    /// the executable. Nothing outside the scratch directory is touched.
+    pub fn fetch(&self) -> std::result::Result<Option<Fetched>, SelfUpdateError> {
+        let scratch = self.scratch()?;
+        let fetched = self
+            .config(&scratch)
+            .map_err(SelfUpdateError::from)
+            .and_then(|cfg| fetch_with(&cfg, &self.binary_name(), &self.current_version));
+        match fetched {
+            // It owns the scratch directory from here on.
+            Ok(Some(fetched)) => Ok(Some(fetched)),
+            other => {
+                let _ = fs::remove_dir_all(&scratch);
+                other
+            }
+        }
+    }
+
+    /// Put a [`fetch`](Self::fetch)ed release in place: prove the binary runs
+    /// and reports its version, then replace the executable and its aliases.
+    ///
+    /// # Errors
+    /// Returns an error when the binary does not run or reports another
+    /// version, or a file cannot be replaced.
+    /// [`SelfUpdateError::is_untouched`] tells whether anything was changed.
+    pub fn install(&self, fetched: &Fetched) -> std::result::Result<Outcome, SelfUpdateError> {
         let exe = match &self.exe {
             Some(exe) => exe.clone(),
             None => current_exe()?,
         };
-        let binary = self.binary_name();
-        self.with_scratch(|cfg| run_with(cfg, &exe, &self.aliases, &binary, &self.current_version))
+        install_with(&exe, &self.aliases, fetched)
+    }
+
+    /// [`fetch`](Self::fetch) and [`install`](Self::install) in one step.
+    ///
+    /// # Errors
+    /// As those two.
+    pub fn apply(&self) -> std::result::Result<Outcome, SelfUpdateError> {
+        self.fetch()?
+            .map_or(Ok(Outcome::UpToDate), |fetched| self.install(&fetched))
     }
 
     fn binary_name(&self) -> String {
@@ -204,18 +487,14 @@ impl SelfUpdate {
             .unwrap_or_else(|| format!("{}{}", self.app, std::env::consts::EXE_SUFFIX))
     }
 
-    /// Run `f` against the self-contained config, in a scratch directory that
-    /// is removed afterwards.
-    fn with_scratch<T>(&self, f: impl FnOnce(&Config) -> Result<T>) -> Result<T> {
+    /// A fresh scratch directory for one update; the caller removes it.
+    fn scratch(&self) -> Result<PathBuf> {
         if self.trusted_keys.is_empty() {
             return Err(Error::Config(
                 "self-update needs at least one trusted key to verify a release against".to_owned(),
             ));
         }
-        let dir = scratch_dir()?;
-        let result = self.config(&dir).and_then(|cfg| f(&cfg));
-        let _ = fs::remove_dir_all(&dir);
-        result
+        scratch_dir()
     }
 
     /// The self-contained config an update runs under: the source, the release
@@ -236,9 +515,12 @@ impl SelfUpdate {
             github,
             manifest,
             asset: self.asset.clone(),
+            channel: self.channel.clone(),
+            header: self.headers.clone(),
             pin: self.version.clone(),
             policy: Some(Policy::Off),
             require_signature: Some(RequireSignature::Enforce),
+            require_manifest: self.require_manifest,
             trusted_keys: Some(self.trusted_keys.join(",")),
             ..Overrides::default()
         };
@@ -248,12 +530,15 @@ impl SelfUpdate {
 
 /// Fetch and verify the catalog, then decide what to install: the version id,
 /// or `None` when `current_version` is already the channel latest.
-fn resolve(cfg: &Config, current_version: &str) -> Result<(manifest::Manifest, Option<String>)> {
+fn resolve(
+    cfg: &Config,
+    current_version: &str,
+) -> std::result::Result<(manifest::Manifest, Option<String>), SelfUpdateError> {
     let manifest = manifest::fetch(cfg)?;
     install::verify_manifest_identity(cfg, &manifest)?;
-    // No floor: the plan below decides against the running binary's version, with
-    // a self-update-specific message; a named version is the caller's deliberate
-    // choice (also the downgrade path) and is installed as is.
+    // No floor: the plan below decides against the running binary's version;
+    // a named version is the caller's deliberate choice (also the downgrade
+    // path) and is installed as is.
     let target = manifest::resolve_target(
         &manifest,
         &cfg.update.channel,
@@ -262,21 +547,16 @@ fn resolve(cfg: &Config, current_version: &str) -> Result<(manifest::Manifest, O
         None,
     )?;
     if cfg.update.pin.is_none() {
+        let versions = || (target.clone(), current_version.to_owned());
         match plan(&target, current_version) {
             Plan::UpToDate => return Ok((manifest, None)),
             Plan::Older => {
-                return Err(Error::Manifest(format!(
-                    "the newest release ({target}) is older than this binary \
-                     ({current_version}); request that version explicitly to install it \
-                     deliberately"
-                )));
+                let (latest, current) = versions();
+                return Err(SelfUpdateError::Older { latest, current });
             }
             Plan::Unordered => {
-                return Err(Error::Manifest(format!(
-                    "the newest release ({target}) cannot be ordered against this binary \
-                     ({current_version}): both must be semver for an update to be followed; \
-                     request that version explicitly to install it deliberately"
-                )));
+                let (latest, current) = versions();
+                return Err(SelfUpdateError::Unordered { latest, current });
             }
             Plan::Install => {}
         }
@@ -284,19 +564,16 @@ fn resolve(cfg: &Config, current_version: &str) -> Result<(manifest::Manifest, O
     Ok((manifest, Some(target)))
 }
 
-/// The update proper, against `cfg` and the executable at `exe` (split from
-/// [`SelfUpdate::apply`] so tests can drive it with a stub source and a scratch
-/// executable). `binary` is the executable's name inside the unpacked asset;
-/// `aliases` are further copies of the executable to replace with it.
-fn run_with(
+/// Download, verify and unpack the release under `cfg`'s scratch directory
+/// (split from [`SelfUpdate::fetch`] so tests can drive it with a stub source).
+/// `binary` is the executable's name inside the unpacked asset.
+fn fetch_with(
     cfg: &Config,
-    exe: &Path,
-    aliases: &[PathBuf],
     binary: &str,
     current_version: &str,
-) -> Result<Outcome> {
+) -> std::result::Result<Option<Fetched>, SelfUpdateError> {
     let (manifest, Some(target)) = resolve(cfg, current_version)? else {
-        return Ok(Outcome::UpToDate);
+        return Ok(None);
     };
 
     let entry = manifest::version_entry(&manifest, &target)?;
@@ -305,30 +582,44 @@ fn run_with(
         download::fetch_artifact(cfg, asset, &target, &manifest::allowed_hosts(cfg))?;
     install::verify_download(cfg, &target, asset, &sha256)?;
 
-    let unpack = cfg.global.dir.join("unpack");
-    fs::create_dir_all(&unpack)?;
+    let dir = cfg.global.dir.join("unpack");
+    fs::create_dir_all(&dir).map_err(Error::from)?;
     install::extract(
         asset,
         manifest::format_from_name(&asset.name),
         &artifact,
-        &unpack,
+        &dir,
     )?;
-    let unpacked = unpack.join(binary);
+    let unpacked = dir.join(binary);
     if !unpacked.is_file() {
-        return Err(Error::Install(format!(
-            "{} does not contain a `{binary}` binary",
-            asset.name
-        )));
+        return Err(SelfUpdateError::MissingBinary {
+            asset: asset.name.clone(),
+            binary: binary.to_owned(),
+        });
     }
-    replace_executable(exe, &unpacked, &target)?;
+    Ok(Some(Fetched {
+        version: target,
+        entry: entry.clone(),
+        dir,
+        binary: unpacked,
+        scratch: cfg.global.dir.clone(),
+    }))
+}
+
+/// Replace `exe` and those of `aliases` that exist with the fetched binary.
+fn install_with(
+    exe: &Path,
+    aliases: &[PathBuf],
+    fetched: &Fetched,
+) -> std::result::Result<Outcome, SelfUpdateError> {
+    replace_executable(exe, &fetched.binary, &fetched.version)?;
     for alias in aliases {
         if alias != exe && alias.is_file() {
-            replace_alias(alias, &unpacked)?;
+            replace_alias(alias, &fetched.binary)?;
         }
     }
-
     Ok(Outcome::Installed {
-        version: target,
+        version: fetched.version.clone(),
         exe: exe.to_path_buf(),
     })
 }
@@ -369,10 +660,24 @@ fn plan(target: &str, current: &str) -> Plan {
 /// permission bits, prove it runs and reports `version`, then put it in `exe`'s
 /// place ([`swap`]). On any failure the staged copy is removed and `exe` is
 /// untouched.
-fn replace_executable(exe: &Path, binary: &Path, version: &str) -> Result<()> {
-    let staged = stage(exe, binary)?;
+fn replace_executable(
+    exe: &Path,
+    binary: &Path,
+    version: &str,
+) -> std::result::Result<(), SelfUpdateError> {
+    let staged = stage(exe, binary).map_err(|e| SelfUpdateError::Local(e.into()))?;
     let result = probe_version(&staged, version).and_then(|()| {
-        swap(&staged, exe).map_err(|e| Error::Install(format!("replace {}: {e}", exe.display())))
+        swap(&staged, exe).map_err(|e| match e {
+            SwapError::Untouched(source) => SelfUpdateError::Replace {
+                path: exe.to_path_buf(),
+                source,
+            },
+            SwapError::Displaced { moved_to, source } => SelfUpdateError::Displaced {
+                path: exe.to_path_buf(),
+                moved_to,
+                source,
+            },
+        })
     });
     if result.is_err() {
         let _ = fs::remove_file(&staged);
@@ -381,23 +686,28 @@ fn replace_executable(exe: &Path, binary: &Path, version: &str) -> Result<()> {
 }
 
 /// Replace `alias`, a second copy of the executable, with `binary`. The binary
-/// was probed when it replaced the executable itself.
-fn replace_alias(alias: &Path, binary: &Path) -> Result<()> {
-    let staged = stage(alias, binary)?;
+/// was probed when it replaced the executable itself, which by now it has.
+fn replace_alias(alias: &Path, binary: &Path) -> std::result::Result<(), SelfUpdateError> {
+    let failed = |source| SelfUpdateError::Alias {
+        path: alias.to_path_buf(),
+        source,
+    };
+    let staged = stage(alias, binary).map_err(failed)?;
     swap(&staged, alias).map_err(|e| {
         let _ = fs::remove_file(&staged);
-        Error::Install(format!("replace {}: {e}", alias.display()))
+        match e {
+            SwapError::Untouched(source) | SwapError::Displaced { source, .. } => failed(source),
+        }
     })
 }
 
 /// Copy `binary` beside `exe` under a name that keeps `exe`'s extension, with
 /// `exe`'s permission bits.
-fn stage(exe: &Path, binary: &Path) -> Result<PathBuf> {
-    let dir = exe
-        .parent()
-        .ok_or_else(|| Error::Install(format!("{} has no parent directory", exe.display())))?;
-    let name = file_name(exe)?;
-    let staged = dir.join(format!(".self-update-{}-{name}", std::process::id()));
+fn stage(exe: &Path, binary: &Path) -> std::io::Result<PathBuf> {
+    let name = exe.file_name().and_then(OsStr::to_str).ok_or_else(|| {
+        std::io::Error::other(format!("{} has no usable filename", exe.display()))
+    })?;
+    let staged = exe.with_file_name(format!(".self-update-{}-{name}", std::process::id()));
     let staging = fs::copy(binary, &staged).map(drop);
     // Windows has no mode bits to carry, and a read-only flag would only get
     // in the way of the next update.
@@ -406,30 +716,40 @@ fn stage(exe: &Path, binary: &Path) -> Result<PathBuf> {
         staging.and_then(|()| fs::set_permissions(&staged, fs::metadata(exe)?.permissions()));
     if let Err(e) = staging {
         let _ = fs::remove_file(&staged);
-        return Err(Error::Install(format!("stage {}: {e}", staged.display())));
+        return Err(std::io::Error::new(
+            e.kind(),
+            format!("stage {}: {e}", staged.display()),
+        ));
     }
     Ok(staged)
 }
 
-fn file_name(exe: &Path) -> Result<&str> {
-    exe.file_name()
-        .and_then(OsStr::to_str)
-        .ok_or_else(|| Error::Install(format!("{} has no usable filename", exe.display())))
+/// How putting a file in an executable's place failed.
+#[derive(Debug)]
+enum SwapError {
+    /// The executable is as it was.
+    Untouched(std::io::Error),
+    /// The executable was moved to `moved_to` and nothing took its place.
+    #[cfg_attr(not(any(windows, test)), allow(dead_code))]
+    Displaced {
+        moved_to: PathBuf,
+        source: std::io::Error,
+    },
 }
 
 /// Put `staged` in `exe`'s place. On Unix one `rename` does it: the running
 /// process keeps the old inode (a mapped executable cannot be written —
 /// `ETXTBSY` — which is why this is a rename, not a write).
 #[cfg(not(windows))]
-fn swap(staged: &Path, exe: &Path) -> std::io::Result<()> {
-    fs::rename(staged, exe)
+fn swap(staged: &Path, exe: &Path) -> std::result::Result<(), SwapError> {
+    fs::rename(staged, exe).map_err(SwapError::Untouched)
 }
 
 /// Put `staged` in `exe`'s place. Windows refuses to overwrite or delete a
 /// running executable but lets it be renamed, so the old file moves aside
 /// first; see `swap_keeping_old`.
 #[cfg(windows)]
-fn swap(staged: &Path, exe: &Path) -> std::io::Result<()> {
+fn swap(staged: &Path, exe: &Path) -> std::result::Result<(), SwapError> {
     swap_keeping_old(staged, exe)
 }
 
@@ -437,13 +757,18 @@ fn swap(staged: &Path, exe: &Path) -> std::io::Result<()> {
 /// that fails. The file moved aside is deleted when nothing runs it any more:
 /// here if possible, else by [`remove_replaced`] on a later start.
 #[cfg(any(windows, test))]
-fn swap_keeping_old(staged: &Path, exe: &Path) -> std::io::Result<()> {
-    let nonce = getrandom::u64().map_err(std::io::Error::other)?;
+fn swap_keeping_old(staged: &Path, exe: &Path) -> std::result::Result<(), SwapError> {
+    let nonce = getrandom::u64().map_err(|e| SwapError::Untouched(std::io::Error::other(e)))?;
     let old = exe.with_file_name(format!("{}{nonce:016x}", old_prefix(exe)));
-    fs::rename(exe, &old)?;
-    if let Err(e) = fs::rename(staged, exe) {
-        let _ = fs::rename(&old, exe);
-        return Err(e);
+    fs::rename(exe, &old).map_err(SwapError::Untouched)?;
+    if let Err(source) = fs::rename(staged, exe) {
+        return Err(match fs::rename(&old, exe) {
+            Ok(()) => SwapError::Untouched(source),
+            Err(_) => SwapError::Displaced {
+                moved_to: old,
+                source,
+            },
+        });
     }
     let _ = fs::remove_file(&old);
     Ok(())
@@ -485,21 +810,19 @@ pub fn remove_replaced(exe: &Path) {
 /// Run `staged --version` and require it to report `version`: catches a download
 /// built for another platform (fails to exec) or a mislabelled release before it
 /// replaces a working binary.
-fn probe_version(staged: &Path, version: &str) -> Result<()> {
-    let output = spawn_probe(staged).map_err(|e| {
-        Error::Install(format!(
-            "run {} --version: {e} (is the release built for this platform?)",
-            staged.display()
-        ))
+fn probe_version(staged: &Path, version: &str) -> std::result::Result<(), SelfUpdateError> {
+    let output = spawn_probe(staged).map_err(|source| SelfUpdateError::NotRunnable {
+        path: staged.to_path_buf(),
+        source,
     })?;
     let stdout = String::from_utf8_lossy(&output.stdout);
     if output.status.success() && stdout.split_whitespace().any(|word| word == version) {
         return Ok(());
     }
-    Err(Error::Install(format!(
-        "the downloaded binary reports {:?}, expected version {version}",
-        stdout.trim()
-    )))
+    Err(SelfUpdateError::WrongVersion {
+        expected: version.to_owned(),
+        reported: stdout.trim().to_owned(),
+    })
 }
 
 /// `staged --version`, retried while the file is busy: a process another
@@ -536,7 +859,7 @@ pub fn current_exe() -> Result<PathBuf> {
 }
 
 /// A private scratch directory under the system temp dir for the download
-/// cache and the unpacked archive; [`SelfUpdate::with_scratch`] removes it when done.
+/// cache and the unpacked archive; whoever asked for it removes it.
 fn scratch_dir() -> Result<PathBuf> {
     scratch_dir_in(&std::env::temp_dir())
 }
@@ -563,6 +886,20 @@ mod tests {
     use serde_json::json;
 
     use super::*;
+
+    /// Fetch and install in one go, as [`SelfUpdate::apply`] does.
+    #[cfg(unix)]
+    fn run_with(
+        cfg: &Config,
+        exe: &Path,
+        aliases: &[PathBuf],
+        binary: &str,
+        current_version: &str,
+    ) -> std::result::Result<Outcome, SelfUpdateError> {
+        fetch_with(cfg, binary, current_version)?.map_or(Ok(Outcome::UpToDate), |fetched| {
+            install_with(exe, aliases, &fetched)
+        })
+    }
 
     #[test]
     fn scratch_dir_is_fresh_and_owner_only() {
@@ -642,6 +979,32 @@ mod tests {
     }
 
     #[test]
+    fn follows_the_stable_channel_with_no_headers_unless_told_otherwise() {
+        let dir = scratch("config-defaults");
+        let update = SelfUpdate::new("myapp", Source::GitHub("o/r".to_owned()), "1.0.0")
+            .asset("myapp-linux-x64.tar.gz")
+            .trusted_keys(["k1:AAAA"]);
+        let cfg = update.config(&dir).unwrap();
+        assert_eq!(cfg.update.channel, "stable");
+        assert!(cfg.http.headers.is_empty());
+
+        let cfg = update
+            .channel("beta")
+            .header("Authorization: Bearer ${MYAPP_TOKEN}")
+            .header("X-Client: myapp")
+            .config(&dir)
+            .unwrap();
+        assert_eq!(cfg.update.channel, "beta");
+        assert_eq!(
+            cfg.http.headers,
+            ["Authorization: Bearer ${MYAPP_TOKEN}", "X-Client: myapp"]
+        );
+        // Still nothing but the source itself may receive them.
+        assert!(cfg.http.credential_hosts.is_empty());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn a_manifest_source_configures_the_native_adapter() {
         let dir = scratch("config-manifest");
         let url = "https://releases.example.com/myapp/manifest.json";
@@ -662,9 +1025,10 @@ mod tests {
         let update = SelfUpdate::new("myapp", Source::GitHub("o/r".to_owned()), "1.0.0")
             .asset("myapp-linux-x64.tar.gz");
         let err = update.check().unwrap_err();
-        assert!(matches!(err, Error::Config(_)), "{err}");
+        assert!(matches!(err, SelfUpdateError::Config(_)), "{err}");
+        assert!(err.is_untouched());
         let err = update.exe("/nonexistent/myapp").apply().unwrap_err();
-        assert!(matches!(err, Error::Config(_)), "{err}");
+        assert!(matches!(err, SelfUpdateError::Config(_)), "{err}");
     }
 
     // --- the executable swap + the end-to-end flow need `/bin/sh` -------------
@@ -727,7 +1091,10 @@ mod tests {
         fs::write(&exe, b"old").unwrap();
 
         let err = swap_keeping_old(&dir.join("missing"), &exe).unwrap_err();
-        assert_eq!(err.kind(), std::io::ErrorKind::NotFound);
+        assert!(
+            matches!(&err, SwapError::Untouched(e) if e.kind() == std::io::ErrorKind::NotFound),
+            "{err:?}"
+        );
         assert_eq!(fs::read(&exe).unwrap(), b"old");
         assert!(replaced_copies(&exe).is_empty());
         let _ = fs::remove_dir_all(&dir);
@@ -854,11 +1221,20 @@ mod tests {
         let wrong = dir.join("wrong-lode");
         write_fake_lode(&wrong, "1.2.3", 0o755);
         let err = replace_executable(&exe, &wrong, "9.9.9").unwrap_err();
+        assert!(
+            matches!(&err, SelfUpdateError::WrongVersion { expected, reported }
+                if expected == "9.9.9" && reported == "lode 1.2.3"),
+            "{err:?}"
+        );
         assert!(err.to_string().contains("expected version 9.9.9"), "{err}");
         // ...and one that cannot run at all (a foreign-platform binary).
         let broken = dir.join("broken-lode");
         fs::write(&broken, b"\x7fELF not really").unwrap();
         let err = replace_executable(&exe, &broken, "9.9.9").unwrap_err();
+        assert!(
+            matches!(err, SelfUpdateError::NotRunnable { .. }),
+            "{err:?}"
+        );
         assert!(err.to_string().contains("--version"), "{err}");
 
         assert_eq!(reported_version(&exe), "lode 1.0.0");
@@ -932,9 +1308,14 @@ mod tests {
                 }));
                 routes.push((format!("/dl/{ASSET}.sig"), format!("{sig}\n").into_bytes()));
             }
-            let release = json!({ "tag_name": tag, "assets": assets })
-                .to_string()
-                .into_bytes();
+            let release = json!({
+                "tag_name": tag,
+                "body": "What changed.",
+                "published_at": "2026-10-12T10:00:00Z",
+                "assets": assets,
+            })
+            .to_string()
+            .into_bytes();
             routes.push((LATEST.to_owned(), release.clone()));
             routes.push((format!("/repos/bkhq/lode/releases/tags/{tag}"), release));
             routes
@@ -989,7 +1370,8 @@ mod tests {
         let cfg = stub_config(&stub, None, &[entry], &dir.join("scratch"));
 
         let err = run_with(&cfg, &exe, &[], BINARY, "0.1.0").unwrap_err();
-        assert!(matches!(err, Error::Verify(_)), "{err}");
+        assert!(matches!(err, SelfUpdateError::Verify(_)), "{err}");
+        assert!(err.is_untouched());
         assert_eq!(reported_version(&exe), "lode 0.1.0");
         let _ = fs::remove_dir_all(&dir);
     }
@@ -1007,7 +1389,8 @@ mod tests {
         let cfg = stub_config(&stub, None, &[other], &dir.join("scratch"));
 
         let err = run_with(&cfg, &exe, &[], BINARY, "0.1.0").unwrap_err();
-        assert!(matches!(err, Error::Verify(_)), "{err}");
+        assert!(matches!(err, SelfUpdateError::Verify(_)), "{err}");
+        assert!(err.is_untouched());
         assert_eq!(reported_version(&exe), "lode 0.1.0");
         let _ = fs::remove_dir_all(&dir);
     }
@@ -1048,6 +1431,11 @@ mod tests {
             &dir.join("scratch"),
         );
         let err = run_with(&cfg, &exe, &[], BINARY, "10.0.0").unwrap_err();
+        assert!(
+            matches!(&err, SelfUpdateError::Older { latest, current }
+                if latest == "9.9.9" && current == "10.0.0"),
+            "{err:?}"
+        );
         assert!(err.to_string().contains("older than this binary"), "{err}");
         assert_eq!(reported_version(&exe), "lode 10.0.0");
 
@@ -1081,6 +1469,7 @@ mod tests {
             &dir.join("scratch"),
         );
         let err = run_with(&cfg, &exe, &[], BINARY, "nightly-2").unwrap_err();
+        assert!(matches!(err, SelfUpdateError::Unordered { .. }), "{err:?}");
         assert!(err.to_string().contains("cannot be ordered"), "{err}");
         assert_eq!(reported_version(&exe), "lode nightly-2");
 
@@ -1121,7 +1510,11 @@ mod tests {
 
         // The archive holds `lode`; asking for a member it lacks changes nothing.
         let err = run_with(&cfg, &exe, &[], "myapp", "0.1.0").unwrap_err();
-        assert!(err.to_string().contains("`myapp` binary"), "{err}");
+        assert!(
+            matches!(&err, SelfUpdateError::MissingBinary { asset, binary }
+                if asset == ASSET && binary == "myapp"),
+            "{err:?}"
+        );
         assert_eq!(reported_version(&exe), "lode 0.1.0");
 
         // The member name is independent of the installed executable's name.
@@ -1139,6 +1532,147 @@ mod tests {
             Outcome::UpToDate
         );
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_fetched_release_is_unpacked_for_the_caller_before_anything_is_installed() {
+        let dir = scratch("fetch");
+        let exe = dir.join("lode");
+        write_fake_lode(&exe, "0.1.0", 0o755);
+        let tarball = release_tarball("9.9.9");
+        let (sha, sig, entry) = sign(&tarball, "9.9.9");
+        let stub = github_stub("v9.9.9", tarball, &sha, Some(&sig));
+        let scratch_dir = dir.join("scratch");
+        let cfg = stub_config(&stub, None, &[entry], &scratch_dir);
+
+        let fetched = fetch_with(&cfg, BINARY, "0.1.0").unwrap().unwrap();
+        assert_eq!(fetched.version(), "9.9.9");
+        assert_eq!(fetched.entry().notes.as_deref(), Some("What changed."));
+        assert_eq!(
+            fetched.entry().published_at.as_deref(),
+            Some("2026-10-12T10:00:00Z")
+        );
+        // Every file of the verified asset is there to take, and nothing is installed yet.
+        assert!(fetched.dir().join(BINARY).is_file());
+        assert_eq!(fetched.binary(), fetched.dir().join(BINARY));
+        assert!(
+            fs::read_to_string(fetched.binary())
+                .unwrap()
+                .contains("9.9.9")
+        );
+        assert_eq!(reported_version(&exe), "lode 0.1.0");
+
+        install_with(&exe, &[], &fetched).unwrap();
+        assert_eq!(reported_version(&exe), "lode 9.9.9");
+        drop(fetched);
+        assert!(!scratch_dir.exists(), "dropping it removes the scratch dir");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_required_manifest_signature_refuses_an_unsigned_manifest() {
+        let dir = scratch("require-manifest");
+        let exe = dir.join("lode");
+        write_fake_lode(&exe, "0.1.0", 0o755);
+        let tarball = release_tarball("9.9.9");
+        let (sha, sig, entry) = sign(&tarball, "9.9.9");
+        // A native manifest whose asset is signed and whose catalog is not.
+        let stub = Stub::start(move |base| {
+            let manifest = json!({
+                "schema": "lode/v1",
+                "name": BINARY,
+                "channels": { "stable": { "latest": "9.9.9" } },
+                "versions": { "9.9.9": {
+                    "notes": "What changed.",
+                    "published_at": "2026-10-12T10:00:00Z",
+                    "assets": [{
+                        "name": ASSET,
+                        "url": format!("{base}/dl/{ASSET}"),
+                        "sha256": sha,
+                        "sig": sig,
+                    }],
+                } },
+            });
+            vec![
+                (
+                    "/manifest.json".to_owned(),
+                    manifest.to_string().into_bytes(),
+                ),
+                (format!("/dl/{ASSET}"), tarball),
+            ]
+        });
+        let update = SelfUpdate::new(
+            BINARY,
+            Source::Manifest(format!("{}/manifest.json", stub.base)),
+            "0.1.0",
+        )
+        .asset(ASSET)
+        .trusted_keys([entry]);
+
+        let strict = update
+            .clone()
+            .require_manifest(RequireManifest::Fresh)
+            .config(&dir.join("scratch"))
+            .unwrap();
+        let err = run_with(&strict, &exe, &[], BINARY, "0.1.0").unwrap_err();
+        assert!(matches!(err, SelfUpdateError::Verify(_)), "{err:?}");
+        assert!(err.is_untouched());
+        assert_eq!(reported_version(&exe), "lode 0.1.0");
+        assert!(!stub.served().iter().any(|path| path.starts_with("/dl/")));
+
+        // Left at the default the same manifest is followed, and its entry is
+        // what `check` hands on.
+        let lenient = update.config(&dir.join("scratch")).unwrap();
+        let (manifest, target) = resolve(&lenient, "0.1.0").unwrap();
+        let entry = manifest::version_entry(&manifest, &target.unwrap()).unwrap();
+        assert_eq!(entry.notes.as_deref(), Some("What changed."));
+        assert_eq!(entry.published_at.as_deref(), Some("2026-10-12T10:00:00Z"));
+        run_with(&lenient, &exe, &[], BINARY, "0.1.0").unwrap();
+        assert_eq!(reported_version(&exe), "lode 9.9.9");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_github_source_cannot_be_asked_for_a_signed_manifest() {
+        let dir = scratch("require-manifest-github");
+        let err = updater(None, &["k1:AAAA".to_owned()])
+            .require_manifest(RequireManifest::Signed)
+            .config(&dir)
+            .unwrap_err();
+        assert!(matches!(
+            SelfUpdateError::from(err),
+            SelfUpdateError::Config(_)
+        ));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_errors_that_changed_the_installation_say_so() {
+        let io = || std::io::Error::other("denied");
+        let alias = SelfUpdateError::Alias {
+            path: PathBuf::from("lode-cli.exe"),
+            source: io(),
+        };
+        let displaced = SelfUpdateError::Displaced {
+            path: PathBuf::from("lode.exe"),
+            moved_to: PathBuf::from(".lode.exe.old-1"),
+            source: io(),
+        };
+        let replace = SelfUpdateError::Replace {
+            path: PathBuf::from("lode"),
+            source: io(),
+        };
+        assert!(!alias.is_untouched());
+        assert!(!displaced.is_untouched());
+        assert!(replace.is_untouched());
+        // The command-line caller still gets lode's own error.
+        assert!(matches!(Error::from(replace), Error::Install(_)));
+        assert!(matches!(
+            Error::from(SelfUpdateError::from(Error::Verify("bad".to_owned()))),
+            Error::Verify(_)
+        ));
     }
 
     #[test]

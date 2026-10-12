@@ -123,12 +123,13 @@ lode 由三个 crate 组成:**`lode-core`**(不含 clap、不碰信号——配�
 
 ```toml
 [dependencies]
-lode-core = { git = "https://github.com/bkhq/lode", tag = "v0.0.2" }        # 配置 + Engine(无 clap、无信号)
-lode-supervisor = { git = "https://github.com/bkhq/lode", tag = "v0.0.2" }  # + 监管循环,由注入的 SignalSource 驱动
+lode-core = { git = "https://github.com/bkhq/lode", tag = "v0.0.3" }        # 配置 + Engine(无 clap、无信号)
+lode-supervisor = { git = "https://github.com/bkhq/lode", tag = "v0.0.3" }  # + 监管循环,由注入的 SignalSource 驱动
 ```
 
-完整的宿主程序示例(自己处理信号、在线程里跑监督循环、通过 `Engine` 切换版本和重启)见
-[`examples/embed`](examples/embed)。
+完整指南见 [docs/embedding.zh-CN.md](docs/embedding.zh-CN.md):程序更新自己的可执行文件
+(`SelfUpdate`),以及宿主监管另一个应用(`Engine` + `serve_embedded`)。两者在
+[`examples/embed`](examples/embed) 里都有完整、可运行的示例程序。
 
 ```bash
 cargo run -p lode-core --example engine        # 代码里构造配置 + 只读 Engine

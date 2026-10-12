@@ -12,6 +12,11 @@
 //! Verification is two-layer: integrity (sha256) + publisher identity (ed25519).
 //! See `docs/architecture.md`.
 //!
+//! Two ways in: [`self_update::SelfUpdate`] replaces the running program's own
+//! executable with a signed release, and [`Engine`] drives the versions of an
+//! app that `lode-supervisor` runs as a child. `docs/embedding.md` is the guide
+//! to both.
+//!
 //! ```no_run
 //! # fn main() -> lode_core::Result<()> {
 //! let cfg = lode_core::Config::from_toml("")?;

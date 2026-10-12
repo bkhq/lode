@@ -1732,6 +1732,7 @@ mod tests {
             "1.0.0".to_owned(),
             VersionEntry {
                 notes: None,
+                published_at: None,
                 assets: vec![asset("app.bin", "abc")],
             },
         );

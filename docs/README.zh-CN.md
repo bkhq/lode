@@ -8,6 +8,7 @@
 |---|---|---|
 | 项目概览 / 快速上手 | [`../README.md`](../README.md) | [`../README.zh-CN.md`](../README.zh-CN.md) |
 | 集成 —— 配置 → 运行 → 发布 | [`integration.md`](integration.md) | [`integration.zh-CN.md`](integration.zh-CN.md) |
+| 嵌入 —— 把 lode 作为库使用:更新程序自身、监管另一个应用 | [`embedding.md`](embedding.md) | [`embedding.zh-CN.md`](embedding.zh-CN.md) |
 | 运维 —— 安装、命令、日志、退出码、常见问题 | [`operations.md`](operations.md) | [`operations.zh-CN.md`](operations.zh-CN.md) |
 | 架构文档(权威规范) | [`architecture.md`](architecture.md) | [`architecture.zh-CN.md`](architecture.zh-CN.md) |
 | 离线本地测试(`lode-cli seed`) | [`dev-local-testing.md`](dev-local-testing.md) | [`dev-local-testing.zh-CN.md`](dev-local-testing.zh-CN.md) |
