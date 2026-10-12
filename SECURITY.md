@@ -99,8 +99,10 @@ welcome to notify us if lode's use of a dependency is exploitable.
   against the release keys compiled into the binary
   (`crates/lode/release-keys.txt`); the app's `lode.toml` / `LODE_*` source
   and trusted keys are never consulted. The verified binary is probed
-  (`--version` must report the target) and atomically renamed over the
-  running executable, which keeps its old inode until lode restarts.
+  (`--version` must report the target) and moved into the place of the
+  running executable: by an atomic rename on Unix, where the process keeps
+  its old inode until lode restarts; on Windows by renaming the old file
+  aside first, since a running executable cannot be overwritten.
 
 ## Artifact extraction safety
 

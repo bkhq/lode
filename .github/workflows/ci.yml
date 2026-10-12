@@ -125,6 +125,11 @@ jobs:
       - name: cargo clippy (Windows)
         if: runner.os == 'Windows'
         run: cargo clippy --workspace --locked
+      # Replacing a running executable differs on Windows and can only be
+      # exercised there.
+      - name: Self-update tests (Windows)
+        if: runner.os == 'Windows'
+        run: cargo test -p lode-core --lib --locked self_update
       - name: Build binaries
         run: cargo build --bins --locked
       - name: Smoke test
@@ -133,8 +138,7 @@ jobs:
           SMOKE_GITHUB_TOKEN: ${{ github.token }}
           SMOKE_RELEASE_KEYS: crates/lode/release-keys.txt
           # The release the GitHub update step installs; empty skips the step.
-          # Set it to v0.0.1 once that release is published.
-          SMOKE_RELEASE_TAG: ""
+          SMOKE_RELEASE_TAG: v0.0.1
           SMOKE_RUNTIME: "1"
         run: |
           set -eu

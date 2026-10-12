@@ -55,6 +55,12 @@ pub fn run() -> anyhow::Result<ExitCode> {
         .suppress_core_dumps(true)
         .install();
 
+    // What a self-update on Windows left beside this executable.
+    #[cfg(windows)]
+    if let Ok(exe) = std::env::current_exe() {
+        lode_core::self_update::remove_replaced(&exe);
+    }
+
     if invoked_as_tool() {
         run_tool()
     } else {
@@ -91,19 +97,12 @@ fn run_loader() -> anyhow::Result<ExitCode> {
     }
 }
 
-#[cfg(unix)]
 fn self_update(version: Option<&str>, keys: &[String]) -> anyhow::Result<()> {
     Ok(commands::self_update::run(
         version,
         keys,
         env!("CARGO_PKG_VERSION"),
     )?)
-}
-
-/// Replacing a running executable needs a different mechanism off Unix.
-#[cfg(not(unix))]
-fn self_update(_version: Option<&str>, _keys: &[String]) -> anyhow::Result<()> {
-    anyhow::bail!("self-update is not supported on this platform; download the new release instead")
 }
 
 /// The `lode-cli` toolkit: management commands talk to a running instance via the

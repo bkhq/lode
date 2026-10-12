@@ -37,7 +37,6 @@ pub mod lock;
 pub mod lock;
 mod logging;
 pub mod manifest;
-#[cfg(unix)]
 pub mod self_update;
 pub mod state;
 #[cfg(test)]

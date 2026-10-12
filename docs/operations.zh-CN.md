@@ -57,7 +57,7 @@ Linux 二进制是静态链接(musl),可在任何发行版上运行。
 | `lode <args…>` | 没有 `exec`:app 作为子进程运行,lode 以它的退出码退出。 |
 | `[runtime]` | 运行时二进制是 `<name>.exe`。 |
 | 数据目录 | 默认 `C:\ProgramData\lode`。没有 `current` 链接;当前版本记录在 `state.json` 里。 |
-| `lode-cli self-update` | 不可用:请直接下载新版本。 |
+| `lode-cli self-update` | 同时替换 `lode.exe` 和 `lode-cli.exe`。运行中的可执行文件不能被覆盖,所以旧文件先被改名挪开,在 lode 下次启动时删除。 |
 | 控制台 | `CTRL_BREAK` 要求 lode 和 app 共用一个控制台。没有控制台时 app 必须自己关注 `state.json` 里的 `status`,否则会在 `stop_timeout` 后被终止。 |
 
 ### 升级 lode 自身
@@ -68,7 +68,7 @@ lode-cli self-update --version v0.0.1    # 指定 tag;降级也用它
 ```
 
 `self-update` 下载本机对应的发布制品,按**当前二进制内置的**发布公钥校验,然后就地替换可执行文件。
-它不读取 app 的 `lode.toml`。正在运行的监督进程在 lode 重启之前仍使用旧二进制。
+它不读取 app 的 `lode.toml`。正在运行的监督进程在 lode 重启之前仍使用旧二进制。可执行文件所在目录必须可写。
 
 如果该发布是用已安装二进制不认识的密钥签的(密钥轮换之后),显式传入新公钥:
 `--release-key '<key_id>:<base64>'`。

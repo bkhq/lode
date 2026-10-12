@@ -61,7 +61,7 @@ lode supervises and updates an app on Windows as it does on Unix. The difference
 | `lode <args…>` | There is no `exec`: the app runs as a child and lode exits with its status. |
 | `[runtime]` | The runtime binary is `<name>.exe`. |
 | Data directory | Default `C:\ProgramData\lode`. There is no `current` link; `state.json` records the current version. |
-| `lode-cli self-update` | Not available: download the new release instead. |
+| `lode-cli self-update` | Replaces both `lode.exe` and `lode-cli.exe`. A running executable cannot be overwritten, so the old files are renamed aside and deleted the next time lode starts. |
 | Console | `CTRL_BREAK` needs lode and the app to share a console. Without one the app must watch `status` in `state.json`, or it is terminated at `stop_timeout`. |
 
 ### Upgrade lode itself
@@ -74,7 +74,7 @@ lode-cli self-update --version v0.0.1    # a specific tag; also how to downgrade
 `self-update` downloads the release asset for this host, verifies it against the
 release keys **built into the running binary**, and replaces the executable in place.
 It never reads the app's `lode.toml`. A running supervisor keeps the old binary until
-lode is restarted.
+lode is restarted. The directory holding the executable must be writable.
 
 If the release was signed with a key the installed binary does not know (after a key
 rotation), pass the new key explicitly: `--release-key '<key_id>:<base64>'`.

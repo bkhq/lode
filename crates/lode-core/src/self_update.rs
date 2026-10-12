@@ -8,9 +8,15 @@
 //! `LODE_*` environment) and then reuses the ordinary chain — source adapter →
 //! download → sha256 + signature gate → unpack — that installs any app version.
 //! The verified binary is staged beside the executable, probed (`--version`
-//! must report the target), and atomically renamed over it. The running process
-//! keeps its old inode, so nothing changes until the program is next started;
-//! restarting (or re-executing) is the caller's decision.
+//! must report the target), and moved into its place. Nothing changes for the
+//! running process until the program is next started; restarting (or
+//! re-executing) is the caller's decision.
+//!
+//! On Unix the move is one atomic `rename` and the running process keeps its
+//! old inode. Windows does not let a running executable be overwritten or
+//! deleted, only renamed: the old file is moved aside under a hidden name and
+//! the new one takes its place. Call [`remove_replaced`] when the program
+//! starts to delete what an earlier update left there.
 //!
 //! ```no_run
 //! use lode_core::self_update::{Outcome, SelfUpdate, Source};
@@ -82,6 +88,7 @@ pub struct SelfUpdate {
     trusted_keys: Vec<String>,
     version: Option<String>,
     exe: Option<PathBuf>,
+    aliases: Vec<PathBuf>,
 }
 
 impl SelfUpdate {
@@ -101,6 +108,7 @@ impl SelfUpdate {
             trusted_keys: Vec::new(),
             version: None,
             exe: None,
+            aliases: Vec::new(),
         }
     }
 
@@ -113,7 +121,7 @@ impl SelfUpdate {
     }
 
     /// The file inside the unpacked asset that is the executable. Defaults to
-    /// the app name.
+    /// the app name, with `.exe` on Windows.
     #[must_use]
     pub fn binary(mut self, name: impl Into<String>) -> Self {
         self.binary = Some(name.into());
@@ -152,6 +160,16 @@ impl SelfUpdate {
         self
     }
 
+    /// Another path that holds a copy of the same executable and is replaced
+    /// along with it — a second name the program ships under where there is no
+    /// symlink to do it (lode's own `lode-cli.exe` on Windows). A path that does
+    /// not exist is left out.
+    #[must_use]
+    pub fn alias(mut self, path: impl Into<PathBuf>) -> Self {
+        self.aliases.push(path.into());
+        self
+    }
+
     /// Look for an update without installing it: `Some(version)` when
     /// [`apply`](Self::apply) would install `version`, `None` when the running
     /// version is already the newest release.
@@ -176,8 +194,14 @@ impl SelfUpdate {
             Some(exe) => exe.clone(),
             None => current_exe()?,
         };
-        let binary = self.binary.as_deref().unwrap_or(&self.app);
-        self.with_scratch(|cfg| run_with(cfg, &exe, binary, &self.current_version))
+        let binary = self.binary_name();
+        self.with_scratch(|cfg| run_with(cfg, &exe, &self.aliases, &binary, &self.current_version))
+    }
+
+    fn binary_name(&self) -> String {
+        self.binary
+            .clone()
+            .unwrap_or_else(|| format!("{}{}", self.app, std::env::consts::EXE_SUFFIX))
     }
 
     /// Run `f` against the self-contained config, in a scratch directory that
@@ -262,8 +286,15 @@ fn resolve(cfg: &Config, current_version: &str) -> Result<(manifest::Manifest, O
 
 /// The update proper, against `cfg` and the executable at `exe` (split from
 /// [`SelfUpdate::apply`] so tests can drive it with a stub source and a scratch
-/// executable). `binary` is the executable's name inside the unpacked asset.
-fn run_with(cfg: &Config, exe: &Path, binary: &str, current_version: &str) -> Result<Outcome> {
+/// executable). `binary` is the executable's name inside the unpacked asset;
+/// `aliases` are further copies of the executable to replace with it.
+fn run_with(
+    cfg: &Config,
+    exe: &Path,
+    aliases: &[PathBuf],
+    binary: &str,
+    current_version: &str,
+) -> Result<Outcome> {
     let (manifest, Some(target)) = resolve(cfg, current_version)? else {
         return Ok(Outcome::UpToDate);
     };
@@ -290,6 +321,11 @@ fn run_with(cfg: &Config, exe: &Path, binary: &str, current_version: &str) -> Re
         )));
     }
     replace_executable(exe, &unpacked, &target)?;
+    for alias in aliases {
+        if alias != exe && alias.is_file() {
+            replace_alias(alias, &unpacked)?;
+        }
+    }
 
     Ok(Outcome::Installed {
         version: target,
@@ -329,36 +365,121 @@ fn plan(target: &str, current: &str) -> Plan {
 }
 
 /// Swap `binary` (the verified, unpacked release) in over `exe`: copy it beside
-/// `exe` (same filesystem, so the final step is an atomic `rename`), carry over
-/// `exe`'s permission bits, prove it runs and reports `version`, then rename it
-/// over `exe`. On any failure the staged copy is removed and `exe` is untouched.
-/// A running `exe` keeps its old inode (Unix never lets a mapped executable be
-/// written — `ETXTBSY`), which is why this is a rename, not a write.
+/// `exe` (same filesystem, so it moves in with a `rename`), carry over `exe`'s
+/// permission bits, prove it runs and reports `version`, then put it in `exe`'s
+/// place ([`swap`]). On any failure the staged copy is removed and `exe` is
+/// untouched.
 fn replace_executable(exe: &Path, binary: &Path, version: &str) -> Result<()> {
-    let dir = exe
-        .parent()
-        .ok_or_else(|| Error::Install(format!("{} has no parent directory", exe.display())))?;
-    let name = exe
-        .file_name()
-        .and_then(OsStr::to_str)
-        .ok_or_else(|| Error::Install(format!("{} has no usable filename", exe.display())))?;
-    let staged = dir.join(format!(".{name}.self-update-{}", std::process::id()));
-    fs::copy(binary, &staged)
-        .map_err(|e| Error::Install(format!("stage {}: {e}", staged.display())))?;
-    let result = install_staged(exe, &staged, version);
+    let staged = stage(exe, binary)?;
+    let result = probe_version(&staged, version).and_then(|()| {
+        swap(&staged, exe).map_err(|e| Error::Install(format!("replace {}: {e}", exe.display())))
+    });
     if result.is_err() {
         let _ = fs::remove_file(&staged);
     }
     result
 }
 
-/// The steps after staging (see [`replace_executable`]), separated so a failure
-/// in any of them cleans up the staged copy in one place.
-fn install_staged(exe: &Path, staged: &Path, version: &str) -> Result<()> {
-    let perms = fs::metadata(exe)?.permissions();
-    fs::set_permissions(staged, perms)?;
-    probe_version(staged, version)?;
-    fs::rename(staged, exe).map_err(|e| Error::Install(format!("replace {}: {e}", exe.display())))
+/// Replace `alias`, a second copy of the executable, with `binary`. The binary
+/// was probed when it replaced the executable itself.
+fn replace_alias(alias: &Path, binary: &Path) -> Result<()> {
+    let staged = stage(alias, binary)?;
+    swap(&staged, alias).map_err(|e| {
+        let _ = fs::remove_file(&staged);
+        Error::Install(format!("replace {}: {e}", alias.display()))
+    })
+}
+
+/// Copy `binary` beside `exe` under a name that keeps `exe`'s extension, with
+/// `exe`'s permission bits.
+fn stage(exe: &Path, binary: &Path) -> Result<PathBuf> {
+    let dir = exe
+        .parent()
+        .ok_or_else(|| Error::Install(format!("{} has no parent directory", exe.display())))?;
+    let name = file_name(exe)?;
+    let staged = dir.join(format!(".self-update-{}-{name}", std::process::id()));
+    let staging = fs::copy(binary, &staged).map(drop);
+    // Windows has no mode bits to carry, and a read-only flag would only get
+    // in the way of the next update.
+    #[cfg(unix)]
+    let staging =
+        staging.and_then(|()| fs::set_permissions(&staged, fs::metadata(exe)?.permissions()));
+    if let Err(e) = staging {
+        let _ = fs::remove_file(&staged);
+        return Err(Error::Install(format!("stage {}: {e}", staged.display())));
+    }
+    Ok(staged)
+}
+
+fn file_name(exe: &Path) -> Result<&str> {
+    exe.file_name()
+        .and_then(OsStr::to_str)
+        .ok_or_else(|| Error::Install(format!("{} has no usable filename", exe.display())))
+}
+
+/// Put `staged` in `exe`'s place. On Unix one `rename` does it: the running
+/// process keeps the old inode (a mapped executable cannot be written —
+/// `ETXTBSY` — which is why this is a rename, not a write).
+#[cfg(not(windows))]
+fn swap(staged: &Path, exe: &Path) -> std::io::Result<()> {
+    fs::rename(staged, exe)
+}
+
+/// Put `staged` in `exe`'s place. Windows refuses to overwrite or delete a
+/// running executable but lets it be renamed, so the old file moves aside
+/// first; see [`swap_keeping_old`].
+#[cfg(windows)]
+fn swap(staged: &Path, exe: &Path) -> std::io::Result<()> {
+    swap_keeping_old(staged, exe)
+}
+
+/// Rename `exe` aside, rename `staged` into its place, and put `exe` back when
+/// that fails. The file moved aside is deleted when nothing runs it any more:
+/// here if possible, else by [`remove_replaced`] on a later start.
+#[cfg(any(windows, test))]
+fn swap_keeping_old(staged: &Path, exe: &Path) -> std::io::Result<()> {
+    let nonce = getrandom::u64().map_err(std::io::Error::other)?;
+    let old = exe.with_file_name(format!("{}{nonce:016x}", old_prefix(exe)));
+    fs::rename(exe, &old)?;
+    if let Err(e) = fs::rename(staged, exe) {
+        let _ = fs::rename(&old, exe);
+        return Err(e);
+    }
+    let _ = fs::remove_file(&old);
+    Ok(())
+}
+
+/// What the files [`swap_keeping_old`] moves aside for `exe` are named with.
+fn old_prefix(exe: &Path) -> String {
+    let name = exe.file_name().and_then(OsStr::to_str).unwrap_or_default();
+    format!(".{name}.old-")
+}
+
+/// The files earlier updates moved aside for `exe` that are still there.
+fn replaced_copies(exe: &Path) -> Vec<PathBuf> {
+    let prefix = old_prefix(exe);
+    let Some(entries) = exe.parent().and_then(|dir| fs::read_dir(dir).ok()) else {
+        return Vec::new();
+    };
+    entries
+        .filter_map(|entry| entry.ok().map(|entry| entry.path()))
+        .filter(|path| {
+            path.file_name()
+                .and_then(OsStr::to_str)
+                .is_some_and(|name| name.starts_with(&prefix))
+        })
+        .collect()
+}
+
+/// Delete what earlier updates left of `exe`.
+///
+/// On Windows the replaced binary stays beside it for as long as a process
+/// still runs it. Best effort — a file still in use stays for the next call. A
+/// program that updates itself calls this when it starts.
+pub fn remove_replaced(exe: &Path) {
+    for old in replaced_copies(exe) {
+        let _ = fs::remove_file(old);
+    }
 }
 
 /// Run `staged --version` and require it to report `version`: catches a download
@@ -424,12 +545,14 @@ fn scratch_dir() -> Result<PathBuf> {
 /// and creation fails when the path exists, so another local user cannot plant
 /// the directory and swap the verified binary before it is installed.
 fn scratch_dir_in(base: &Path) -> Result<PathBuf> {
-    use std::os::unix::fs::DirBuilderExt as _;
-
     let nonce = getrandom::u64()
         .map_err(|e| Error::Install(format!("self-update: no randomness for scratch dir: {e}")))?;
     let dir = base.join(format!("lode-self-update-{nonce:016x}"));
-    fs::DirBuilder::new().mode(0o700).create(&dir)?;
+    #[cfg(unix)]
+    std::os::unix::fs::DirBuilderExt::mode(&mut fs::DirBuilder::new(), 0o700).create(&dir)?;
+    // On Windows the user's temp directory is already private to the user.
+    #[cfg(not(unix))]
+    fs::create_dir(&dir)?;
     Ok(dir)
 }
 
@@ -443,13 +566,13 @@ mod tests {
 
     #[test]
     fn scratch_dir_is_fresh_and_owner_only() {
-        use std::os::unix::fs::PermissionsExt as _;
-
         let base = scratch("scratch-dir");
         let first = scratch_dir_in(&base).unwrap();
         let second = scratch_dir_in(&base).unwrap();
         assert_ne!(first, second, "each call gets its own directory");
+        #[cfg(unix)]
         for dir in [&first, &second] {
+            use std::os::unix::fs::PermissionsExt as _;
             let mode = fs::metadata(dir).unwrap().permissions().mode();
             assert_eq!(mode & 0o777, 0o700);
         }
@@ -564,12 +687,14 @@ mod tests {
         fs::metadata(path).unwrap().permissions().mode() & 0o777
     }
 
+    #[cfg(unix)]
     fn reported_version(exe: &Path) -> String {
         let out = Command::new(exe).arg("--version").output().unwrap();
         String::from_utf8_lossy(&out.stdout).trim().to_owned()
     }
 
-    /// No `.<name>.self-update-*` staging file was left behind in `dir`.
+    /// No `.self-update-*` staging file was left behind in `dir`.
+    #[cfg(unix)]
     fn no_staging_leftovers(dir: &Path) -> bool {
         !fs::read_dir(dir).unwrap().any(|e| {
             e.unwrap()
@@ -577,6 +702,129 @@ mod tests {
                 .to_string_lossy()
                 .contains(".self-update-")
         })
+    }
+
+    #[test]
+    fn swap_keeping_old_replaces_the_file_and_puts_the_old_one_aside() {
+        let dir = scratch("swap-old");
+        let exe = dir.join("app.exe");
+        fs::write(&exe, b"old").unwrap();
+        let staged = dir.join(".self-update-1-app.exe");
+        fs::write(&staged, b"new").unwrap();
+
+        swap_keeping_old(&staged, &exe).unwrap();
+        assert_eq!(fs::read(&exe).unwrap(), b"new");
+        assert!(!staged.exists());
+        // Nothing runs the old file here, so it could be removed at once.
+        assert!(replaced_copies(&exe).is_empty());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn swap_keeping_old_puts_the_file_back_when_the_new_one_cannot_move_in() {
+        let dir = scratch("swap-back");
+        let exe = dir.join("app.exe");
+        fs::write(&exe, b"old").unwrap();
+
+        let err = swap_keeping_old(&dir.join("missing"), &exe).unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::NotFound);
+        assert_eq!(fs::read(&exe).unwrap(), b"old");
+        assert!(replaced_copies(&exe).is_empty());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn remove_replaced_clears_what_earlier_updates_left_of_this_executable_only() {
+        let dir = scratch("old-copies");
+        let exe = dir.join("app.exe");
+        fs::write(&exe, b"current").unwrap();
+        let mine = dir.join(".app.exe.old-00000000000000aa");
+        let other = dir.join(".tool.exe.old-00000000000000bb");
+        fs::write(&mine, b"x").unwrap();
+        fs::write(&other, b"x").unwrap();
+
+        remove_replaced(&exe);
+        assert!(!mine.exists());
+        assert!(other.exists());
+        assert!(exe.exists());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// Stays alive while `swap_keeping_old_replaces_a_running_executable` swaps
+    /// the file it runs from. Not a test of its own.
+    #[cfg(windows)]
+    #[test]
+    #[ignore = "helper process for swap_keeping_old_replaces_a_running_executable"]
+    fn stay_alive_for_the_swap_test() {
+        std::thread::sleep(std::time::Duration::from_secs(60));
+    }
+
+    /// The point of the Windows path: a running executable cannot be overwritten
+    /// or deleted, but it can be renamed aside.
+    #[cfg(windows)]
+    #[test]
+    fn swap_keeping_old_replaces_a_running_executable() {
+        let dir = scratch("swap-running");
+        let exe = dir.join("app.exe");
+        fs::copy(std::env::current_exe().unwrap(), &exe).unwrap();
+        let mut running = Command::new(&exe)
+            .args([
+                "--exact",
+                "self_update::tests::stay_alive_for_the_swap_test",
+                "--ignored",
+            ])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(500));
+        assert!(fs::write(&exe, b"new").is_err(), "a running exe is locked");
+
+        let staged = dir.join(".self-update-1-app.exe");
+        fs::write(&staged, b"new").unwrap();
+        swap_keeping_old(&staged, &exe).unwrap();
+        assert_eq!(fs::read(&exe).unwrap(), b"new");
+        // The old file is still mapped by the running process: it stays, aside.
+        assert_eq!(replaced_copies(&exe).len(), 1);
+
+        running.kill().unwrap();
+        running.wait().unwrap();
+        remove_replaced(&exe);
+        assert!(replaced_copies(&exe).is_empty());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn an_alias_of_the_executable_gets_the_same_binary() {
+        let dir = scratch("alias");
+        let exe = dir.join("lode");
+        let alias = dir.join("lode-cli");
+        write_fake_lode(&exe, "0.1.0", 0o755);
+        write_fake_lode(&alias, "0.1.0", 0o755);
+        let tarball = release_tarball("9.9.9");
+        let (sha, sig, entry) = sign(&tarball, "9.9.9");
+        let stub = github_stub("v9.9.9", tarball, &sha, Some(&sig));
+        let cfg = stub_config(&stub, None, &[entry], &dir.join("scratch"));
+
+        // An alias that does not exist is left out; the executable itself is not done twice.
+        let aliases = [alias.clone(), dir.join("absent"), exe.clone()];
+        run_with(&cfg, &exe, &aliases, BINARY, "0.1.0").unwrap();
+        assert_eq!(reported_version(&exe), "lode 9.9.9");
+        assert_eq!(reported_version(&alias), "lode 9.9.9");
+        assert!(!dir.join("absent").exists());
+        assert!(no_staging_leftovers(&dir));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_binary_defaults_to_the_app_name_with_the_platform_suffix() {
+        let update = SelfUpdate::new("myapp", Source::GitHub("o/r".to_owned()), "1.0.0");
+        assert_eq!(
+            update.binary_name(),
+            format!("myapp{}", std::env::consts::EXE_SUFFIX)
+        );
+        assert_eq!(update.binary("tool.bin").binary_name(), "tool.bin");
     }
 
     #[cfg(unix)]
@@ -712,7 +960,7 @@ mod tests {
         let stub = github_stub("v9.9.9", tarball, &sha, Some(&sig));
         let cfg = stub_config(&stub, None, &[entry], &dir.join("scratch"));
 
-        run_with(&cfg, &exe, BINARY, "0.1.0").unwrap();
+        run_with(&cfg, &exe, &[], BINARY, "0.1.0").unwrap();
 
         assert_eq!(reported_version(&exe), "lode 9.9.9");
         assert!(no_staging_leftovers(exe.parent().unwrap()));
@@ -740,7 +988,7 @@ mod tests {
         let stub = github_stub("v9.9.9", tarball, &sha, None);
         let cfg = stub_config(&stub, None, &[entry], &dir.join("scratch"));
 
-        let err = run_with(&cfg, &exe, BINARY, "0.1.0").unwrap_err();
+        let err = run_with(&cfg, &exe, &[], BINARY, "0.1.0").unwrap_err();
         assert!(matches!(err, Error::Verify(_)), "{err}");
         assert_eq!(reported_version(&exe), "lode 0.1.0");
         let _ = fs::remove_dir_all(&dir);
@@ -758,7 +1006,7 @@ mod tests {
         let stub = github_stub("v9.9.9", tarball, &sha, Some(&sig));
         let cfg = stub_config(&stub, None, &[other], &dir.join("scratch"));
 
-        let err = run_with(&cfg, &exe, BINARY, "0.1.0").unwrap_err();
+        let err = run_with(&cfg, &exe, &[], BINARY, "0.1.0").unwrap_err();
         assert!(matches!(err, Error::Verify(_)), "{err}");
         assert_eq!(reported_version(&exe), "lode 0.1.0");
         let _ = fs::remove_dir_all(&dir);
@@ -775,7 +1023,7 @@ mod tests {
         let stub = github_stub("v9.9.9", tarball, &sha, Some(&sig));
         let cfg = stub_config(&stub, None, &[entry], &dir.join("scratch"));
 
-        run_with(&cfg, &exe, BINARY, "9.9.9").unwrap();
+        run_with(&cfg, &exe, &[], BINARY, "9.9.9").unwrap();
 
         assert_eq!(reported_version(&exe), "lode 9.9.9");
         assert!(!stub.served().iter().any(|p| p == &format!("/dl/{ASSET}")));
@@ -799,14 +1047,14 @@ mod tests {
             std::slice::from_ref(&entry),
             &dir.join("scratch"),
         );
-        let err = run_with(&cfg, &exe, BINARY, "10.0.0").unwrap_err();
+        let err = run_with(&cfg, &exe, &[], BINARY, "10.0.0").unwrap_err();
         assert!(err.to_string().contains("older than this binary"), "{err}");
         assert_eq!(reported_version(&exe), "lode 10.0.0");
 
         // ...while naming the raw tag installs it: the pin resolves to the same
         // `9.9.9` id the signature was made over, not the raw `v9.9.9`.
         let cfg = stub_config(&stub, Some("v9.9.9"), &[entry], &dir.join("scratch"));
-        run_with(&cfg, &exe, BINARY, "10.0.0").unwrap();
+        run_with(&cfg, &exe, &[], BINARY, "10.0.0").unwrap();
         assert_eq!(reported_version(&exe), "lode 9.9.9");
         assert!(
             stub.served()
@@ -832,12 +1080,12 @@ mod tests {
             std::slice::from_ref(&entry),
             &dir.join("scratch"),
         );
-        let err = run_with(&cfg, &exe, BINARY, "nightly-2").unwrap_err();
+        let err = run_with(&cfg, &exe, &[], BINARY, "nightly-2").unwrap_err();
         assert!(err.to_string().contains("cannot be ordered"), "{err}");
         assert_eq!(reported_version(&exe), "lode nightly-2");
 
         let cfg = stub_config(&stub, Some("nightly-1"), &[entry], &dir.join("scratch"));
-        run_with(&cfg, &exe, BINARY, "nightly-2").unwrap();
+        run_with(&cfg, &exe, &[], BINARY, "nightly-2").unwrap();
         assert_eq!(reported_version(&exe), "lode nightly-1");
         let _ = fs::remove_dir_all(&dir);
     }
@@ -872,12 +1120,12 @@ mod tests {
         let cfg = stub_config(&stub, None, &[entry], &dir.join("scratch"));
 
         // The archive holds `lode`; asking for a member it lacks changes nothing.
-        let err = run_with(&cfg, &exe, "myapp", "0.1.0").unwrap_err();
+        let err = run_with(&cfg, &exe, &[], "myapp", "0.1.0").unwrap_err();
         assert!(err.to_string().contains("`myapp` binary"), "{err}");
         assert_eq!(reported_version(&exe), "lode 0.1.0");
 
         // The member name is independent of the installed executable's name.
-        let outcome = run_with(&cfg, &exe, BINARY, "0.1.0").unwrap();
+        let outcome = run_with(&cfg, &exe, &[], BINARY, "0.1.0").unwrap();
         assert_eq!(
             outcome,
             Outcome::Installed {
@@ -887,7 +1135,7 @@ mod tests {
         );
         assert_eq!(reported_version(&exe), "lode 9.9.9");
         assert_eq!(
-            run_with(&cfg, &exe, BINARY, "9.9.9").unwrap(),
+            run_with(&cfg, &exe, &[], BINARY, "9.9.9").unwrap(),
             Outcome::UpToDate
         );
         let _ = fs::remove_dir_all(&dir);

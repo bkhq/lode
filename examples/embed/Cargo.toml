@@ -10,8 +10,8 @@ description = "lode demo: a host program that embeds the supervise loop as a lib
 
 # Path dependencies so the demo always builds against this checkout. In your own
 # project depend on a release tag instead:
-#   lode-core       = { git = "https://github.com/bkhq/lode", tag = "v0.0.1" }
-#   lode-supervisor = { git = "https://github.com/bkhq/lode", tag = "v0.0.1" }
+#   lode-core       = { git = "https://github.com/bkhq/lode", tag = "v0.0.2" }
+#   lode-supervisor = { git = "https://github.com/bkhq/lode", tag = "v0.0.2" }
 [dependencies]
 lode-core = { path = "../../crates/lode-core" }
 lode-supervisor = { path = "../../crates/lode-supervisor" }

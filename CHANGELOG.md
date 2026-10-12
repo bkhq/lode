@@ -5,6 +5,23 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.0.2] - 2026-10-12
+
+### Added
+
+- **Self-update on Windows.** `lode-cli self-update` and
+  `lode_core::self_update::SelfUpdate` now work there. A running executable
+  cannot be overwritten on Windows, so the old file is renamed aside, the new
+  one takes its place, and the old one is deleted the next time lode starts
+  (`self_update::remove_replaced` for a host that embeds the library).
+  `lode-cli self-update` replaces both `lode.exe` and `lode-cli.exe`;
+  `SelfUpdate::alias` names such a second copy.
+
+### Changed
+
+- `SelfUpdate` looks for `<app>.exe` in a Windows asset by default.
+- Workflows run on `ubuntu-26.04` and current action releases.
+
 ## [0.0.1] - 2026-10-11
 
 First release.

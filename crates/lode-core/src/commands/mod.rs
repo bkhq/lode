@@ -9,7 +9,6 @@ pub mod rollback;
 pub mod seed;
 // `self_update` is cli-only as well: it replaces the lode binary itself. A host
 // updating its own binary uses `crate::self_update` directly.
-#[cfg(unix)]
 pub mod self_update;
 pub mod status;
 pub mod update;

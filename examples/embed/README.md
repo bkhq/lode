@@ -85,7 +85,7 @@ Then:
 
 Everything above updates a worker that the host supervises. A host that ships as
 one binary can also replace **itself** in place with
-`lode_core::self_update::SelfUpdate` (Unix only):
+`lode_core::self_update::SelfUpdate`:
 
 ```rust
 use lode_core::self_update::{Outcome, SelfUpdate, Source};
@@ -111,14 +111,19 @@ release is always verified under `enforce`, the downloaded binary must answer
 `--version` with the target version before it replaces anything, and there is no
 automatic rollback — nothing outside the process watches the new version.
 
+On Windows a running executable cannot be overwritten, so the old file is renamed
+aside and stays until no process runs it. Call
+`lode_core::self_update::remove_replaced(&exe)` at startup to delete it, and name
+any second copy of the binary with `.alias(path)` so it is replaced as well.
+
 ## In your own project
 
 The crates are not on crates.io. Depend on a release tag:
 
 ```toml
 [dependencies]
-lode-core       = { git = "https://github.com/bkhq/lode", tag = "v0.0.1" }
-lode-supervisor = { git = "https://github.com/bkhq/lode", tag = "v0.0.1" }
+lode-core       = { git = "https://github.com/bkhq/lode", tag = "v0.0.2" }
+lode-supervisor = { git = "https://github.com/bkhq/lode", tag = "v0.0.2" }
 ```
 
 The demo's worker is a shell script, so the demo itself runs on Unix. The same API works on Windows.

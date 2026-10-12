@@ -7,8 +7,8 @@
 > manifest,**永不重建镜像**。
 
 - **镜像:** `docker.io/bkhq/lode`([Docker Hub](https://hub.docker.com/r/bkhq/lode))
-- **二进制:** Linux(x86_64 / aarch64,musl 静态)+ macOS(x86_64 / arm64) —— [Releases](https://github.com/bkhq/lode/releases);就地升级用 `lode-cli self-update`
-- **平台:** Linux、macOS 和 Windows。在 Windows 上 app 运行在 Job Object 里,用 `CTRL_BREAK` 请求停止;信号转发和 `lode-cli self-update` 仅 Unix 可用。→ [运维](docs/operations.zh-CN.md)
+- **二进制:** Linux(x86_64 / aarch64,musl 静态)、macOS(x86_64 / arm64)和 Windows(x86_64) —— [Releases](https://github.com/bkhq/lode/releases);就地升级用 `lode-cli self-update`
+- **平台:** Linux、macOS 和 Windows。在 Windows 上 app 运行在 Job Object 里,用 `CTRL_BREAK` 请求停止;信号转发仅 Unix 可用。→ [运维](docs/operations.zh-CN.md)
 
 ## 从这里开始 —— 按角色
 
@@ -123,8 +123,8 @@ lode 由三个 crate 组成:**`lode-core`**(不含 clap、不碰信号——配�
 
 ```toml
 [dependencies]
-lode-core = { git = "https://github.com/bkhq/lode", tag = "v0.0.1" }        # 配置 + Engine(无 clap、无信号)
-lode-supervisor = { git = "https://github.com/bkhq/lode", tag = "v0.0.1" }  # + 监管循环,由注入的 SignalSource 驱动
+lode-core = { git = "https://github.com/bkhq/lode", tag = "v0.0.2" }        # 配置 + Engine(无 clap、无信号)
+lode-supervisor = { git = "https://github.com/bkhq/lode", tag = "v0.0.2" }  # + 监管循环,由注入的 SignalSource 驱动
 ```
 
 完整的宿主程序示例(自己处理信号、在线程里跑监督循环、通过 `Engine` 切换版本和重启)见

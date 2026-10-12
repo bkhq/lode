@@ -9,7 +9,7 @@
 
 - **Image:** `docker.io/bkhq/lode` ([Docker Hub](https://hub.docker.com/r/bkhq/lode))
 - **Binaries:** Linux (x86_64 / aarch64, musl-static), macOS (x86_64 / arm64) and Windows (x86_64) — [Releases](https://github.com/bkhq/lode/releases); upgrade in place with `lode-cli self-update`
-- **Platforms:** Linux, macOS and Windows. On Windows the app runs in a Job Object and is asked to stop with `CTRL_BREAK`; signal forwarding and `lode-cli self-update` are Unix only. → [Operations](docs/operations.md)
+- **Platforms:** Linux, macOS and Windows. On Windows the app runs in a Job Object and is asked to stop with `CTRL_BREAK`; signal forwarding is Unix only. → [Operations](docs/operations.md)
 
 ## Start here — by role
 
@@ -127,8 +127,8 @@ belong to unrelated projects) — depend on a release tag of this repository:
 
 ```toml
 [dependencies]
-lode-core = { git = "https://github.com/bkhq/lode", tag = "v0.0.1" }        # config + Engine (no clap, no signals)
-lode-supervisor = { git = "https://github.com/bkhq/lode", tag = "v0.0.1" }  # + the supervise loop, driven by an injected SignalSource
+lode-core = { git = "https://github.com/bkhq/lode", tag = "v0.0.2" }        # config + Engine (no clap, no signals)
+lode-supervisor = { git = "https://github.com/bkhq/lode", tag = "v0.0.2" }  # + the supervise loop, driven by an injected SignalSource
 ```
 
 A complete host program — its own signal handling, the supervise loop on a thread,
