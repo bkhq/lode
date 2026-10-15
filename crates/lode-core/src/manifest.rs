@@ -20,9 +20,13 @@ use serde::Deserialize;
 use crate::config::{Config, RequireSignature};
 use crate::error::{Error, Result};
 use crate::idval::validate_id;
+use crate::verify::Delegation;
 
 /// The only manifest schema this loader understands.
 const SCHEMA: &str = "lode/v1";
+
+/// GitHub release asset carrying a [`Delegation`].
+pub const DELEGATION_ASSET: &str = "lode-delegation.json";
 
 /// A parsed `lode/v1` manifest.
 ///
@@ -60,6 +64,9 @@ pub struct Manifest {
     /// verifying the same file.
     #[serde(default)]
     pub expires_sig: Option<String>,
+    /// Root-signed delegation letting a sub-key sign this manifest and its assets.
+    #[serde(default)]
+    pub delegation: Option<Delegation>,
     /// Channels by name.
     pub channels: BTreeMap<String, Channel>,
     /// Published versions by id.
@@ -195,6 +202,10 @@ pub struct Asset {
     /// `false` => do not attach `[http].headers` to this URL (e.g. pre-signed).
     #[serde(default = "default_true")]
     pub auth: bool,
+    /// The manifest's [`Manifest::delegation`], copied here at parse so the
+    /// install-time signature check has it.
+    #[serde(skip)]
+    pub delegation: Option<Delegation>,
 }
 
 const fn default_true() -> bool {
@@ -440,13 +451,43 @@ fn fetch_github(cfg: &Config, repo: &str) -> Result<Manifest> {
     // §5: a release may ship a signature as a `<name>.sig` sidecar asset instead of
     // the asset `label` (which GitHub renders in place of the filename); the label
     // wins when both are present.
-    resolve_sidecars(
-        cfg,
-        &mut manifest,
-        &allowed_hosts(cfg),
-        SidecarLookup::Listed,
-    )?;
+    let hosts = allowed_hosts(cfg);
+    resolve_sidecars(cfg, &mut manifest, &hosts, SidecarLookup::Listed)?;
+    resolve_delegation_asset(cfg, &mut manifest, &hosts)?;
     Ok(manifest)
+}
+
+/// Load a release's [`DELEGATION_ASSET`] into the manifest when a signature is
+/// required. Best-effort like a sidecar: absent or unreadable leaves it unset.
+fn resolve_delegation_asset(
+    cfg: &Config,
+    manifest: &mut Manifest,
+    allowed_hosts: &[String],
+) -> Result<()> {
+    if !signature_required(cfg)? {
+        return Ok(());
+    }
+    let Some(listed) = manifest
+        .versions
+        .values()
+        .flat_map(|entry| &entry.assets)
+        .find(|a| a.name == DELEGATION_ASSET)
+    else {
+        return Ok(());
+    };
+    let Some(body) = fetch_sidecar(cfg, &listed.url, listed.auth, allowed_hosts) else {
+        return Ok(());
+    };
+    match serde_json::from_str::<Delegation>(&body) {
+        Ok(delegation) => {
+            manifest.delegation = Some(delegation);
+            propagate_delegation(manifest);
+        }
+        Err(e) => {
+            tracing::warn!(error = %e, "{DELEGATION_ASSET} is not a valid delegation; ignored");
+        }
+    }
+    Ok(())
 }
 
 /// Resolve the release for `channel`/`pin` using GitHub's native endpoints
@@ -552,6 +593,7 @@ fn map_release(app: &str, release: GhRelease, channel: &str) -> Result<Manifest>
         sig: None,
         expires: None,
         expires_sig: None,
+        delegation: None,
         channels,
         versions,
     })
@@ -586,6 +628,7 @@ fn gh_asset_to_asset(a: GhAsset) -> Asset {
         exec: None,
         size: a.size,
         auth: true,
+        delegation: None,
     }
 }
 
@@ -669,7 +712,18 @@ pub fn parse(bytes: &[u8]) -> Result<Manifest> {
             }
         }
     }
+    let mut manifest = manifest;
+    propagate_delegation(&mut manifest);
     Ok(manifest)
+}
+
+/// Copy the manifest's delegation onto every asset.
+fn propagate_delegation(manifest: &mut Manifest) {
+    for entry in manifest.versions.values_mut() {
+        for asset in &mut entry.assets {
+            asset.delegation.clone_from(&manifest.delegation);
+        }
+    }
 }
 
 /// Log a manifest/asset `alg` that names no [`crate::verify::Algorithm`].
@@ -1397,6 +1451,73 @@ mod tests {
         let stub = github_release_stub(None, true);
         let m = fetch(&github_cfg(&stub.base, "a.tar.gz", "off")).unwrap();
         assert!(selected_sig(&m).is_none());
+        assert_eq!(stub.served(), vec!["/repos/o/r/releases/latest".to_owned()]);
+    }
+
+    const DELEGATION_JSON: &str =
+        r#"{"key":"ed25519:k:AAAA","name":"myapp","not_before":1,"not_after":2,"sig":"S"}"#;
+
+    #[test]
+    fn parse_propagates_the_delegation_to_every_asset() {
+        let text = format!(
+            r#"{{"schema":"lode/v1","name":"myapp","delegation":{DELEGATION_JSON},
+               "channels":{{"stable":{{"latest":"1.0.0"}}}},
+               "versions":{{"1.0.0":{{"assets":[
+                 {{"name":"a","url":"","sha256":"00"}},{{"name":"b","url":"","sha256":"00"}}]}}}}}}"#
+        );
+        let m = parse(text.as_bytes()).unwrap();
+        let d = m.delegation.clone().unwrap();
+        assert_eq!(d.name, "myapp");
+        for asset in &m.versions["1.0.0"].assets {
+            assert_eq!(asset.delegation.as_ref(), Some(&d));
+        }
+        // Absent: nothing to carry.
+        let m = parse(
+            br#"{"schema":"lode/v1","name":"x","channels":{"stable":{"latest":"1.0.0"}},
+                "versions":{"1.0.0":{"assets":[{"name":"a","url":"","sha256":"00"}]}}}"#,
+        )
+        .unwrap();
+        assert!(m.delegation.is_none());
+        assert!(m.versions["1.0.0"].assets[0].delegation.is_none());
+    }
+
+    /// A `latest` release with `a.tar.gz` plus a `lode-delegation.json` asset.
+    fn github_delegation_stub() -> Stub {
+        Stub::start(|base| {
+            let release = serde_json::json!({ "tag_name": "v1.0.0", "assets": [
+                { "name": "a.tar.gz", "browser_download_url": format!("{base}/dl/a.tar.gz"),
+                  "digest": "sha256:00", "label": "SIG" },
+                { "name": DELEGATION_ASSET,
+                  "browser_download_url": format!("{base}/dl/{DELEGATION_ASSET}") },
+            ]});
+            vec![
+                (
+                    "/repos/o/r/releases/latest".to_owned(),
+                    release.to_string().into_bytes(),
+                ),
+                (
+                    format!("/dl/{DELEGATION_ASSET}"),
+                    DELEGATION_JSON.as_bytes().to_vec(),
+                ),
+            ]
+        })
+    }
+
+    #[test]
+    fn github_release_delegation_asset_is_fetched_when_signatures_are_required() {
+        let stub = github_delegation_stub();
+        let m = fetch(&github_cfg(&stub.base, "a.tar.gz", "enforce")).unwrap();
+        assert_eq!(
+            m.delegation.as_ref().map(|d| d.name.as_str()),
+            Some("myapp")
+        );
+        let asset = select_asset(version_entry(&m, "1.0.0").unwrap(), "a.tar.gz").unwrap();
+        assert_eq!(asset.delegation, m.delegation);
+
+        // Not required (`off`): not fetched.
+        let stub = github_delegation_stub();
+        let m = fetch(&github_cfg(&stub.base, "a.tar.gz", "off")).unwrap();
+        assert!(m.delegation.is_none());
         assert_eq!(stub.served(), vec!["/repos/o/r/releases/latest".to_owned()]);
     }
 

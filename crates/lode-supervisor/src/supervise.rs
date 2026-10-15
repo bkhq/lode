@@ -3396,6 +3396,7 @@ mod tests {
                 require_manifest: lode_core::config::RequireManifest::Off,
                 trusted_keys: Vec::new(),
                 trusted_keys_file: None,
+                revocation_url: None,
             },
             command: lode_core::config::Command {
                 run: Some("./app".to_owned()),

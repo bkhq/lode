@@ -466,8 +466,219 @@ pub fn decode_key(b64: &str) -> Result<[u8; 32]> {
     Ok(arr)
 }
 
+/// The full trusted-key entry for `key`: `<alg>:<key_id>:<base64url>`.
+pub fn key_entry(key: &PublicKey) -> String {
+    format!(
+        "{}:{}:{}",
+        key.algorithm(),
+        key.key_id(),
+        B64.encode(key.to_bytes())
+    )
+}
+
+/// Canonical signed message for a [`Delegation`]:
+/// `lode.delegation.v1\n{name}\n{alg}\n{sub_key_base64url}\n{not_before}\n{not_after}`.
+///
+/// The sub-key's algorithm is bound, so the root pins it, not the manifest.
+pub fn delegation_message(
+    name: &str,
+    alg: Algorithm,
+    key_b64: &str,
+    not_before: u64,
+    not_after: u64,
+) -> Vec<u8> {
+    format!("lode.delegation.v1\n{name}\n{alg}\n{key_b64}\n{not_before}\n{not_after}").into_bytes()
+}
+
+/// A root-signed certificate that lets a sub-key sign for one manifest `name`
+/// during `[not_before, not_after)` (Unix seconds).
+///
+/// Only trusted (root) keys can issue one; a sub-key cannot delegate further.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct Delegation {
+    /// The sub-key, as a trusted-key entry (`[<alg>:][<key_id>:]<base64>`).
+    pub key: String,
+    /// The manifest `name` the sub-key may sign for.
+    pub name: String,
+    /// Start of validity (inclusive).
+    pub not_before: u64,
+    /// End of validity (exclusive).
+    pub not_after: u64,
+    /// Advisory `key_id` of the issuing root key.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub issuer: Option<String>,
+    /// Root signature over [`Delegation::signing_message`].
+    #[serde(default)]
+    pub sig: String,
+}
+
+impl Delegation {
+    /// The decoded sub-key.
+    pub fn sub_key(&self) -> Result<PublicKey> {
+        decode_trusted_key(&self.key).context("delegation key")
+    }
+
+    /// The exact bytes the root signs ([`delegation_message`]).
+    pub fn signing_message(&self) -> Result<Vec<u8>> {
+        let key = self.sub_key()?;
+        Ok(delegation_message(
+            &self.name,
+            key.algorithm(),
+            &B64.encode(key.to_bytes()),
+            self.not_before,
+            self.not_after,
+        ))
+    }
+
+    /// Check the delegation for `name` at `now` against the root keys and the
+    /// revoked sub-key ids; returns the sub-key's trusted-key entry.
+    pub fn validate(
+        &self,
+        roots: &[String],
+        name: &str,
+        now: u64,
+        revoked: &std::collections::BTreeSet<String>,
+    ) -> Result<String> {
+        if self.name != name {
+            bail!("delegation is for {:?}, not {name:?}", self.name);
+        }
+        let message = self.signing_message()?;
+        verify_manifest_sig(roots, self.issuer.as_deref(), &message, &self.sig)
+            .map_err(|_| anyhow::anyhow!("delegation is not signed by a trusted key"))?;
+        if now < self.not_before {
+            bail!(
+                "delegation is not valid yet (not_before={}, now={now})",
+                self.not_before
+            );
+        }
+        if now >= self.not_after {
+            bail!(
+                "delegation expired (not_after={}, now={now})",
+                self.not_after
+            );
+        }
+        let key = self.sub_key()?;
+        let id = key.key_id();
+        if revoked.contains(&id) {
+            bail!("delegated key {id} is revoked");
+        }
+        Ok(key_entry(&key))
+    }
+}
+
+/// The keys a signature may verify against: the trusted `roots`, plus the
+/// delegated sub-key when `delegation` validates for `name` at `now`.
+///
+/// The second value is why a present delegation was rejected, for error messages.
+/// With no roots nothing is trusted, delegation included.
+pub fn effective_keys(
+    roots: &[String],
+    delegation: Option<&Delegation>,
+    name: &str,
+    now: u64,
+    revoked: &std::collections::BTreeSet<String>,
+) -> (Vec<String>, Option<String>) {
+    let mut keys = roots.to_vec();
+    let Some(delegation) = delegation else {
+        return (keys, None);
+    };
+    if roots.is_empty() {
+        return (keys, None);
+    }
+    match delegation.validate(roots, name, now, revoked) {
+        Ok(entry) => {
+            keys.push(entry);
+            (keys, None)
+        }
+        Err(e) => (keys, Some(format!("{e:#}"))),
+    }
+}
+
+/// Schema id of a [`RevocationList`].
+pub const REVOCATIONS_SCHEMA: &str = "lode-revocations/v1";
+
+/// Canonical signed message for a [`RevocationList`]:
+/// `lode.revocations.v1\n{key_id}\n{issued_at}` then each revoked id (sorted,
+/// deduplicated) on its own line.
+pub fn revocation_message(key_id: &str, issued_at: u64, revoked: &[String]) -> Vec<u8> {
+    let ids: std::collections::BTreeSet<&str> = revoked.iter().map(String::as_str).collect();
+    let mut out = format!("lode.revocations.v1\n{key_id}\n{issued_at}");
+    for id in ids {
+        out.push('\n');
+        out.push_str(id);
+    }
+    out.into_bytes()
+}
+
+/// A signed list of revoked delegated sub-key ids.
+///
+/// Signed by a trusted key, or by a valid delegated sub-key that carries its
+/// [`Delegation`].
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct RevocationList {
+    /// [`REVOCATIONS_SCHEMA`].
+    pub schema: String,
+    /// Issue time (Unix seconds); a list never replaces a newer one.
+    pub issued_at: u64,
+    /// Revoked sub-key ids.
+    #[serde(default)]
+    pub revoked: Vec<String>,
+    /// Id of the signing key.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub key_id: Option<String>,
+    /// The signer's delegation, when signed by a sub-key.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub delegation: Option<Delegation>,
+    /// Signature over [`RevocationList::signing_message`].
+    #[serde(default)]
+    pub sig: String,
+}
+
+impl RevocationList {
+    /// The exact bytes signed ([`revocation_message`]).
+    pub fn signing_message(&self) -> Vec<u8> {
+        revocation_message(
+            self.key_id.as_deref().unwrap_or(""),
+            self.issued_at,
+            &self.revoked,
+        )
+    }
+
+    /// Verify the list for app `name` at `now` against the root keys; a sub-key
+    /// signer must hold a valid, unrevoked delegation.
+    pub fn verify(
+        &self,
+        roots: &[String],
+        name: &str,
+        now: u64,
+        revoked: &std::collections::BTreeSet<String>,
+    ) -> Result<()> {
+        if self.schema != REVOCATIONS_SCHEMA {
+            bail!(
+                "unsupported revocation list schema {:?} (expected {REVOCATIONS_SCHEMA:?})",
+                self.schema
+            );
+        }
+        let (keys, rejected) = effective_keys(roots, self.delegation.as_ref(), name, now, revoked);
+        verify_manifest_sig(
+            &keys,
+            self.key_id.as_deref(),
+            &self.signing_message(),
+            &self.sig,
+        )
+        .map_err(|e| {
+            rejected.map_or_else(
+                || anyhow::anyhow!("revocation list: {e}"),
+                |why| anyhow::anyhow!("revocation list: {e} (delegation rejected: {why})"),
+            )
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeSet;
+
     use ed25519_dalek::{Signer as _, SigningKey};
 
     use super::*;
@@ -990,5 +1201,208 @@ mod tests {
         }
         assert_eq!(decode_key(&standard.encode(public)).unwrap(), public);
         assert_eq!(decode_key(&B64.encode(public)).unwrap(), public);
+    }
+
+    // --- delegation -------------------------------------------------------
+
+    fn ed_entry(signing: &SigningKey) -> String {
+        let public = PublicKey::Ed25519(signing.verifying_key());
+        key_entry(&public)
+    }
+
+    /// A delegation for `name` of `sub` signed by `root`, valid over `[nb, na)`.
+    fn delegate(root: &SigningKey, sub: &SigningKey, name: &str, nb: u64, na: u64) -> Delegation {
+        let mut d = Delegation {
+            key: ed_entry(sub),
+            name: name.to_owned(),
+            not_before: nb,
+            not_after: na,
+            issuer: Some(PublicKey::Ed25519(root.verifying_key()).key_id()),
+            sig: String::new(),
+        };
+        d.sig = B64.encode(root.sign(&d.signing_message().unwrap()).to_bytes());
+        d
+    }
+
+    #[test]
+    fn delegation_message_binds_every_field() {
+        let sub = SigningKey::from_bytes(&[2u8; 32]);
+        let b64 = B64.encode(sub.verifying_key().to_bytes());
+        assert_eq!(
+            delegation_message("myapp", Algorithm::Ed25519, &b64, 10, 20),
+            format!("lode.delegation.v1\nmyapp\ned25519\n{b64}\n10\n20").into_bytes()
+        );
+    }
+
+    #[test]
+    fn delegation_validates_only_when_root_signed_scoped_and_current() {
+        let root = SigningKey::from_bytes(&[1u8; 32]);
+        let sub = SigningKey::from_bytes(&[2u8; 32]);
+        let roots = vec![ed_entry(&root)];
+        let none = BTreeSet::new();
+        let d = delegate(&root, &sub, "myapp", 100, 200);
+
+        let entry = d.validate(&roots, "myapp", 150, &none).unwrap();
+        assert_eq!(entry, ed_entry(&sub));
+        // Window: not_before inclusive, not_after exclusive.
+        assert!(d.validate(&roots, "myapp", 100, &none).is_ok());
+        assert!(d.validate(&roots, "myapp", 99, &none).is_err());
+        assert!(d.validate(&roots, "myapp", 200, &none).is_err());
+        // Scope: another manifest name is refused.
+        assert!(d.validate(&roots, "other", 150, &none).is_err());
+        // An untrusted issuer (the sub-key itself, or any other key) is refused.
+        assert!(d.validate(&[ed_entry(&sub)], "myapp", 150, &none).is_err());
+        let self_signed = delegate(&sub, &sub, "myapp", 100, 200);
+        assert!(self_signed.validate(&roots, "myapp", 150, &none).is_err());
+        // Revoked sub-key.
+        let revoked = BTreeSet::from([PublicKey::Ed25519(sub.verifying_key()).key_id()]);
+        assert!(d.validate(&roots, "myapp", 150, &revoked).is_err());
+        // Any tampered field breaks the root signature.
+        for tampered in [
+            Delegation {
+                not_after: 900,
+                ..d.clone()
+            },
+            Delegation {
+                not_before: 0,
+                ..d.clone()
+            },
+            Delegation {
+                name: "x".to_owned(),
+                ..d.clone()
+            },
+            Delegation {
+                key: ed_entry(&SigningKey::from_bytes(&[5u8; 32])),
+                ..d.clone()
+            },
+        ] {
+            assert!(
+                tampered
+                    .validate(&roots, &tampered.name, 150, &none)
+                    .is_err()
+            );
+        }
+        // A wrong `issuer` hint still verifies through the try-all fallback.
+        let hinted = Delegation {
+            issuer: Some("0000000000000000".to_owned()),
+            ..d
+        };
+        assert!(hinted.validate(&roots, "myapp", 150, &none).is_ok());
+    }
+
+    #[test]
+    fn delegation_binds_the_sub_key_algorithm() {
+        let root = SigningKey::from_bytes(&[1u8; 32]);
+        let roots = vec![ed_entry(&root)];
+        let (p256_signing, p256_entry) = ecdsa_p256();
+        let mut d = Delegation {
+            key: p256_entry,
+            name: "myapp".to_owned(),
+            not_before: 0,
+            not_after: 10,
+            issuer: None,
+            sig: String::new(),
+        };
+        d.sig = B64.encode(root.sign(&d.signing_message().unwrap()).to_bytes());
+        let entry = d.validate(&roots, "myapp", 5, &BTreeSet::new()).unwrap();
+        assert_eq!(
+            decode_trusted_key(&entry).unwrap().algorithm(),
+            Algorithm::EcdsaP256
+        );
+        // The sub-key then verifies its own signatures under its pinned algorithm.
+        let msg = b"payload";
+        let sig: p256::ecdsa::Signature = p256_signing.sign(msg);
+        assert!(verify_signature(&entry, msg, &B64.encode(sig.to_bytes())).unwrap());
+    }
+
+    #[test]
+    fn effective_keys_adds_a_valid_sub_key_and_reports_a_bad_one() {
+        let root = SigningKey::from_bytes(&[1u8; 32]);
+        let sub = SigningKey::from_bytes(&[2u8; 32]);
+        let roots = vec![ed_entry(&root)];
+        let none = BTreeSet::new();
+        let d = delegate(&root, &sub, "myapp", 100, 200);
+
+        let (keys, err) = effective_keys(&roots, None, "myapp", 150, &none);
+        assert_eq!(keys, roots);
+        assert!(err.is_none());
+
+        let (keys, err) = effective_keys(&roots, Some(&d), "myapp", 150, &none);
+        assert_eq!(keys, vec![ed_entry(&root), ed_entry(&sub)]);
+        assert!(err.is_none());
+
+        let (keys, err) = effective_keys(&roots, Some(&d), "myapp", 250, &none);
+        assert_eq!(keys, roots);
+        assert!(err.unwrap().contains("expired"));
+
+        // No roots configured: a delegation can never stand in for them.
+        let (keys, _) = effective_keys(&[], Some(&d), "myapp", 150, &none);
+        assert!(keys.is_empty());
+    }
+
+    // --- revocation list --------------------------------------------------
+
+    fn revocation_list(
+        signer: &SigningKey,
+        delegation: Option<Delegation>,
+        issued_at: u64,
+        revoked: &[&str],
+    ) -> RevocationList {
+        let mut list = RevocationList {
+            schema: REVOCATIONS_SCHEMA.to_owned(),
+            issued_at,
+            revoked: revoked.iter().map(|s| (*s).to_owned()).collect(),
+            key_id: Some(PublicKey::Ed25519(signer.verifying_key()).key_id()),
+            delegation,
+            sig: String::new(),
+        };
+        list.sig = B64.encode(signer.sign(&list.signing_message()).to_bytes());
+        list
+    }
+
+    #[test]
+    fn revocation_message_is_order_independent() {
+        let a = revocation_message("k", 7, &["b".to_owned(), "a".to_owned(), "b".to_owned()]);
+        assert_eq!(a, b"lode.revocations.v1\nk\n7\na\nb".to_vec());
+        assert_eq!(
+            a,
+            revocation_message("k", 7, &["a".to_owned(), "b".to_owned()])
+        );
+    }
+
+    #[test]
+    fn revocation_list_verifies_by_root_or_valid_sub_key() {
+        let root = SigningKey::from_bytes(&[1u8; 32]);
+        let sub = SigningKey::from_bytes(&[2u8; 32]);
+        let other = SigningKey::from_bytes(&[3u8; 32]);
+        let roots = vec![ed_entry(&root)];
+        let none = BTreeSet::new();
+        let sub_id = PublicKey::Ed25519(sub.verifying_key()).key_id();
+
+        // Root-signed.
+        let list = revocation_list(&root, None, 5, &["aaaa"]);
+        assert!(list.verify(&roots, "myapp", 150, &none).is_ok());
+        // Sub-key-signed, carrying its delegation.
+        let d = delegate(&root, &sub, "myapp", 100, 200);
+        let list = revocation_list(&sub, Some(d), 5, &["aaaa"]);
+        assert!(list.verify(&roots, "myapp", 150, &none).is_ok());
+        // ... but not once the delegation expired, or for another app.
+        assert!(list.verify(&roots, "myapp", 250, &none).is_err());
+        assert!(list.verify(&roots, "other", 150, &none).is_err());
+        // ... and not by an already-revoked sub-key.
+        let revoked = BTreeSet::from([sub_id]);
+        assert!(list.verify(&roots, "myapp", 150, &revoked).is_err());
+        // Untrusted signer, tampered content, wrong schema.
+        assert!(
+            revocation_list(&other, None, 5, &[])
+                .verify(&roots, "myapp", 150, &none)
+                .is_err()
+        );
+        let mut tampered = revocation_list(&root, None, 5, &["aaaa"]);
+        tampered.revoked.clear();
+        assert!(tampered.verify(&roots, "myapp", 150, &none).is_err());
+        let mut schema = revocation_list(&root, None, 5, &[]);
+        schema.schema = "lode-revocations/v9".to_owned();
+        assert!(schema.verify(&roots, "myapp", 150, &none).is_err());
     }
 }

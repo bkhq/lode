@@ -69,7 +69,7 @@ export class ManifestServer {
    * served, so lode's manifest-signature verification passes under
    * `require_signature = auto|enforce`.
    */
-  static start(name: string, signKeyPath?: string): ManifestServer {
+  static start(name: string, signKeyPath?: string, signArgs: string[] = []): ManifestServer {
     const www = mkTmp("lode-www-");
     const manifest: Manifest = { schema: "lode/v1", name, channels: {}, versions: {} };
     const wwwRoot = normalize(www);
@@ -88,7 +88,9 @@ export class ManifestServer {
         return new Response(file);
       },
     });
-    return new ManifestServer(name, www, server, manifest, signKeyPath);
+    const ms = new ManifestServer(name, www, server, manifest, signKeyPath);
+    ms.#signArgs = signArgs;
+    return ms;
   }
 
   get url(): string {

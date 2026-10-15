@@ -188,6 +188,9 @@ app 连续失败了 `restart_max` 次,或回滚目标也失败了。lode 打印
 `require_signature = auto` 且没有配置公钥:此时只校验 sha256。请设置 `[trust].trusted_keys`,
 生产环境用 `require_signature = "enforce"`。
 
+**`delegation rejected: delegation expired (not_after=…, now=…)`**
+manifest 由委托子密钥签名,但其 delegation 已过期,或本机时钟不对。由发布方续签 delegation(`lode-cli delegate`)并重新签名;否则检查时钟。`lode-cli status` 会显示签名密钥及其 delegation 的到期时间。`delegated key … is revoked` 表示该子密钥在 `[trust].revocation_url` 列表中(已合并进 `$LODE_DIR/revocations.json`)。
+
 **`manifest: no update source configured`**
 `[update].manifest` 和 `[update].github` 都没设。对 seed 出来的离线数据目录这是正常的;`update`
 需要来源。

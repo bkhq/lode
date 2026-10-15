@@ -73,6 +73,7 @@ fn overrides_from_globals(cli: &Globals) -> Overrides {
         require_manifest: cli.require_manifest.map(Into::into),
         trusted_keys: cli.trusted_keys.clone(),
         trusted_keys_file: cli.trusted_keys_file.clone(),
+        revocation_url: cli.revocation_url.clone(),
         run: cli.run.clone(),
         exec: cli.exec.clone(),
         runtime: cli.runtime.clone(),

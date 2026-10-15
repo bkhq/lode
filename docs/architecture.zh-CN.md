@@ -223,9 +223,62 @@ lode.manifest-expiry.v1
   - **`enforce`** 始终要求受信公钥,且 *artifact* 签名必须有效。
   - **目录签名(present 才验)。** 清单可选的顶层 `sig` 在存在时被验证(present 但无效则拒绝),但**永不强制** —— 未签名的目录在 `enforce` 下也能正常安装。channel `latest` 指针的回滚改由客户端**禁降级 floor** 拦截:跟随 `latest` 永远不会解析出比 `max(current, last_good)` 更老的版本;显式 `--version`/`pin`/`rollback` 属刻意选择,豁免。
 
+### 委托签名密钥
+
+受信密钥可以一直离线。受信(根)密钥签发一份 **delegation**,允许一把子密钥在限定时间内为某个 manifest `name` 签名;之后由子密钥签目录(`sig`、`expires_sig`)和资产。运维方仍只信任根密钥。
+
+```json
+"delegation": {
+  "key": "ed25519:<sub_key_id>:<base64url>",
+  "name": "myapp",
+  "not_before": 1760000000,
+  "not_after": 1762592000,
+  "issuer": "<root_key_id>",
+  "sig": "<根密钥签名>"
+}
+```
+
+根密钥签名的内容:
+```
+lode.delegation.v1
+{name}
+{alg}            # 子密钥的算法,由根密钥钉住
+{sub_key_base64url}
+{not_before}
+{not_after}
+```
+
+- **载体**:原生来源放在 manifest 顶层 `delegation`;GitHub 来源放在名为 `lode-delegation.json` 的 release 资产里(内容相同,需要签名时才拉取)。
+- **识别**:带 `delegation` 的 manifest 走委托密钥;不带的即由受信密钥直接签名,行为与以前完全一致。schema 仍为 `lode/v1`。`lode-cli status` 显示 `signing: direct (<key_id>)` 或 `signing: delegated (key <id>, issuer <id>, expires in …)`。
+- **有效条件**:delegation 必须由受信密钥签名、`name` 等于本 manifest(即 `[global].app`)、按本机时钟满足 `not_before <= now < not_after`,且子密钥未被吊销。满足后子密钥对该 manifest 及其资产视同受信密钥。只有一层:子密钥不能再委托。
+- **策略不变**:`require_signature` / `require_manifest` 以及"未配置受信密钥"的判断只看受信密钥;delegation 永远不能替代它们。
+- **过期只影响新安装**:已安装版本启动时不再重新验签。
+- **旧版 lode**(≤ 0.0.3)会忽略 `delegation`;配置了受信密钥时会拒绝子密钥签名(fail closed)。用子密钥发布前先升级各主机。
+
+### 吊销列表(可选)
+
+`[trust].revocation_url`(`--revocation-url`、`LODE_REVOCATION_URL`)订阅一份已签名的子密钥吊销列表:
+
+```json
+{
+  "schema": "lode-revocations/v1",
+  "issued_at": 1760500000,
+  "revoked": ["<sub_key_id>"],
+  "key_id": "<签名密钥 id>",
+  "delegation": { "...": "仅在由子密钥签名时携带" },
+  "sig": "<签名>"
+}
+```
+
+签名内容:`lode.revocations.v1\n{key_id}\n{issued_at}`,其后每个被吊销的 id(排序、去重)各占一行。
+
+- 由受信密钥签名,或由持有对 `[global].app` 有效且未被吊销的 delegation 的子密钥签名。
+- 每次验证 manifest 时拉取。更新的有效列表(`issued_at` 大于缓存)会**合并**进 `$LODE_DIR/revocations.json`;条目只增不减,列表无法取消吊销,旧列表被忽略。
+- 非强制:列表不可达、无效或过旧时只记日志,继续使用缓存。没有列表时,吊销只能依赖 delegation 的 `not_after`;delegation 有效期宜短。
+
 ### CLI(发布者)
 
-`lode-cli keygen` / `lode-cli sign <asset> --app <app> --version <ver> --key <priv> [--run <cmd>] [--exec <cmd>]`(或 `--key-env <VAR>`;打印 `sha256`/`sig`/`key_id`,其中 `sig` 即随资产发布的 `<asset>.sig` 内容 —— 或 GitHub 资产 `label`;`--run`/`--exec` 把启动命令覆盖绑入签名)/ `lode-cli verify <asset> --version <ver> --pubkey <b64> --sig <b64>` / `lode-cli manifest <asset> --version <ver> --url <url> [--run <cmd>] [--exec <cmd>] --key <priv> --into manifest.json` / `lode-cli manifest-sign --into manifest.json --key <priv>`(为目录写入顶层 `key_id` + `sig`)。私钥离线,lode 只持公钥。
+`lode-cli keygen` / `lode-cli sign <asset> --app <app> --version <ver> --key <priv> [--run <cmd>] [--exec <cmd>]`(或 `--key-env <VAR>`;打印 `sha256`/`sig`/`key_id`,其中 `sig` 即随资产发布的 `<asset>.sig` 内容 —— 或 GitHub 资产 `label`;`--run`/`--exec` 把启动命令覆盖绑入签名)/ `lode-cli verify <asset> --version <ver> --pubkey <b64> --sig <b64>` / `lode-cli manifest <asset> --version <ver> --url <url> [--run <cmd>] [--exec <cmd>] --key <priv> --into manifest.json` / `lode-cli manifest-sign --into manifest.json --key <priv> [--delegation <file>]`(为目录写入顶层 `key_id` + `sig`)/ `lode-cli delegate --app <app> --key <root> --sub <sub.pub> --valid-for 30d --out delegation.json` / `lode-cli revoke --key <priv> [--delegation <file>] --list revocations.json --add <key_id>`。`manifest`、`manifest-sign`、`verify` 支持 `--delegation`,用于以子密钥签名或校验。根私钥离线,lode 只持公钥。
 
 ---
 
@@ -385,6 +438,7 @@ lode 发 `SIGTERM` 后,**在 `stop_timeout` 秒内绝不 SIGKILL**,给 app 充�
 | `LODE_REQUIRE_MANIFEST` | `--require-manifest <off\|signed\|fresh>` | `trust.require_manifest` | `off` | manifest 必须证明什么(签名、过期时间),§6 |
 | `LODE_TRUSTED_KEYS` | `--trusted-keys <list>` | `trust.trusted_keys` | — | 受信公钥 `key_id:base64`,逗号分隔 |
 | `LODE_TRUSTED_KEYS_FILE` | `--trusted-keys-file <path>` | `trust.trusted_keys_file` | — | 受信公钥文件 |
+| `LODE_REVOCATION_URL` | `--revocation-url <url>` | `trust.revocation_url` | — | 委托密钥的签名吊销列表(可选),§6 |
 | **`[command]` —— 怎么运行** | | | | |
 | `LODE_RUN` | `--run <cmd>` | `command.run` | — | **字面裸跑启动命令**(按空白切;仅 `{dir}` 展开);manifest 资产可覆盖,见 §4 |
 | `LODE_EXEC` | `--exec <cmd>` | `command.exec` | — | **字面 CLI 透传基准命令**(`lode <args>` 追加其后);manifest 资产可覆盖,见 §4 |
@@ -587,6 +641,7 @@ $LODE_DIR/
   lode.pid.lock            # 单实例 flock;从不删除
   state.json               # 运行时状态,lode 与 app 共同写入
   state.json.lock          # 串行化 state.json 读-改-写的 flock
+  revocations.json         # 已验证、合并后的吊销列表(仅在配置 [trust].revocation_url 时)
   downloads/<ver>/<asset>    # 已校验下载缓存(保留;可重新解压,随版本一起回收)
   downloads/<ver>/<asset>.part  # 下载暂存(进行中)
   runtime/<key>/<name>       # 已下载的运行时,key = <版本>-<URL 摘要>(未锁版本时为 url-<摘要>)

@@ -10,7 +10,7 @@
 //! rename. Pruning keeps `current` + `last_good` + the newest `keep_versions`.
 
 use std::cmp::Ordering;
-use std::collections::{HashSet, VecDeque};
+use std::collections::{BTreeSet, HashSet, VecDeque};
 use std::ffi::OsStr;
 use std::fs;
 use std::io::{self, Read as _};
@@ -138,6 +138,7 @@ pub fn seed_local(cfg: &Config, version: &str, source: &Path, activate: bool) ->
         exec: None,
         size: None,
         auth: false,
+        delegation: None,
     };
 
     let versions_dir = cfg.global.dir.join("versions");
@@ -518,6 +519,7 @@ pub(crate) fn verify_download(
 ///   is the only launch command an unverified catalog may rely on.
 /// - `enforce` => a valid signature (and trusted keys) is mandatory.
 fn verify_identity(cfg: &Config, version: &str, asset: &Asset, computed_sha: &str) -> Result<()> {
+    // Policy looks at the root keys only; the delegated key joins at the check.
     let keys = trusted_keys(cfg)?;
     match cfg.trust.require_signature {
         RequireSignature::Off => Ok(()),
@@ -544,7 +546,15 @@ fn verify_identity(cfg: &Config, version: &str, asset: &Asset, computed_sha: &st
                      (require_signature=auto is fail-closed)"
                 ))
             })?;
-            check_sig(&cfg.global.app, version, asset, computed_sha, sig, &keys)
+            check_sig(
+                &cfg.global.app,
+                version,
+                asset,
+                computed_sha,
+                sig,
+                &keys,
+                &revoked_keys(cfg),
+            )
         }
         RequireSignature::Enforce => {
             if keys.is_empty() {
@@ -557,7 +567,15 @@ fn verify_identity(cfg: &Config, version: &str, asset: &Asset, computed_sha: &st
                     "require_signature=enforce but the {version} asset has no signature"
                 ))
             })?;
-            check_sig(&cfg.global.app, version, asset, computed_sha, sig, &keys)
+            check_sig(
+                &cfg.global.app,
+                version,
+                asset,
+                computed_sha,
+                sig,
+                &keys,
+                &revoked_keys(cfg),
+            )
         }
     }
 }
@@ -565,15 +583,19 @@ fn verify_identity(cfg: &Config, version: &str, asset: &Asset, computed_sha: &st
 /// Bridge to [`crate::verify::verify_artifact_sig`], mapping its error into the
 /// crate's `verify:` domain. The signed identity is the app name
 /// (`[global].app`) + the asset filename (`asset.name`) + version + digest + the optional `run`/`exec` launch overrides
-/// — never `platform`/`format`/`url`.
+/// — never `platform`/`format`/`url`. `roots` gain the asset's delegated key
+/// when its delegation is valid now.
 fn check_sig(
     app: &str,
     version: &str,
     asset: &Asset,
     sha: &str,
     sig: &str,
-    keys: &[String],
+    roots: &[String],
+    revoked: &BTreeSet<String>,
 ) -> Result<()> {
+    let (keys, rejected) =
+        crate::verify::effective_keys(roots, asset.delegation.as_ref(), app, unix_now(), revoked);
     crate::verify::verify_artifact_sig(
         app,
         &asset.name,
@@ -582,9 +604,17 @@ fn check_sig(
         asset.run.as_deref(),
         asset.exec.as_deref(),
         sig,
-        keys,
+        &keys,
     )
-    .map_err(|e| Error::Verify(e.to_string()))
+    .map_err(|e| delegation_error(&e, rejected.as_deref()))
+}
+
+/// A `verify:` error, naming why a present delegation was rejected.
+fn delegation_error(e: &dyn std::fmt::Display, rejected: Option<&str>) -> Error {
+    Error::Verify(rejected.map_or_else(
+        || e.to_string(),
+        |why| format!("{e} (delegation rejected: {why})"),
+    ))
 }
 
 /// Manifest identity (catalog signature) — **verify-if-present**, required only
@@ -618,6 +648,7 @@ fn check_sig(
 ///
 /// Call this right after [`crate::manifest::fetch`], before resolving/downloading.
 pub fn verify_manifest_identity(cfg: &Config, manifest: &Manifest) -> Result<()> {
+    refresh_revocations(cfg);
     verify_manifest_at(cfg, manifest, unix_now())
 }
 
@@ -644,8 +675,17 @@ fn verify_manifest_at(cfg: &Config, manifest: &Manifest, now: u64) -> Result<()>
         )));
     }
 
+    let (keys, rejected) = crate::verify::effective_keys(
+        &keys,
+        manifest.delegation.as_ref(),
+        &manifest.name,
+        now,
+        &revoked_keys(cfg),
+    );
     match manifest.sig.as_deref() {
-        Some(sig) if !keys.is_empty() => check_manifest_sig(manifest, sig, &keys)?,
+        Some(sig) if !keys.is_empty() => {
+            check_manifest_sig(manifest, sig, &keys, rejected.as_deref())?;
+        }
         Some(_) if cfg.trust.require_signature != RequireSignature::Off => tracing::warn!(
             manifest = manifest.name,
             "manifest carries a signature but no trusted keys are configured to verify it"
@@ -673,7 +713,9 @@ fn verify_manifest_at(cfg: &Config, manifest: &Manifest, now: u64) -> Result<()>
     ) {
         (Some(sig), Some(message)) if !keys.is_empty() => {
             crate::verify::verify_manifest_sig(&keys, manifest.key_id.as_deref(), &message, sig)
-                .map_err(|e| Error::Verify(format!("manifest expiry: {e}")))?;
+                .map_err(|e| {
+                    delegation_error(&format!("manifest expiry: {e}"), rejected.as_deref())
+                })?;
         }
         (None, _) if policy == RequireManifest::Fresh => {
             return Err(Error::Verify(
@@ -719,10 +761,133 @@ fn expiry_note(manifest: &Manifest, now: u64) -> String {
 /// Bridge to [`crate::verify::verify_manifest_sig`] over the manifest's canonical message,
 /// mapping its error into the crate's `verify:` domain. The manifest's declared
 /// `key_id` selects the trusted key (with a try-all fallback inside `verify`).
-fn check_manifest_sig(manifest: &Manifest, sig: &str, keys: &[String]) -> Result<()> {
+fn check_manifest_sig(
+    manifest: &Manifest,
+    sig: &str,
+    keys: &[String],
+    rejected: Option<&str>,
+) -> Result<()> {
     let message = manifest.signing_message();
     crate::verify::verify_manifest_sig(keys, manifest.key_id.as_deref(), &message, sig)
-        .map_err(|e| Error::Verify(e.to_string()))
+        .map_err(|e| delegation_error(&e, rejected))
+}
+
+/// How the manifest is signed, for `status`: `direct (<key_id>)`,
+/// `delegated (key <id>, issuer <id>, expires in …)`, or `unsigned`.
+pub fn signing_scheme(cfg: &Config, manifest: &Manifest) -> String {
+    signing_scheme_at(cfg, manifest, unix_now())
+}
+
+fn signing_scheme_at(cfg: &Config, manifest: &Manifest, now: u64) -> String {
+    let Some(delegation) = manifest.delegation.as_ref() else {
+        return manifest
+            .key_id
+            .as_deref()
+            .map_or_else(|| "unsigned".to_owned(), |id| format!("direct ({id})"));
+    };
+    let roots = trusted_keys(cfg).unwrap_or_default();
+    match delegation.validate(&roots, &manifest.name, now, &revoked_keys(cfg)) {
+        Ok(entry) => {
+            let key = crate::verify::decode_trusted_key(&entry).map(|k| k.key_id());
+            format!(
+                "delegated (key {}, issuer {}, expires in {})",
+                key.unwrap_or_default(),
+                delegation.issuer.as_deref().unwrap_or("?"),
+                human_duration(delegation.not_after - now)
+            )
+        }
+        Err(e) => format!("delegated, REJECTED: {e:#}"),
+    }
+}
+
+/// Cache of revoked delegated key ids under `[global].dir`.
+const REVOCATIONS_FILE: &str = "revocations.json";
+
+/// The merged, grow-only revocation state lode has verified.
+#[derive(Debug, Default, Serialize, Deserialize)]
+struct RevocationCache {
+    issued_at: u64,
+    #[serde(default)]
+    revoked: BTreeSet<String>,
+}
+
+fn read_revocation_cache(cfg: &Config) -> RevocationCache {
+    let Ok(bytes) = fs::read(cfg.global.dir.join(REVOCATIONS_FILE)) else {
+        return RevocationCache::default();
+    };
+    serde_json::from_slice(&bytes).unwrap_or_else(|e| {
+        tracing::warn!(error = %e, "unreadable {REVOCATIONS_FILE}; ignoring it");
+        RevocationCache::default()
+    })
+}
+
+/// Delegated key ids known to be revoked.
+pub fn revoked_keys(cfg: &Config) -> BTreeSet<String> {
+    read_revocation_cache(cfg).revoked
+}
+
+/// Refresh the revocation cache from `[trust].revocation_url`. Best-effort: any
+/// failure is logged and the cached state stays in force.
+pub fn refresh_revocations(cfg: &Config) {
+    refresh_revocations_at(cfg, unix_now());
+}
+
+fn refresh_revocations_at(cfg: &Config, now: u64) {
+    let Some(url) = cfg.trust.revocation_url.as_deref() else {
+        return;
+    };
+    if cfg.trust.require_signature == RequireSignature::Off {
+        return;
+    }
+    let roots = match trusted_keys(cfg) {
+        Ok(roots) if !roots.is_empty() => roots,
+        _ => return,
+    };
+    let mut cache = read_revocation_cache(cfg);
+    let list = match fetch_revocations(cfg, url) {
+        Ok(list) => list,
+        Err(e) => {
+            tracing::warn!(error = %e, "revocation list not refreshed; using the cached one");
+            return;
+        }
+    };
+    if let Err(e) = list.verify(&roots, &cfg.global.app, now, &cache.revoked) {
+        tracing::warn!(error = %e, "revocation list rejected; using the cached one");
+        return;
+    }
+    if list.issued_at <= cache.issued_at {
+        return;
+    }
+    cache.issued_at = list.issued_at;
+    cache
+        .revoked
+        .extend(list.revoked.iter().map(|id| id.trim().to_owned()));
+    if let Err(e) = write_revocation_cache(cfg, &cache) {
+        tracing::warn!(error = %e, "could not store the revocation list");
+    }
+}
+
+fn fetch_revocations(cfg: &Config, url: &str) -> Result<crate::verify::RevocationList> {
+    let hosts = crate::manifest::allowed_hosts(cfg);
+    let headers = if crate::download::host_allowed(url, &hosts) {
+        crate::http::expand_headers(&cfg.http.headers)?
+    } else {
+        Vec::new()
+    };
+    let attach = |host: &str| crate::download::host_in(host, &hosts);
+    let bytes = crate::http::get_bytes(url, &headers, cfg.http.allow_insecure, &attach)?;
+    serde_json::from_slice(&bytes)
+        .map_err(|e| Error::Verify(format!("revocation list is not valid JSON: {e}")))
+}
+
+fn write_revocation_cache(cfg: &Config, cache: &RevocationCache) -> io::Result<()> {
+    let path = cfg.global.dir.join(REVOCATIONS_FILE);
+    let tmp = cfg.global.dir.join(format!("{REVOCATIONS_FILE}.tmp"));
+    fs::write(
+        &tmp,
+        serde_json::to_vec_pretty(cache).map_err(io::Error::other)?,
+    )?;
+    fs::rename(&tmp, &path)
 }
 
 /// A one-line, secret-free summary of the catalog's effective trust posture for
@@ -1171,6 +1336,7 @@ mod tests {
         Command, Global, Http, Policy, Readiness, RequireSignature, RestartMode, RestartPolicy,
         Runtime, Signals, Supervise, Trust, Update,
     };
+    use crate::verify::Delegation;
 
     const B64: base64::engine::general_purpose::GeneralPurpose =
         base64::engine::general_purpose::STANDARD;
@@ -1214,6 +1380,7 @@ mod tests {
                 require_manifest: RequireManifest::Off,
                 trusted_keys,
                 trusted_keys_file: None,
+                revocation_url: None,
             },
             command: Command {
                 run: None,
@@ -1274,6 +1441,7 @@ mod tests {
             exec: None,
             size: None,
             auth: true,
+            delegation: None,
         }
     }
 
@@ -1744,6 +1912,7 @@ mod tests {
             sig: None,
             expires: None,
             expires_sig: None,
+            delegation: None,
             channels,
             versions,
         }
@@ -1997,6 +2166,219 @@ mod tests {
         let posture = manifest_trust_posture(&cfg, &stale);
         assert!(posture.starts_with("VERIFICATION FAILED"), "{posture}");
         assert!(posture.contains("expired"), "{posture}");
+    }
+
+    // --- delegation & revocation ---------------------------------------------
+
+    fn ed_entry(signing: &SigningKey) -> String {
+        crate::verify::key_entry(&crate::verify::PublicKey::Ed25519(signing.verifying_key()))
+    }
+
+    fn ed_id(signing: &SigningKey) -> String {
+        crate::verify::key_id(&signing.verifying_key().to_bytes())
+    }
+
+    /// `root` delegates `name` to `sub` over `[nb, na)`.
+    fn delegation(root: &SigningKey, sub: &SigningKey, name: &str, nb: u64, na: u64) -> Delegation {
+        let mut d = Delegation {
+            key: ed_entry(sub),
+            name: name.to_owned(),
+            not_before: nb,
+            not_after: na,
+            issuer: Some(ed_id(root)),
+            sig: String::new(),
+        };
+        d.sig = B64.encode(root.sign(&d.signing_message().unwrap()).to_bytes());
+        d
+    }
+
+    fn write_revocation_cache(dir: &Path, issued_at: u64, revoked: &[String]) {
+        let cache = serde_json::json!({ "issued_at": issued_at, "revoked": revoked });
+        fs::write(dir.join(REVOCATIONS_FILE), cache.to_string()).unwrap();
+    }
+
+    #[test]
+    fn delegated_sub_key_signs_an_artifact() {
+        let dir = scratch("deleg-art");
+        let root = SigningKey::from_bytes(&[30u8; 32]);
+        let sub = SigningKey::from_bytes(&[31u8; 32]);
+        let cfg = cfg_for(
+            dir.clone(),
+            RequireSignature::Enforce,
+            vec![ed_entry(&root)],
+        );
+        let now = unix_now();
+
+        let (temp, sha) = stage_download(&cfg, "1.0.0", b"delegated payload");
+        let msg = format!("lode.artifact.v2\nmyapp\napp.bin\n1.0.0\n{sha}\n\n");
+        let mut art = asset("app.bin", &sha);
+        art.sig = Some(B64.encode(sub.sign(msg.as_bytes()).to_bytes()));
+
+        // Without the delegation the sub-key is just an untrusted key.
+        assert!(install(&cfg, "1.0.0", &art, &temp, &sha).is_err());
+        // An expired delegation is named in the error.
+        art.delegation = Some(delegation(&root, &sub, "myapp", now - 7200, now - 3600));
+        let err = install(&cfg, "1.0.0", &art, &temp, &sha).unwrap_err();
+        assert!(err.to_string().contains("delegation"), "{err}");
+        // A delegation for another app does not count.
+        art.delegation = Some(delegation(&root, &sub, "other", now - 60, now + 3600));
+        assert!(install(&cfg, "1.0.0", &art, &temp, &sha).is_err());
+        // A revoked sub-key does not count.
+        art.delegation = Some(delegation(&root, &sub, "myapp", now - 60, now + 3600));
+        write_revocation_cache(&dir, 1, &[ed_id(&sub)]);
+        assert!(install(&cfg, "1.0.0", &art, &temp, &sha).is_err());
+        // Valid and unrevoked: installs.
+        fs::remove_file(dir.join(REVOCATIONS_FILE)).unwrap();
+        install(&cfg, "1.0.0", &art, &temp, &sha).unwrap();
+        assert!(dir.join("versions/1.0.0/app.bin").exists());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn delegated_sub_key_signs_the_catalog_and_its_expiry() {
+        let root = SigningKey::from_bytes(&[32u8; 32]);
+        let sub = SigningKey::from_bytes(&[33u8; 32]);
+        let cfg = cfg_requiring(RequireManifest::Fresh, vec![ed_entry(&root)]);
+
+        let mut m = manifest_fixture();
+        m.delegation = Some(delegation(&root, &sub, "myapp", NOW - 60, NOW + 7200));
+        sign_manifest(&mut m, &sub);
+        sign_expiry(&mut m, &sub, NOW + 3600);
+        assert!(verify_manifest_at(&cfg, &m, NOW).is_ok());
+
+        // Past the delegation window the catalog no longer verifies.
+        let err = verify_manifest_at(&cfg, &m, NOW + 7200)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("delegation"), "{err}");
+        // A delegation scoped to another manifest name is refused.
+        let mut scoped = m.clone();
+        scoped.delegation = Some(delegation(&root, &sub, "other", NOW - 60, NOW + 7200));
+        assert!(verify_manifest_at(&cfg, &scoped, NOW).is_err());
+        // A root-signed catalog still verifies with or without a delegation present.
+        let mut direct = manifest_fixture();
+        sign_manifest(&mut direct, &root);
+        sign_expiry(&mut direct, &root, NOW + 3600);
+        assert!(verify_manifest_at(&cfg, &direct, NOW).is_ok());
+        direct.delegation = m.delegation.clone();
+        assert!(verify_manifest_at(&cfg, &direct, NOW).is_ok());
+    }
+
+    #[test]
+    fn signing_scheme_reports_direct_or_delegated() {
+        let root = SigningKey::from_bytes(&[34u8; 32]);
+        let sub = SigningKey::from_bytes(&[35u8; 32]);
+        let cfg = cfg_requiring(RequireManifest::Off, vec![ed_entry(&root)]);
+        let mut m = manifest_fixture();
+        sign_manifest(&mut m, &root);
+        assert_eq!(
+            signing_scheme_at(&cfg, &m, NOW),
+            format!("direct ({})", ed_id(&root))
+        );
+        m.delegation = Some(delegation(&root, &sub, "myapp", NOW - 60, NOW + 3600));
+        assert_eq!(
+            signing_scheme_at(&cfg, &m, NOW),
+            format!(
+                "delegated (key {}, issuer {}, expires in 1h)",
+                ed_id(&sub),
+                ed_id(&root)
+            )
+        );
+        let rejected = signing_scheme_at(&cfg, &m, NOW + 3600);
+        assert!(rejected.starts_with("delegated, REJECTED:"), "{rejected}");
+    }
+
+    /// A revocation list signed by `signer` (with its `delegation`, if any).
+    fn signed_list(
+        signer: &SigningKey,
+        delegation: Option<Delegation>,
+        issued_at: u64,
+        revoked: &[String],
+    ) -> Vec<u8> {
+        let mut list = crate::verify::RevocationList {
+            schema: crate::verify::REVOCATIONS_SCHEMA.to_owned(),
+            issued_at,
+            revoked: revoked.to_vec(),
+            key_id: Some(ed_id(signer)),
+            delegation,
+            sig: String::new(),
+        };
+        list.sig = B64.encode(signer.sign(&list.signing_message()).to_bytes());
+        serde_json::to_vec(&list).unwrap()
+    }
+
+    #[test]
+    fn revocation_cache_only_grows_from_valid_newer_lists() {
+        use crate::stub::Stub;
+
+        let dir = scratch("revoke");
+        let root = SigningKey::from_bytes(&[36u8; 32]);
+        let sub = SigningKey::from_bytes(&[37u8; 32]);
+        let deleg = delegation(&root, &sub, "myapp", NOW - 60, NOW + 3600);
+        let (a, b, c) = ("aaaa".to_owned(), "bbbb".to_owned(), "cccc".to_owned());
+        let lists = vec![
+            (
+                "/v1".to_owned(),
+                signed_list(&root, None, 10, std::slice::from_ref(&a)),
+            ),
+            // Newer, signed by a valid sub-key, drops `a` and adds `b`.
+            (
+                "/v2".to_owned(),
+                signed_list(&sub, Some(deleg.clone()), 20, std::slice::from_ref(&b)),
+            ),
+            // Older than what is cached.
+            (
+                "/old".to_owned(),
+                signed_list(&root, None, 5, std::slice::from_ref(&c)),
+            ),
+            // Signed by a key nobody trusts.
+            (
+                "/forged".to_owned(),
+                signed_list(
+                    &SigningKey::from_bytes(&[38u8; 32]),
+                    None,
+                    99,
+                    std::slice::from_ref(&c),
+                ),
+            ),
+            // Signed by the sub-key after it was revoked.
+            (
+                "/by-revoked".to_owned(),
+                signed_list(&sub, Some(deleg), 30, std::slice::from_ref(&c)),
+            ),
+        ];
+        let server = Stub::start(move |_| lists);
+        let mut cfg = cfg_for(
+            dir.clone(),
+            RequireSignature::Enforce,
+            vec![ed_entry(&root)],
+        );
+        let refresh = |cfg: &mut Config, path: &str| {
+            cfg.trust.revocation_url = Some(format!("{}{path}", server.base));
+            refresh_revocations_at(cfg, NOW);
+            revoked_keys(cfg)
+        };
+
+        assert_eq!(refresh(&mut cfg, "/v1"), BTreeSet::from([a.clone()]));
+        assert_eq!(
+            refresh(&mut cfg, "/v2"),
+            BTreeSet::from([a.clone(), b.clone()])
+        );
+        assert_eq!(
+            refresh(&mut cfg, "/old"),
+            BTreeSet::from([a.clone(), b.clone()])
+        );
+        assert_eq!(
+            refresh(&mut cfg, "/forged"),
+            BTreeSet::from([a.clone(), b.clone()])
+        );
+        assert_eq!(
+            refresh(&mut cfg, "/missing"),
+            BTreeSet::from([a.clone(), b.clone()])
+        );
+        write_revocation_cache(&dir, 20, &[a, b, ed_id(&sub)]);
+        assert!(!refresh(&mut cfg, "/by-revoked").contains(&c));
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]

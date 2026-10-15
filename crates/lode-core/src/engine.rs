@@ -486,6 +486,7 @@ fn runtime_asset(url: &str, name: &str, sha256: Option<&str>) -> manifest::Asset
         exec: None,
         size: None,
         auth: true,
+        delegation: None,
     }
 }
 

@@ -223,9 +223,62 @@ Only `fresh` stops a source from stripping `expires`/`expires_sig` and replaying
   - **`enforce`** always requires trusted keys plus a valid *artifact* signature.
   - **Catalog signature (verify-if-present).** A manifest's optional top-level `sig` is verified when present (a present-but-invalid one is rejected) but is **never required** — an unsigned catalog installs fine under `enforce`. Rollback of the channel `latest` pointer is instead caught client-side by the **downgrade floor**: following `latest` never resolves a version older than `max(current, last_good)`; an explicit `--version`/`pin`/`rollback` is a deliberate choice and is exempt.
 
+### Delegated signing keys
+
+The trusted keys can stay offline. A trusted (root) key signs a **delegation** that lets a sub-key sign for one manifest `name` for a limited time; the sub-key then signs the catalog (`sig`, `expires_sig`) and the assets. Operators keep trusting only the root.
+
+```json
+"delegation": {
+  "key": "ed25519:<sub_key_id>:<base64url>",
+  "name": "myapp",
+  "not_before": 1760000000,
+  "not_after": 1762592000,
+  "issuer": "<root_key_id>",
+  "sig": "<root signature>"
+}
+```
+
+The root signs:
+```
+lode.delegation.v1
+{name}
+{alg}            # the sub-key's algorithm, so the root pins it
+{sub_key_base64url}
+{not_before}
+{not_after}
+```
+
+- **Where it travels**: the manifest's top-level `delegation` (native); a release asset named `lode-delegation.json` with the same JSON (GitHub, fetched when a signature is required).
+- **Detection**: a manifest with `delegation` uses the delegated key; one without is signed directly by a trusted key, exactly as before. The schema stays `lode/v1`. `lode-cli status` prints `signing: direct (<key_id>)` or `signing: delegated (key <id>, issuer <id>, expires in …)`.
+- **Validity**: the delegation must verify under a trusted key, name this manifest (`name` = `[global].app`), have `not_before <= now < not_after` on the host clock, and its sub-key must not be revoked. The sub-key then joins the trusted keys for that manifest and its assets. One level only: a sub-key cannot delegate.
+- **Policy is unchanged**: `require_signature` / `require_manifest` and "no trusted keys" look at the trusted keys only; a delegation never stands in for them.
+- **Expiry gates new installs only**: installed versions are not re-verified at launch.
+- **Older lodes** (≤ 0.0.3) ignore `delegation`; with trusted keys configured they reject a sub-key signature (fail closed). Upgrade hosts before publishing with a sub-key.
+
+### Revocation list (optional)
+
+`[trust].revocation_url` (`--revocation-url`, `LODE_REVOCATION_URL`) subscribes to a signed list of revoked sub-key ids:
+
+```json
+{
+  "schema": "lode-revocations/v1",
+  "issued_at": 1760500000,
+  "revoked": ["<sub_key_id>"],
+  "key_id": "<signer_key_id>",
+  "delegation": { "...": "only when signed by a sub-key" },
+  "sig": "<signature>"
+}
+```
+
+Signed message: `lode.revocations.v1\n{key_id}\n{issued_at}` followed by each revoked id (sorted, deduplicated) on its own line.
+
+- Signed by a trusted key, or by a sub-key with a valid, unrevoked delegation for `[global].app`.
+- Fetched whenever the manifest is verified. A newer valid list (`issued_at` greater than the cached one) is **merged** into `$LODE_DIR/revocations.json`; entries are never removed, so a list cannot un-revoke a key, and an older list is ignored.
+- Not mandatory: an unreachable, invalid or stale list is logged and the cached state stays in force. Without a list, revocation relies on the delegation's `not_after`; keep delegations short.
+
 ### CLI (publisher)
 
-`lode-cli keygen` / `lode-cli sign <asset> --app <app> --version <ver> --key <priv> [--run <cmd>] [--exec <cmd>]` (or `--key-env <VAR>`; prints `sha256`/`sig`/`key_id`, where `sig` is what you publish beside the asset as `<asset>.sig` — or as the GitHub asset `label`; `--run`/`--exec` bind launch overrides into the signature) / `lode-cli verify <asset> --version <ver> --pubkey <b64> --sig <b64>` / `lode-cli manifest <asset> --version <ver> --url <url> [--run <cmd>] [--exec <cmd>] --key <priv> --into manifest.json` / `lode-cli manifest-sign --into manifest.json --key <priv>` (stamp the catalog's top-level `key_id` + `sig`). The private key stays offline; lode holds only the public key.
+`lode-cli keygen` / `lode-cli sign <asset> --app <app> --version <ver> --key <priv> [--run <cmd>] [--exec <cmd>]` (or `--key-env <VAR>`; prints `sha256`/`sig`/`key_id`, where `sig` is what you publish beside the asset as `<asset>.sig` — or as the GitHub asset `label`; `--run`/`--exec` bind launch overrides into the signature) / `lode-cli verify <asset> --version <ver> --pubkey <b64> --sig <b64>` / `lode-cli manifest <asset> --version <ver> --url <url> [--run <cmd>] [--exec <cmd>] --key <priv> --into manifest.json` / `lode-cli manifest-sign --into manifest.json --key <priv> [--delegation <file>]` (stamp the catalog's top-level `key_id` + `sig`) / `lode-cli delegate --app <app> --key <root> --sub <sub.pub> --valid-for 30d --out delegation.json` / `lode-cli revoke --key <priv> [--delegation <file>] --list revocations.json --add <key_id>`. `manifest`, `manifest-sign` and `verify` take `--delegation` to sign or check with a sub-key. The root private key stays offline; lode holds only the public key.
 
 ---
 
@@ -385,6 +438,7 @@ Key names: `lode.toml` uses snake_case (see `docs/lode.example.toml`); environme
 | `LODE_REQUIRE_MANIFEST` | `--require-manifest <off\|signed\|fresh>` | `trust.require_manifest` | `off` | what the manifest must prove (signature, expiry), §6 |
 | `LODE_TRUSTED_KEYS` | `--trusted-keys <list>` | `trust.trusted_keys` | — | trusted public keys `key_id:base64`, comma-separated |
 | `LODE_TRUSTED_KEYS_FILE` | `--trusted-keys-file <path>` | `trust.trusted_keys_file` | — | trusted public keys file |
+| `LODE_REVOCATION_URL` | `--revocation-url <url>` | `trust.revocation_url` | — | signed revocation list for delegated keys (optional), §6 |
 | **`[command]` — how to run** | | | | |
 | `LODE_RUN` | `--run <cmd>` | `command.run` | — | **literal bare-run launch command** (whitespace-split; only `{dir}` expands); manifest asset may override, see §4 |
 | `LODE_EXEC` | `--exec <cmd>` | `command.exec` | — | **literal CLI passthrough base command** (`lode <args>` appended after it); manifest asset may override, see §4 |
@@ -587,6 +641,7 @@ $LODE_DIR/
   lode.pid.lock            # single-instance flock; never removed
   state.json               # runtime state, written by lode and the app
   state.json.lock          # flock that serialises state.json read-modify-writes
+  revocations.json         # verified, merged revocation list (only with [trust].revocation_url)
   downloads/<ver>/<asset>    # verified download cache (kept; re-extractable, pruned with the version)
   downloads/<ver>/<asset>.part  # in-progress download staging
   runtime/<key>/<name>       # downloaded runtime; key = <version>-<url digest> (or url-<digest> when unpinned)

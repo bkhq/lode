@@ -298,6 +298,33 @@ Operators then point lode at the package's read URL:
   `auto` is fail-closed once any trusted key is configured; without keys it installs
   **UNVERIFIED** with a warning.
 
+### Delegated signing (root key offline)
+
+Keep the key operators trust (the root) offline and sign releases with a short-lived
+sub-key instead. Operators configure only the root in `trusted_keys`.
+
+```sh
+lode-cli keygen --out root                  # once; keep root.key offline
+lode-cli keygen --out ci                    # the sub-key CI signs with
+# offline, with the root key: let `ci` sign for myapp for 30 days
+lode-cli delegate --app myapp --key root.key --sub ci.pub --valid-for 30d --out delegation.json
+# CI: sign as usual with ci.key, then embed the delegation
+lode-cli manifest dist/myapp.tar.gz --app myapp --version 1.5.0 --url https://… \
+  --key ci.key --delegation delegation.json --into manifest.json
+lode-cli manifest-sign --into manifest.json --key ci.key --delegation delegation.json --expires-in 7d
+```
+
+- GitHub Releases: upload `delegation.json` as the release asset
+  **`lode-delegation.json`**; sign the assets with the sub-key (`<asset>.sig`).
+- Renew the delegation before `not_after` (e.g. 30-day delegations renewed weekly);
+  a manifest whose delegation expired no longer installs.
+- Revoke a leaked sub-key: `lode-cli revoke --key root.key --list revocations.json
+  --add <sub_key_id>` (or sign with a still-valid sub-key and its `--delegation`), publish
+  the file, and point operators' `[trust].revocation_url` at it. The list is optional;
+  without it a leaked sub-key stays usable until its delegation expires.
+- Hosts on lode 0.0.3 or older reject sub-key signatures; upgrade them first
+  (`lode-cli status` lists `features: delegation, revocation`).
+
 ### Checklist
 
 - [ ] each host's `[update].asset` names the exact asset filename for its platform.

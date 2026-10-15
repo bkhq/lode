@@ -108,6 +108,7 @@ fn self_update(version: Option<&str>, keys: &[String]) -> anyhow::Result<()> {
 /// The `lode-cli` toolkit: management commands talk to a running instance via the
 /// resolved config; publisher commands (keygen/sign/verify/manifest/init) are
 /// self-contained and need no config.
+#[allow(clippy::too_many_lines)] // one flat dispatch arm per subcommand
 fn run_tool() -> anyhow::Result<ExitCode> {
     let cli = ToolCli::parse();
     init_post_parse(&cli.globals);
@@ -138,6 +139,7 @@ fn run_tool() -> anyhow::Result<ExitCode> {
             exec,
             pubkey,
             sig,
+            delegation,
         } => authoring::verify(
             signed_app(&cli.globals, "verify")?,
             &artifact,
@@ -146,6 +148,7 @@ fn run_tool() -> anyhow::Result<ExitCode> {
             exec.as_deref(),
             &pubkey,
             &sig,
+            delegation.as_deref(),
         )?,
         ToolCommand::Manifest {
             artifact,
@@ -157,6 +160,7 @@ fn run_tool() -> anyhow::Result<ExitCode> {
             channel,
             key,
             into,
+            delegation,
         } => authoring::manifest(
             // The manifest `name` must equal the loader's `[global].app`, so a
             // silent default would publish a catalog every instance rejects.
@@ -175,9 +179,26 @@ fn run_tool() -> anyhow::Result<ExitCode> {
             &channel,
             &key,
             into.as_deref(),
+            delegation.as_deref(),
         )?,
         ToolCommand::Publish(args) => return Ok(publish::command(&args)),
-        ToolCommand::ManifestSign(a) => authoring::manifest_sign(&a.into, &a.key, a.expires_in)?,
+        ToolCommand::ManifestSign(a) => {
+            authoring::manifest_sign(&a.into, &a.key, a.expires_in, a.delegation.as_deref())?;
+        }
+        ToolCommand::Delegate(a) => {
+            let app = signed_app(&cli.globals, "delegate")?;
+            authoring::delegate(
+                &a.key,
+                &a.sub,
+                app,
+                a.valid_for,
+                a.not_before,
+                a.out.as_deref(),
+            )?;
+        }
+        ToolCommand::Revoke(a) => {
+            authoring::revoke(&a.key, a.delegation.as_deref(), &a.list, &a.add)?;
+        }
         ToolCommand::Init { path } => authoring::init(path.as_deref())?,
 
         // --- management (resolve config to locate the instance) ---

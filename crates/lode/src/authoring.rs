@@ -17,7 +17,8 @@ use serde_json::{Map, Value, json};
 use zeroize::Zeroizing;
 
 use lode_core::verify::{
-    Algorithm, Artifact, PublicKey, artifact_message, sha256_hex_file, verify_signature,
+    Algorithm, Artifact, Delegation, PublicKey, REVOCATIONS_SCHEMA, RevocationList,
+    artifact_message, effective_keys, key_entry, sha256_hex_file, verify_signature,
 };
 
 use lode_core::verify::{B64, decode_b64};
@@ -305,6 +306,7 @@ pub(crate) fn verify(
     exec: Option<&str>,
     public: &str,
     sig_b64: &str,
+    delegation: Option<&str>,
 ) -> Result<()> {
     let name = basename(artifact);
     let a = Artifact {
@@ -317,7 +319,25 @@ pub(crate) fn verify(
     };
     let sha256 = sha256_hex_file(Path::new(a.path))?;
     let message = artifact_message(&a, &sha256);
-    let ok = verify_signature(public, &message, sig_b64)?;
+    let ok = match delegation {
+        None => verify_signature(public, &message, sig_b64)?,
+        Some(path) => {
+            let delegation = read_delegation(path)?;
+            let roots = [public.to_owned()];
+            let (keys, rejected) = effective_keys(
+                &roots,
+                Some(&delegation),
+                app,
+                unix_now()?,
+                &std::collections::BTreeSet::default(),
+            );
+            if let Some(why) = rejected {
+                bail!("delegation rejected: {why}");
+            }
+            keys.iter()
+                .any(|key| matches!(verify_signature(key, &message, sig_b64), Ok(true)))
+        }
+    };
     let mut stdout = io::stdout().lock();
     writeln!(stdout, "sha256: {sha256}")?;
     if ok {
@@ -348,6 +368,7 @@ pub(crate) fn manifest(
     channel: &str,
     key_path: &str,
     into: Option<&str>,
+    delegation: Option<&str>,
 ) -> Result<()> {
     validate_overrides(run, exec)?;
     let name = basename(artifact);
@@ -361,6 +382,9 @@ pub(crate) fn manifest(
     };
     let key = key_from_file(key_path)?;
     let alg = key.algorithm();
+    let delegation = delegation
+        .map(|path| signer_delegation(path, &key))
+        .transpose()?;
     let (sha256, sig_b64, id) = sign_artifact(&a, &key)?;
 
     // The asset object: name/sha256/sig/key_id/run/exec are the signed identity +
@@ -394,6 +418,7 @@ pub(crate) fn manifest(
         });
         if let Some(obj) = man.as_object_mut() {
             stamp_alg(obj, alg);
+            put_delegation(obj, delegation.as_ref())?;
         }
         writeln!(
             io::stdout().lock(),
@@ -421,6 +446,7 @@ pub(crate) fn manifest(
         obj.insert("key_id".to_owned(), json!(id));
         stamp_alg(obj, alg);
     }
+    put_delegation(obj, delegation.as_ref())?;
 
     // versions[version].assets: replace any same-name entry, then append.
     let versions = obj
@@ -474,13 +500,21 @@ pub(crate) fn manifest(
 /// The loader verifies this under `[trust].require_signature` (see
 /// [`lode_core::install::verify_manifest_identity`]); both sides build the signed bytes
 /// via [`lode_core::manifest::Manifest::signing_message`], so they always agree.
-pub(crate) fn manifest_sign(into: &str, key_path: &str, expires_in: Option<u64>) -> Result<()> {
+pub(crate) fn manifest_sign(
+    into: &str,
+    key_path: &str,
+    expires_in: Option<u64>,
+    delegation: Option<&str>,
+) -> Result<()> {
     let bytes = fs::read(into).with_context(|| format!("read {into}"))?;
     let mut manifest =
         lode_core::manifest::parse(&bytes).map_err(|e| anyhow::anyhow!("parse {into}: {e}"))?;
 
     let key = key_from_file(key_path)?;
     let id = key.public().key_id();
+    let delegation = delegation
+        .map(|path| signer_delegation(path, &key))
+        .transpose()?;
 
     // `key_id` is part of the signed message, so stamp it before building the bytes.
     manifest.key_id = Some(id.clone());
@@ -488,11 +522,7 @@ pub(crate) fn manifest_sign(into: &str, key_path: &str, expires_in: Option<u64>)
     let sig_b64 = B64.encode(key.sign(&message));
     let expiry = match expires_in {
         Some(secs) => {
-            let now = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .context("system clock is before the Unix epoch")?
-                .as_secs();
-            let expires = now.saturating_add(secs);
+            let expires = unix_now()?.saturating_add(secs);
             manifest.expires = Some(expires);
             let message = manifest
                 .expiry_signing_message()
@@ -518,6 +548,7 @@ pub(crate) fn manifest_sign(into: &str, key_path: &str, expires_in: Option<u64>)
         obj.remove("expires_sig");
     }
     stamp_alg(obj, key.algorithm());
+    put_delegation(obj, delegation.as_ref())?;
 
     fs::write(into, format!("{}\n", serde_json::to_string_pretty(&root)?))
         .with_context(|| format!("write {into}"))?;
@@ -528,6 +559,130 @@ pub(crate) fn manifest_sign(into: &str, key_path: &str, expires_in: Option<u64>)
         )?,
         None => writeln!(io::stdout().lock(), "signed {into}: key_id {id}")?,
     }
+    Ok(())
+}
+
+/// Seconds since the Unix epoch.
+fn unix_now() -> Result<u64> {
+    Ok(std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .context("system clock is before the Unix epoch")?
+        .as_secs())
+}
+
+/// Embed `delegation` (when given) as the manifest's top-level `delegation`.
+fn put_delegation(obj: &mut Map<String, Value>, delegation: Option<&Delegation>) -> Result<()> {
+    if let Some(d) = delegation {
+        obj.insert("delegation".to_owned(), serde_json::to_value(d)?);
+    }
+    Ok(())
+}
+
+/// Load a delegation JSON file.
+fn read_delegation(path: &str) -> Result<Delegation> {
+    let text = fs::read_to_string(path).with_context(|| format!("read {path}"))?;
+    serde_json::from_str(&text).with_context(|| format!("parse {path} as a delegation"))
+}
+
+/// Load a delegation and check that it delegates to `key`.
+fn signer_delegation(path: &str, key: &SecretKey) -> Result<Delegation> {
+    let delegation = read_delegation(path)?;
+    let delegated = delegation.sub_key()?.key_id();
+    let signer = key.public().key_id();
+    if delegated != signer {
+        bail!("{path} delegates key {delegated}, but the signing key is {signer}");
+    }
+    Ok(delegation)
+}
+
+/// `delegate` — sign, with the root key at `key_path`, a delegation letting the
+/// sub-key `sub` (a trusted-key entry, or a `.pub` file holding one) sign for
+/// `name` from `not_before` (default: five minutes ago) for `valid_for` seconds.
+/// Prints the delegation JSON, or writes it to `out`.
+pub(crate) fn delegate(
+    key_path: &str,
+    sub: &str,
+    name: &str,
+    valid_for: u64,
+    not_before: Option<u64>,
+    out: Option<&str>,
+) -> Result<()> {
+    let root = key_from_file(key_path)?;
+    let entry = if Path::new(sub).is_file() {
+        fs::read_to_string(sub).with_context(|| format!("read {sub}"))?
+    } else {
+        sub.to_owned()
+    };
+    let sub_key = lode_core::verify::decode_trusted_key(entry.trim()).context("sub-key")?;
+    let not_before = match not_before {
+        Some(at) => at,
+        None => unix_now()?.saturating_sub(300),
+    };
+    let mut delegation = Delegation {
+        key: key_entry(&sub_key),
+        name: name.to_owned(),
+        not_before,
+        not_after: not_before.saturating_add(valid_for),
+        issuer: Some(root.public().key_id()),
+        sig: String::new(),
+    };
+    delegation.sig = B64.encode(root.sign(&delegation.signing_message()?));
+    let text = format!("{}\n", serde_json::to_string_pretty(&delegation)?);
+    match out {
+        Some(path) => {
+            fs::write(path, text).with_context(|| format!("write {path}"))?;
+            writeln!(
+                io::stdout().lock(),
+                "wrote {path}: key {} for {name} until {}",
+                sub_key.key_id(),
+                delegation.not_after
+            )?;
+        }
+        None => io::stdout().lock().write_all(text.as_bytes())?,
+    }
+    Ok(())
+}
+
+/// `revoke` — add `add` to the revocation list at `list` (created when missing)
+/// and re-sign it with `key_path`; a sub-key signs with its `delegation`.
+pub(crate) fn revoke(
+    key_path: &str,
+    delegation: Option<&str>,
+    list: &str,
+    add: &[String],
+) -> Result<()> {
+    let key = key_from_file(key_path)?;
+    let delegation = delegation
+        .map(|path| signer_delegation(path, &key))
+        .transpose()?;
+    let previous: Option<RevocationList> = if Path::new(list).exists() {
+        let text = fs::read_to_string(list).with_context(|| format!("read {list}"))?;
+        Some(serde_json::from_str(&text).with_context(|| format!("parse {list}"))?)
+    } else {
+        None
+    };
+    let mut revoked: std::collections::BTreeSet<String> = previous
+        .as_ref()
+        .map(|p| p.revoked.iter().cloned().collect())
+        .unwrap_or_default();
+    revoked.extend(add.iter().map(|id| id.trim().to_owned()));
+    let issued_at = unix_now()?.max(previous.as_ref().map_or(0, |p| p.issued_at + 1));
+    let mut out = RevocationList {
+        schema: REVOCATIONS_SCHEMA.to_owned(),
+        issued_at,
+        revoked: revoked.into_iter().collect(),
+        key_id: Some(key.public().key_id()),
+        delegation,
+        sig: String::new(),
+    };
+    out.sig = B64.encode(key.sign(&out.signing_message()));
+    fs::write(list, format!("{}\n", serde_json::to_string_pretty(&out)?))
+        .with_context(|| format!("write {list}"))?;
+    writeln!(
+        io::stdout().lock(),
+        "signed {list}: {} revoked, issued_at {issued_at}",
+        out.revoked.len()
+    )?;
     Ok(())
 }
 
@@ -726,6 +881,7 @@ mod tests {
             manifest_path.to_str().unwrap(),
             dir.join("ecdsa.key").to_str().unwrap(),
             None,
+            None,
         )
         .unwrap();
         let signed = read();
@@ -752,6 +908,7 @@ mod tests {
         manifest_sign(
             manifest_path.to_str().unwrap(),
             dir.join("ed.key").to_str().unwrap(),
+            None,
             None,
         )
         .unwrap();
@@ -781,6 +938,7 @@ mod tests {
                 manifest_path.to_str().unwrap(),
                 key_path.to_str().unwrap(),
                 expires_in,
+                None,
             )
             .unwrap();
             lode_core::manifest::parse(&fs::read(&manifest_path).unwrap()).unwrap()
@@ -824,6 +982,224 @@ mod tests {
         let cleared = sign(None);
         assert_eq!(cleared.expires, None);
         assert_eq!(cleared.expires_sig, None);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    fn now() -> u64 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs()
+    }
+
+    fn pub_line(dir: &Path, prefix: &str) -> String {
+        fs::read_to_string(dir.join(format!("{prefix}.pub")))
+            .unwrap()
+            .trim()
+            .to_owned()
+    }
+
+    fn path_str(dir: &Path, name: &str) -> String {
+        dir.join(name).to_str().unwrap().to_owned()
+    }
+
+    /// `delegate` issues a delegation the loader accepts; `manifest-sign
+    /// --delegation` embeds it and the sub-key's catalog signature verifies against
+    /// the root alone; a key that does not match the delegation is refused.
+    #[test]
+    fn delegate_then_manifest_sign_with_the_sub_key() {
+        let dir = scratch("delegate");
+        keygen(Some(&path_str(&dir, "root")), "ed25519").unwrap();
+        keygen(Some(&path_str(&dir, "sub")), "ecdsa-p256").unwrap();
+        let roots = vec![pub_line(&dir, "root")];
+        let deleg = path_str(&dir, "delegation.json");
+
+        // `--sub` takes the `.pub` file or its line verbatim.
+        delegate(
+            &path_str(&dir, "root.key"),
+            &path_str(&dir, "sub.pub"),
+            "x",
+            3600,
+            None,
+            Some(&deleg),
+        )
+        .unwrap();
+        let d: lode_core::verify::Delegation =
+            serde_json::from_str(&fs::read_to_string(&deleg).unwrap()).unwrap();
+        assert_eq!(d.name, "x");
+        assert!(d.not_before < now() && d.not_after > now());
+        let none = std::collections::BTreeSet::new();
+        let sub_entry =
+            key_entry(&lode_core::verify::decode_trusted_key(&pub_line(&dir, "sub")).unwrap());
+        assert_eq!(d.validate(&roots, "x", now(), &none).unwrap(), sub_entry);
+        delegate(
+            &path_str(&dir, "root.key"),
+            &pub_line(&dir, "sub"),
+            "x",
+            3600,
+            Some(5),
+            None,
+        )
+        .unwrap();
+
+        let manifest_path = path_str(&dir, "manifest.json");
+        fs::write(
+            &manifest_path,
+            r#"{"schema":"lode/v1","name":"x",
+                "channels":{"stable":{"latest":"1.0.0"}},
+                "versions":{"1.0.0":{"assets":[{"name":"a","url":"","sha256":"00"}]}}}"#,
+        )
+        .unwrap();
+        manifest_sign(
+            &manifest_path,
+            &path_str(&dir, "sub.key"),
+            Some(3600),
+            Some(&deleg),
+        )
+        .unwrap();
+        let m = lode_core::manifest::parse(&fs::read(&manifest_path).unwrap()).unwrap();
+        assert_eq!(m.delegation.as_ref(), Some(&d));
+        let (keys, rejected) =
+            lode_core::verify::effective_keys(&roots, m.delegation.as_ref(), "x", now(), &none);
+        assert!(rejected.is_none());
+        for message in [m.signing_message(), m.expiry_signing_message().unwrap()] {
+            let sig = if message == m.signing_message() {
+                m.sig.clone()
+            } else {
+                m.expires_sig.clone()
+            };
+            assert!(
+                lode_core::verify::verify_manifest_sig(
+                    &keys,
+                    m.key_id.as_deref(),
+                    &message,
+                    &sig.unwrap()
+                )
+                .is_ok()
+            );
+        }
+        // Re-signing without `--delegation` keeps the embedded one.
+        manifest_sign(&manifest_path, &path_str(&dir, "sub.key"), None, None).unwrap();
+        let again = lode_core::manifest::parse(&fs::read(&manifest_path).unwrap()).unwrap();
+        assert_eq!(again.delegation.as_ref(), Some(&d));
+        // The root key cannot sign under the sub-key's delegation.
+        let err = manifest_sign(
+            &manifest_path,
+            &path_str(&dir, "root.key"),
+            None,
+            Some(&deleg),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("delegation"), "{err}");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// `verify --delegation` checks a sub-key signature against the root key.
+    #[test]
+    fn verify_accepts_a_sub_key_signature_through_a_delegation() {
+        let dir = scratch("verify-delegated");
+        keygen(Some(&path_str(&dir, "root")), "ed25519").unwrap();
+        keygen(Some(&path_str(&dir, "sub")), "ed25519").unwrap();
+        let deleg = path_str(&dir, "delegation.json");
+        delegate(
+            &path_str(&dir, "root.key"),
+            &path_str(&dir, "sub.pub"),
+            "x",
+            3600,
+            None,
+            Some(&deleg),
+        )
+        .unwrap();
+        let artifact = path_str(&dir, "a.tar.gz");
+        fs::write(&artifact, b"payload").unwrap();
+        let a = Artifact {
+            app: "x",
+            name: "a.tar.gz",
+            version: "1.0.0",
+            path: &artifact,
+            run: None,
+            exec: None,
+        };
+        let (_, sig, _) =
+            sign_artifact(&a, &key_from_file(&path_str(&dir, "sub.key")).unwrap()).unwrap();
+        let root = pub_line(&dir, "root");
+        assert!(verify("x", &artifact, "1.0.0", None, None, &root, &sig, None).is_err());
+        verify(
+            "x",
+            &artifact,
+            "1.0.0",
+            None,
+            None,
+            &root,
+            &sig,
+            Some(&deleg),
+        )
+        .unwrap();
+        assert!(
+            verify(
+                "y",
+                &artifact,
+                "1.0.0",
+                None,
+                None,
+                &root,
+                &sig,
+                Some(&deleg)
+            )
+            .is_err()
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// `revoke` creates then grows a list; root- and sub-key-signed lists verify.
+    #[test]
+    fn revoke_creates_and_extends_a_signed_list() {
+        let dir = scratch("revoke");
+        keygen(Some(&path_str(&dir, "root")), "ed25519").unwrap();
+        keygen(Some(&path_str(&dir, "sub")), "ed25519").unwrap();
+        let roots = vec![pub_line(&dir, "root")];
+        let deleg = path_str(&dir, "delegation.json");
+        delegate(
+            &path_str(&dir, "root.key"),
+            &path_str(&dir, "sub.pub"),
+            "x",
+            3600,
+            None,
+            Some(&deleg),
+        )
+        .unwrap();
+        let list_path = path_str(&dir, "revocations.json");
+        let read = || -> lode_core::verify::RevocationList {
+            serde_json::from_str(&fs::read_to_string(&list_path).unwrap()).unwrap()
+        };
+        let none = std::collections::BTreeSet::new();
+
+        revoke(
+            &path_str(&dir, "root.key"),
+            None,
+            &list_path,
+            &["aaaa".to_owned()],
+        )
+        .unwrap();
+        let first = read();
+        assert_eq!(first.revoked, vec!["aaaa".to_owned()]);
+        first.verify(&roots, "x", now(), &none).unwrap();
+
+        revoke(
+            &path_str(&dir, "sub.key"),
+            Some(&deleg),
+            &list_path,
+            &["bbbb".to_owned(), "aaaa".to_owned()],
+        )
+        .unwrap();
+        let second = read();
+        assert_eq!(second.revoked, vec!["aaaa".to_owned(), "bbbb".to_owned()]);
+        assert!(second.issued_at > first.issued_at);
+        second.verify(&roots, "x", now(), &none).unwrap();
+        // A sub-key without its delegation is just an untrusted signer.
+        revoke(&path_str(&dir, "sub.key"), None, &list_path, &[]).unwrap();
+        assert!(read().verify(&roots, "x", now(), &none).is_err());
         let _ = fs::remove_dir_all(&dir);
     }
 }

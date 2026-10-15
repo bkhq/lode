@@ -224,6 +224,8 @@ pub struct Trust {
     pub trusted_keys: Vec<String>,
     /// File holding additional trusted key entries, one per line.
     pub trusted_keys_file: Option<String>,
+    /// Optional URL of a signed revocation list for delegated keys.
+    pub revocation_url: Option<String>,
 }
 
 /// `[command]` — how to launch the app.
@@ -377,6 +379,7 @@ struct TomlTrust {
     require_manifest: Option<RequireManifest>,
     trusted_keys: Option<Vec<String>>,
     trusted_keys_file: Option<String>,
+    revocation_url: Option<String>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -474,6 +477,8 @@ pub struct Overrides {
     pub trusted_keys: Option<String>,
     /// Overrides `[trust].trusted_keys_file`.
     pub trusted_keys_file: Option<String>,
+    /// Overrides `[trust].revocation_url`.
+    pub revocation_url: Option<String>,
     /// Overrides `[command].run`.
     pub run: Option<String>,
     /// Overrides `[command].exec`.
@@ -767,6 +772,10 @@ fn merge_trust(o: &Overrides, t: &TomlTrust) -> Trust {
             .trusted_keys_file
             .clone()
             .or_else(|| t.trusted_keys_file.clone()),
+        revocation_url: o
+            .revocation_url
+            .clone()
+            .or_else(|| t.revocation_url.clone()),
     }
 }
 
@@ -1079,6 +1088,28 @@ mod tests {
         assert!(cfg.http.credential_hosts.is_empty());
         assert!(!cfg.http.allow_insecure); // secure by default
         assert!(validate(&cfg).is_ok());
+    }
+
+    #[test]
+    fn revocation_url_from_toml_then_cli_overrides() {
+        assert_eq!(
+            merge_trust(&blank_cli(), &TomlTrust::default()).revocation_url,
+            None
+        );
+        let t = TomlTrust {
+            revocation_url: Some("https://r.example/rev.json".to_owned()),
+            ..TomlTrust::default()
+        };
+        assert_eq!(
+            merge_trust(&blank_cli(), &t).revocation_url.as_deref(),
+            Some("https://r.example/rev.json")
+        );
+        let mut cli = blank_cli();
+        cli.revocation_url = Some("https://other.example/rev.json".to_owned());
+        assert_eq!(
+            merge_trust(&cli, &t).revocation_url.as_deref(),
+            Some("https://other.example/rev.json")
+        );
     }
 
     #[test]

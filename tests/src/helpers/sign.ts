@@ -63,6 +63,21 @@ export class Signer {
     return { sha256: sha.toLowerCase(), sig };
   }
 
+  /** Delegate signing for `app` to the sub-key whose `.pub` file is `subPub`
+   * (`lode-cli delegate`), writing the delegation JSON to `out`. */
+  async delegate(app: string, subPub: string, out: string): Promise<void> {
+    const r = await run([LODE_CLI_BIN, "delegate", "--app", app, "--key", this.privPath, "--sub", subPub, "--valid-for", "1d", "--out", out]);
+    if (r.exitCode !== 0) throw new Error(`lode delegate failed (${r.exitCode}): ${r.stderr}\n${r.stdout}`);
+  }
+
+  /** Add `keyIds` to the revocation list at `listPath` (`lode-cli revoke`). */
+  async revoke(listPath: string, keyIds: string[]): Promise<void> {
+    const cmd = [LODE_CLI_BIN, "revoke", "--key", this.privPath, "--list", listPath];
+    for (const id of keyIds) cmd.push("--add", id);
+    const r = await run(cmd);
+    if (r.exitCode !== 0) throw new Error(`lode revoke failed (${r.exitCode}): ${r.stderr}\n${r.stdout}`);
+  }
+
   /** Sign a complete manifest.json in place (stamp its top-level `key_id` + `sig`)
    * via `lode-cli manifest-sign`. Required whenever the loader verifies the
    * manifest-level signature — i.e. require_signature=enforce, or auto with a

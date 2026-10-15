@@ -61,6 +61,9 @@ trusted_keys = ["9787ab11e55b4cbc:nyQSShSI8fAtHZNiJWDemBbcaX6V9OvmXtovkITm4fc="]
 #                          # no tag = ed25519, e.g. "ecdsa-p256:<key_id>:<base64>" for an ECDSA P-256 key.
 #                          # The algorithm is pinned here, on the key — never taken from the manifest.
 # trusted_keys_file = "/run/secrets/lode_keys"
+# revocation_url = "https://releases.example.com/myapp/revocations.json"
+#                          # optional signed list of revoked delegated sub-keys (`lode-cli revoke`);
+#                          # unreachable = keep the cached list, never blocks an update.
 
 # --- run: how to launch.  run = the LITERAL command for bare `lode`; exec = the base
 #     command for `lode <args>` passthrough. Both are whitespace-split and run with

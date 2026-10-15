@@ -46,6 +46,12 @@ pub fn run(cfg: &Config) -> Result<()> {
         "  keys_file:  {}",
         opt(cfg.trust.trusted_keys_file.as_deref())
     )?;
+    writeln!(
+        out,
+        "  revocation: {}",
+        opt(cfg.trust.revocation_url.as_deref())
+    )?;
+    writeln!(out, "  features:   delegation, revocation")?;
 
     writeln!(out, "[command]")?;
     writeln!(out, "  run:        {}", opt(cfg.command.run.as_deref()))?;
@@ -108,6 +114,11 @@ fn write_remote(out: &mut impl Write, cfg: &Config) -> Result<()> {
                 out,
                 "  trust:      {}",
                 crate::install::manifest_trust_posture(cfg, &m)
+            )?;
+            writeln!(
+                out,
+                "  signing:    {}",
+                crate::install::signing_scheme(cfg, &m)
             )?;
             match m.channels.get(&cfg.update.channel) {
                 Some(c) => writeln!(

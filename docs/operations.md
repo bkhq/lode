@@ -203,6 +203,13 @@ different version with `lode-cli update --version <v>`.
 `require_signature = auto` with no key: only the sha256 is checked. Set
 `[trust].trusted_keys`, and `require_signature = "enforce"` in production.
 
+**`delegation rejected: delegation expired (not_after=…, now=…)`**
+The manifest is signed by a delegated sub-key whose delegation has expired, or the
+host clock is wrong. The publisher renews the delegation (`lode-cli delegate`) and
+re-signs; check the clock otherwise. `lode-cli status` shows the signing key and
+when its delegation expires. `delegated key … is revoked` means the sub-key is on
+the `[trust].revocation_url` list (merged into `$LODE_DIR/revocations.json`).
+
 **`manifest: no update source configured`**
 Neither `[update].manifest` nor `[update].github` is set. That is expected for a
 seeded, offline data directory; `update` needs a source.

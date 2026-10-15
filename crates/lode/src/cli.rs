@@ -255,6 +255,9 @@ pub(crate) struct Globals {
         global = true
     )]
     pub(crate) trusted_keys_file: Option<String>,
+    /// URL of a signed revocation list for delegated signing keys (optional).
+    #[arg(long = "revocation-url", env = "LODE_REVOCATION_URL", global = true)]
+    pub(crate) revocation_url: Option<String>,
 
     // --- [command] ---
     /// Bare-run launch command (literal, whitespace-split, cwd = `workdir`; a
@@ -475,6 +478,10 @@ pub(crate) enum ToolCommand {
         /// Base64 signature.
         #[arg(long, allow_hyphen_values = true)]
         sig: String,
+        /// Delegation JSON (from `delegate`): `--pubkey` is then the root key and
+        /// the signature may come from the delegated sub-key.
+        #[arg(long)]
+        delegation: Option<String>,
     },
     /// Sign an asset and emit (or create-or-merge with `--into`) a `lode/v1` manifest.
     Manifest {
@@ -507,6 +514,9 @@ pub(crate) enum ToolCommand {
         /// Create-or-merge into this `manifest.json` instead of printing.
         #[arg(long)]
         into: Option<String>,
+        /// Embed this delegation (from `delegate`); `--key` must be its sub-key.
+        #[arg(long)]
+        delegation: Option<String>,
     },
     /// Publish a release to a lode-server registry: create the draft version,
     /// upload every asset and publish it to a channel. The token is read from
@@ -514,6 +524,13 @@ pub(crate) enum ToolCommand {
     Publish(PublishArgs),
     /// Sign a complete `lode/v1` manifest in place (set its top-level `key_id` + `sig`).
     ManifestSign(ManifestSignArgs),
+    /// Delegate signing for `--app` to a sub-key: sign, with the root key, a
+    /// delegation the sub-key ships in its manifests (or as the GitHub release
+    /// asset `lode-delegation.json`).
+    Delegate(DelegateArgs),
+    /// Add delegated key ids to a signed revocation list (created when missing),
+    /// signed by a root key or by a sub-key with its `--delegation`.
+    Revoke(RevokeArgs),
     /// Write a minimal starter `lode.toml` (see docs/lode.example.toml for the
     /// full documented reference).
     Init {
@@ -575,6 +592,46 @@ pub(crate) struct ManifestSignArgs {
     /// an expired manifest. Without it any existing expiry is removed.
     #[arg(long = "expires-in", value_name = "DURATION", value_parser = parse_duration)]
     pub(crate) expires_in: Option<u64>,
+    /// Embed this delegation (from `delegate`); `--key` must be its sub-key.
+    #[arg(long)]
+    pub(crate) delegation: Option<String>,
+}
+
+/// `lode-cli delegate` arguments.
+#[derive(Debug, clap::Args)]
+pub(crate) struct DelegateArgs {
+    /// The root private key file.
+    #[arg(long)]
+    pub(crate) key: String,
+    /// The sub-key: its `.pub` file or trusted-key entry.
+    #[arg(long, allow_hyphen_values = true)]
+    pub(crate) sub: String,
+    /// How long the delegation stays valid: a number with a unit `m`, `h` or `d`.
+    #[arg(long = "valid-for", value_name = "DURATION", value_parser = parse_duration)]
+    pub(crate) valid_for: u64,
+    /// Start of validity, Unix seconds (default: five minutes ago).
+    #[arg(long = "not-before")]
+    pub(crate) not_before: Option<u64>,
+    /// Write the delegation here instead of printing it.
+    #[arg(long)]
+    pub(crate) out: Option<String>,
+}
+
+/// `lode-cli revoke` arguments.
+#[derive(Debug, clap::Args)]
+pub(crate) struct RevokeArgs {
+    /// The signing private key file.
+    #[arg(long)]
+    pub(crate) key: String,
+    /// The signing sub-key's delegation, when `--key` is not a root key.
+    #[arg(long)]
+    pub(crate) delegation: Option<String>,
+    /// The revocation list file to create or update.
+    #[arg(long)]
+    pub(crate) list: String,
+    /// Key ids to revoke (repeatable).
+    #[arg(long = "add")]
+    pub(crate) add: Vec<String>,
 }
 
 /// Parse `--expires-in`: a positive whole number followed by `m`, `h` or `d`,

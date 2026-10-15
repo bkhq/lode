@@ -262,6 +262,26 @@ LODE_REGISTRY_TOKEN=pat_... lode-cli publish \
   sidecar 资产或 `label`;native:`sig` 字段或 `.sig` sidecar)。`auto` 一旦配置了任一受信公钥即 fail-closed;无公钥时安装为
   **UNVERIFIED** 并告警。
 
+### 委托签名(根密钥离线)
+
+运维方信任的密钥(根密钥)保持离线,发布改用短期子密钥签名。运维方的 `trusted_keys` 只配置根密钥。
+
+```sh
+lode-cli keygen --out root                  # 一次性;root.key 离线保存
+lode-cli keygen --out ci                    # CI 使用的子密钥
+# 离线用根密钥:允许 `ci` 为 myapp 签名 30 天
+lode-cli delegate --app myapp --key root.key --sub ci.pub --valid-for 30d --out delegation.json
+# CI:照常用 ci.key 签名,再嵌入 delegation
+lode-cli manifest dist/myapp.tar.gz --app myapp --version 1.5.0 --url https://… \
+  --key ci.key --delegation delegation.json --into manifest.json
+lode-cli manifest-sign --into manifest.json --key ci.key --delegation delegation.json --expires-in 7d
+```
+
+- GitHub Releases:把 `delegation.json` 作为 release 资产 **`lode-delegation.json`** 上传;资产用子密钥签名(`<asset>.sig`)。
+- 在 `not_after` 之前续签 delegation(例如 30 天有效、每周续签);delegation 过期的 manifest 无法安装。
+- 吊销泄露的子密钥:`lode-cli revoke --key root.key --list revocations.json --add <sub_key_id>`(也可用仍有效的子密钥加 `--delegation` 签名),发布该文件,并让运维方把 `[trust].revocation_url` 指向它。列表是可选的;没有它时,泄露的子密钥在 delegation 过期前仍可用。
+- lode 0.0.3 及更早版本会拒绝子密钥签名;先升级(`lode-cli status` 显示 `features: delegation, revocation`)。
+
 ### 清单
 
 - [ ] 每台主机的 `[update].asset` 写明本平台对应的确切资产文件名。

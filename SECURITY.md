@@ -83,6 +83,16 @@ welcome to notify us if lode's use of a dependency is exploitable.
   applies every other section but never these: an edit that weakens
   verification, repoints the catalog or redirects credentials is refused with
   an error until lode itself is restarted.
+- **Delegated signing keys:** a trusted (root) key may sign a delegation that
+  lets a sub-key sign one manifest `name` until `not_after`. The delegation is
+  checked on every verification (root signature, name, validity window,
+  revocation); policy decisions still look at the root keys only, and a
+  sub-key cannot delegate further. Revocation is best-effort: the optional
+  `[trust].revocation_url` list (signed by a root or a valid sub-key) is merged
+  grow-only into a local cache, so it can never un-revoke a key, but a host
+  that cannot fetch it keeps accepting a revoked sub-key until its delegation
+  expires. A leaked sub-key can also revoke other sub-keys until it is itself
+  revoked. Keep delegations short.
 - **Catalog/manifest signature:** *verify-if-present* — checked when a
   signature exists, never required (so GitHub-source catalogs and unsigned
   native catalogs install, while a present signature must still verify).

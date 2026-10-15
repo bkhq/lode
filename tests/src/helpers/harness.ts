@@ -43,10 +43,13 @@ export class Harness {
   readonly #buildDir: string;
   readonly #tmps: string[] = [];
   readonly #lodes: LodeRunner[] = [];
+  /** The trusted root when `signer` is a delegated sub-key. */
+  readonly root?: Signer;
 
-  private constructor(server: ManifestServer, signer: Signer, dataDir: string, buildDir: string, keysDir: string) {
+  private constructor(server: ManifestServer, signer: Signer, dataDir: string, buildDir: string, keysDir: string, root?: Signer) {
     this.server = server;
     this.signer = signer;
+    this.root = root;
     this.dataDir = dataDir;
     this.#buildDir = buildDir;
     this.#tmps.push(dataDir, buildDir, keysDir);
@@ -59,18 +62,31 @@ export class Harness {
    * each artifact — the catalog signature is verify-if-present (never required), so
    * this must still install/verify fine under `enforce`.
    */
-  static async start(opts: { signCatalog?: boolean } = {}): Promise<Harness> {
+  static async start(opts: { signCatalog?: boolean; delegated?: boolean } = {}): Promise<Harness> {
     const dataDir = mkTmp("lode-data-");
     const buildDir = mkTmp("lode-build-");
     const keysDir = mkTmp("lode-keys-");
-    const signer = await Signer.create(keysDir);
+    let signer = await Signer.create(keysDir);
+    let root: Signer | undefined;
+    const signArgs: string[] = [];
+    if (opts.delegated) {
+      // `{ delegated: true }`: lode trusts only the root; a sub-key signs everything
+      // under a root-signed delegation embedded in the catalog.
+      root = signer;
+      const subDir = join(keysDir, "sub");
+      mkdirSync(subDir);
+      signer = await Signer.create(subDir);
+      const delegation = join(keysDir, "delegation.json");
+      await root.delegate(APP_NAME, join(subDir, "publisher.pub"), delegation);
+      signArgs.push("--delegation", delegation);
+    }
     const catalogKey = (opts.signCatalog ?? true) ? signer.privPath : undefined;
-    const server = ManifestServer.start(APP_NAME, catalogKey);
-    return new Harness(server, signer, dataDir, buildDir, keysDir);
+    const server = ManifestServer.start(APP_NAME, catalogKey, signArgs);
+    return new Harness(server, signer, dataDir, buildDir, keysDir, root);
   }
 
   get trustedKey(): string {
-    return this.signer.trustedKey;
+    return (this.root ?? this.signer).trustedKey;
   }
 
   /** Build, sign, and serve a version. With tamperSha/omitSig, produce a bad artifact. */
