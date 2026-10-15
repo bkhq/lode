@@ -551,8 +551,10 @@ itDocker(
     await reg.sync();
     await pollVersion(fsCid, rustCid,"0.0.2", 60_000, "svc-rust auto v0.0.2");
     await pollVersion(fsCid, bunCid,"0.0.2", 60_000, "svc-bun auto v0.0.2");
-    expect((await readState(rustCid))?.last_good).toBe("0.0.2");
-    expect((await readState(bunCid))?.last_good).toBe("0.0.2");
+    // last_good is committed once the health_grace observation ends, after the
+    // new version is already serving.
+    await pollState(rustCid, (s) => s.last_good === "0.0.2", 30_000, "svc-rust last_good v0.0.2");
+    await pollState(bunCid, (s) => s.last_good === "0.0.2", 30_000, "svc-bun last_good v0.0.2");
 
     // PHASE 7 — crashing v0.0.3 -> single-strike rollback to v0.0.2 ----------
     // Published as a (signed) version but NOT channel-latest, then requested via

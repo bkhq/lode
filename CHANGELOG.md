@@ -42,6 +42,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Hosts on 0.0.3 or older reject sub-key signatures; upgrade them before
   publishing with a sub-key.
 
+### Security
+
+- rustls 0.23.46 (RUSTSEC-2026-0346, -0347, -0348, -0349).
+
 ## [0.0.3] - 2026-10-12
 
 ### Added
