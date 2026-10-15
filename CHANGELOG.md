@@ -7,6 +7,41 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.0] - 2026-10-15
+
+### Added
+
+- **Delegated signing.** A trusted (root) key can stay offline and delegate
+  signing to a sub-key for one manifest name and a validity window
+  (`lode-cli delegate`). The delegation travels as the manifest's top-level
+  `delegation`, or as the `lode-delegation.json` asset of a GitHub release;
+  `manifest`, `manifest-sign` and `verify` take `--delegation`.
+- **Revocation lists.** `[trust].revocation_url` (`--revocation-url`,
+  `LODE_REVOCATION_URL`) subscribes to a list of revoked sub-key ids signed by
+  a root or a valid sub-key (`lode-cli revoke`). Verified lists are merged into
+  `$LODE_DIR/revocations.json`; an unreachable list never blocks an update.
+- **Resources.** `[[resource]]` distributes config files, data sets and other
+  bundles under the app's trust model, published as `<app>/<name>`. They are
+  installed under `$LODE_DIR/resources/<name>` before the app starts, passed to
+  it as `LODE_RESOURCE_<NAME>`, updated per their own `policy`, and announced
+  to the app by `SIGHUP` or a restart (`notify`). The app requests a version
+  through `state.json` `resource_target`; `lode-cli pull` does the same from
+  outside, and an older version rolls back.
+- The SDKs gain `resource`, `applyResource` and `resourcePath`.
+- `lode-cli status` reports the manifest's signing scheme, the configured
+  resources and the loader's trust features.
+
+### Changed
+
+- **Breaking:** `Manifest` and `Asset` gain a `delegation` field, `Config` a
+  `resources` field, `Trust` a `revocation_url` field and `State` the
+  `resources` and `resource_target` fields; code that builds them with struct
+  literals must set them.
+- `[global].app` may no longer contain `/`, which separates an app from its
+  resources.
+- Hosts on 0.0.3 or older reject sub-key signatures; upgrade them before
+  publishing with a sub-key.
+
 ## [0.0.3] - 2026-10-12
 
 ### Added
