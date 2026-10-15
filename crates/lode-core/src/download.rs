@@ -60,7 +60,9 @@ pub fn fetch_artifact(
     // passes "runtime"/the runtime name, both valid ids).
     validate_id("version", version)?;
     validate_id("asset", &asset.name)?;
-    let cache_dir = cfg.global.dir.join("downloads").join(version);
+    let cache_dir = crate::install::install_root(cfg)
+        .join("downloads")
+        .join(version);
     let cache_path = cache_dir.join(&asset.name);
 
     if let Some(hit) = reusable_cache(&cache_path, &asset.sha256) {

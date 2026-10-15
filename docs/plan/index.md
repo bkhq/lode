@@ -32,4 +32,4 @@ Each plan is a single line linking to its detail file. All detailed information 
 ## Plans
 
 - [x] [**20261015-0103-delegated-signing-keys Delegated signing keys with revocation**](20261015-0103-delegated-signing-keys.md) `2026-10-15`
-- [ ] [**20261015-0107-resource-distribution Distribute arbitrary resources**](20261015-0107-resource-distribution.md) `2026-10-15`
+- [x] [**20261015-0107-resource-distribution Distribute arbitrary resources**](20261015-0107-resource-distribution.md) `2026-10-15`

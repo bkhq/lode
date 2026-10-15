@@ -55,6 +55,23 @@ pub struct HistoryEntry {
     pub result: String, // "good" | "bad"
 }
 
+/// lode's view of one `[[resource]]` (state.json `resources.<name>`).
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ResourceState {
+    /// The active version.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub current: Option<String>,
+    /// A newer version found by a check (`policy = "check"`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub available: Option<String>,
+    /// Where the active version lives (also `LODE_RESOURCE_<NAME>`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub path: Option<String>,
+    /// Why the last check or apply failed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
 /// Parsed state.json. lode writes the top group; the app writes
 /// `target`/`restart_nonce`/`check_nonce`/`ready`.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -95,6 +112,12 @@ pub struct State {
     pub hold: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ready: Option<String>,
+    /// Per-resource state, keyed by `[[resource]]` name.
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub resources: std::collections::BTreeMap<String, ResourceState>,
+    /// Pending resource requests (see [`Lode::apply_resource`]).
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub resource_target: std::collections::BTreeMap<String, String>,
 }
 
 /// A handle on one lode data directory. [`Lode::from_env`] for the supervised app;
@@ -214,6 +237,33 @@ impl Lode {
         }
         self.update(|o| {
             o.insert("target".into(), Value::from(version));
+        })?;
+        Ok(())
+    }
+
+    /// The state of `[[resource]]` `name` (`None` until lode has recorded it).
+    pub fn resource(&self, name: &str) -> Result<Option<ResourceState>> {
+        Ok(self.read()?.and_then(|mut st| st.resources.remove(name)))
+    }
+
+    /// Ask lode to activate `version` (`"latest"` for the channel latest) of
+    /// `[[resource]]` `name`; an older version rolls it back. lode acts ~1s
+    /// later, then records the result in [`Self::resource`] and notifies per
+    /// the resource's `notify`.
+    pub fn apply_resource(&self, name: &str, version: &str) -> Result<()> {
+        if name.is_empty() || version.is_empty() {
+            return Err("lode: apply_resource needs a non-empty name and version".into());
+        }
+        self.update(|o| {
+            let targets = o
+                .entry("resource_target")
+                .or_insert_with(|| Value::Object(Map::new()));
+            if !targets.is_object() {
+                *targets = Value::Object(Map::new());
+            }
+            if let Some(t) = targets.as_object_mut() {
+                t.insert(name.into(), Value::from(version));
+            }
         })?;
         Ok(())
     }
@@ -466,6 +516,23 @@ pub fn read_config() -> Option<String> {
 /// The version lode launched (`LODE_ACTIVE_VERSION`).
 pub fn active_version() -> Option<String> {
     std::env::var("LODE_ACTIVE_VERSION")
+        .ok()
+        .filter(|s| !s.is_empty())
+}
+
+/// The active path of `[[resource]]` `name` (`LODE_RESOURCE_<NAME>`), when installed.
+pub fn resource_path(name: &str) -> Option<String> {
+    let key: String = name
+        .chars()
+        .map(|c| {
+            if c == '-' || c == '.' {
+                '_'
+            } else {
+                c.to_ascii_uppercase()
+            }
+        })
+        .collect();
+    std::env::var(format!("LODE_RESOURCE_{key}"))
         .ok()
         .filter(|s| !s.is_empty())
 }

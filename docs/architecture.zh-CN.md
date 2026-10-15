@@ -162,6 +162,43 @@ target ≠ current 且可用(stop-start 模式):
 - **垃圾回收**:清理中断遗留的 `downloads/<v>/*.part`、`versions/<v>.tmp` 半成品(已校验的按版本下载缓存保留);按 `keep_versions` 保留 current + last_good + 最近 N 个版本,其余版本目录**连同其 `downloads/<v>/` 缓存**一起删除;`$LODE_DIR/runtime/` 同理只留当前在用的缓存 key。
 - **校验落盘一致性**:`current` 软链指向的版本若缺失/损坏 → 回退到 last_good 或重新引导。
 
+### 资源(`[[resource]]`)
+
+除 app 本身外,lode 还能按同一套信任模型分发任意数量的独立发布的资源包——配置文件、
+数据集、模型、静态资源。每个 `[[resource]]` 指向自己的原生 `lode/v1` manifest 与 asset:
+
+```toml
+[[resource]]
+name     = "config"                                         # 字母、数字、. _ -;唯一
+manifest = "https://releases.example.com/myapp/config.json"
+asset    = "settings.tar.gz"
+channel  = "stable"   # 默认:[update].channel
+policy   = "auto"     # off | check | auto;默认:[update].policy
+notify   = "signal"   # none(默认)| signal(SIGHUP)| restart
+required = true       # 默认 false;true = 缺少它时 lode 不启动 app
+```
+
+- **身份。** 资源以 `<app>/<name>` 发布(如 `myapp/config`):这是它的 manifest `name`、
+  artifact 签名绑定的 `app`(§6)以及其 delegation 携带的名字。app id 不能包含 `/`,所以
+  app 的签名永远不会被当作资源签名通过,反之亦然。`[trust]`(密钥、`require_signature`、
+  `require_manifest`、吊销)原样生效。资源 asset 不得发布 `run`/`exec`。
+- **安装。** 与 app 相同的流水线(下载 → sha256 + 签名 → 落盘),落到
+  `$LODE_DIR/resources/<name>/`,有自己的 `versions/`、`downloads/` 与 `current` 链接,
+  按 `keep_versions` 清理。格式同 app。
+- **启动。** 首次 spawn 前,lode 安装所有还没有激活版本的资源。`required` 的失败会让 lode
+  停止;可选的只记录日志并写入 `state.json`,由下一次检查重试。
+- **交给 app。** 子进程获得 `LODE_RESOURCE_<NAME>`(大写,`-`/`.` → `_`)= 激活路径:
+  Unix 上为 `resources/<name>/current`(跨更新不变),Windows 上为版本目录。
+  `state.json` 的 `resources.<name>` 记录 `current`、`available`、`path`、`error`。
+- **更新。** 每 `[update].check_interval` 按资源的 `policy` 检查(`auto` 激活更新版本,
+  `check` 记录 `available`),每次 `check_nonce` 也会检查(其 `check_error` 包含资源错误)。
+  app 通过 `resource_target.<name>` 请求某个版本——`"latest"`,或更旧的版本以回滚;
+  `lode-cli pull` 从外部做同样的事。app 与资源版本互相独立。
+- **通知。** 激活资源后,lode 按 `notify` 通知运行中的 app:不通知(读 `state.json`)、
+  向其进程组发 `SIGHUP`(仅 Unix),或优雅重启。
+- **重载。** `[[resource]]` 的来源(`name`、`manifest`)与 `[update]` 来源一样被固定;
+  新增或改指向需要重启 lode。
+
 ---
 
 ## 6. 验证与信任:文件完整性 + 发布者身份
@@ -324,16 +361,18 @@ lode.delegation.v1
   "history": [ { "version": "1.4.2", "at": "2026-06-04T21:00:00Z", "result": "good" } ],
   "config_generation": 0,
   "checked_nonce": 0,
+  "resources": { "config": { "current": "3", "path": "/data/resources/config/current" } },
 
   "target": null,
   "restart_nonce": 0,
   "check_nonce": 0,
   "hold": false,
+  "resource_target": {},
 
   "ready": "12345-k3x9q2-0"
 }
 ```
-lode 拥有的字段 vs app 拥有的字段(`target`/`restart_nonce`/`check_nonce`/`hold`)互不重叠;`ready` 为共有字段(§8);`status` ∈ `starting|running|held|updating|rolling-back|stopping|stopped|error`;`result` ∈ `good|bad`。
+lode 拥有的字段 vs app 拥有的字段(`target`/`restart_nonce`/`check_nonce`/`hold`/`resource_target`)互不重叠;`ready` 为共有字段(§8);`status` ∈ `starting|running|held|updating|rolling-back|stopping|stopped|error`;`result` ∈ `good|bad`。
 
 ---
 
@@ -601,6 +640,7 @@ lode-cli 管理（写 state.json,与运行中的服务实例沟通）:
   rollback     把 state.json 的 target 设为 last_good（或 --version <v>）
   restart      递增 state.json 的 restart_nonce，让服务重启子进程
   versions     列出本地已安装版本
+  pull         拉取、校验并激活 [[resource]] 资源包(全部,或 --resource <name>;--version <v> 指定或回滚);服务运行时经 resource_target 交由其应用
   seed         开发/测试:把本地可执行文件/归档作为一个版本安装(无 manifest、无下载、无签名校验)并激活,使裸 `lode` 可完全离线运行它
   self-update  用最新的 lode 发布替换当前 lode 二进制,按二进制内置的发布公钥校验
 
@@ -648,6 +688,7 @@ $LODE_DIR/
   versions/<ver>/            # 各版本(raw/gz 落单文件 / tar.gz/zip 解包 / binary chmod)
     .lode.json             #   该版本元数据(run/exec/format 等)供离线运行
   current -> versions/<ver>  # 原子切换的当前软链
+  resources/<name>/          # 每个 [[resource]]:自己的 versions/、downloads/ 与 current(布局同上)
 # 注:manifest.json 在远程,不存本地。
 ```
 

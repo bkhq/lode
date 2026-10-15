@@ -92,8 +92,37 @@ pub fn run(cfg: &Config) -> Result<()> {
     writeln!(out, "  forward:    {}", forward_set(cfg))?;
     writeln!(out, "  restart:    {}", opt(cfg.signals.restart.as_deref()))?;
 
+    write_resources(&mut out, cfg)?;
     write_remote(&mut out, cfg)?;
     write_state(&mut out, cfg)?;
+    Ok(())
+}
+
+/// The configured `[[resource]]` bundles and their recorded state.
+fn write_resources(out: &mut impl Write, cfg: &Config) -> Result<()> {
+    if cfg.resources.is_empty() {
+        return Ok(());
+    }
+    writeln!(out, "[resources]")?;
+    let st = state::read_lenient(&cfg.global.dir.join("state.json")).unwrap_or_default();
+    for res in &cfg.resources {
+        let rs = st.resources.get(&res.name).cloned().unwrap_or_default();
+        writeln!(
+            out,
+            "  {}: {} (policy {:?}, notify {:?}{})",
+            res.name,
+            opt(rs.current.as_deref()),
+            res.policy,
+            res.notify,
+            if res.required { ", required" } else { "" }
+        )?;
+        if let Some(v) = rs.available.as_deref() {
+            writeln!(out, "    available: {v}")?;
+        }
+        if let Some(e) = rs.error.as_deref() {
+            writeln!(out, "    error:     {e}")?;
+        }
+    }
     Ok(())
 }
 

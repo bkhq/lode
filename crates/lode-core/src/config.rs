@@ -55,6 +55,19 @@ pub enum Policy {
     Auto,
 }
 
+/// How the app learns that a resource was updated (`[[resource]].notify`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum Notify {
+    /// Nothing; the app reads `state.json` or asks with `check_nonce` (default).
+    #[default]
+    None,
+    /// Send `SIGHUP` to the app.
+    Signal,
+    /// Restart the app.
+    Restart,
+}
+
 /// Signature-enforcement strength (`trust.require_signature`), design §6.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "kebab-case")]
@@ -157,11 +170,34 @@ pub struct Config {
     /// `[env]` — extra environment variables injected into the child (on top of
     /// the inherited host env; lode's own `LODE_*` introspection vars still win).
     pub env: BTreeMap<String, String>,
+    /// `[[resource]]` — separately published bundles installed beside the app.
+    pub resources: Vec<Resource>,
     /// The `lode.toml` path this config was read from (`None` when running
     /// file-less). The supervisor watches its mtime to recover a *paused* app after
     /// the operator edits it (design §8); a running app is never disturbed.
     #[allow(clippy::struct_field_names)] // mirrors the on-disk `lode.toml` concept
     pub config_path: Option<PathBuf>,
+}
+
+/// `[[resource]]` — a separately published, separately versioned bundle (config
+/// files, data, assets) verified like the app and installed under
+/// `$LODE_DIR/resources/<name>`. Its manifest `name` is `<app>/<name>`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Resource {
+    /// Local id; also the manifest identity suffix.
+    pub name: String,
+    /// The resource's native `lode/v1` manifest URL.
+    pub manifest: String,
+    /// The asset filename to install.
+    pub asset: String,
+    /// Channel to follow (default: `[update].channel`).
+    pub channel: String,
+    /// Update policy (default: `[update].policy`).
+    pub policy: Policy,
+    /// How the app is told about an applied update.
+    pub notify: Notify,
+    /// The app does not start until the resource is installed.
+    pub required: bool,
 }
 
 /// `[global]` — identity and storage.
@@ -340,6 +376,22 @@ struct TomlConfig {
     signals: TomlSignals,
     #[serde(default)]
     env: BTreeMap<String, String>,
+    #[serde(default)]
+    resource: Vec<TomlResource>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct TomlResource {
+    name: String,
+    manifest: String,
+    asset: String,
+    channel: Option<String>,
+    policy: Option<Policy>,
+    #[serde(default)]
+    notify: Notify,
+    #[serde(default)]
+    required: bool,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -686,8 +738,25 @@ fn merge(o: &Overrides, t: &TomlConfig) -> Config {
         // entry at deploy time, set it directly in the process env (it wins as a
         // host env var; see `child_env`).
         env: t.env.clone(),
+        resources: merge_resources(o, t),
         config_path: None, // filled in by `resolve` after merge
     }
+}
+
+fn merge_resources(o: &Overrides, t: &TomlConfig) -> Vec<Resource> {
+    let update = merge_update(o, &t.update);
+    t.resource
+        .iter()
+        .map(|r| Resource {
+            name: r.name.clone(),
+            manifest: r.manifest.clone(),
+            asset: r.asset.clone(),
+            channel: r.channel.clone().unwrap_or_else(|| update.channel.clone()),
+            policy: r.policy.unwrap_or(update.policy),
+            notify: r.notify,
+            required: r.required,
+        })
+        .collect()
 }
 
 fn merge_global(o: &Overrides, t: &TomlGlobal) -> Global {
@@ -991,6 +1060,30 @@ impl ConfigBuilder {
     }
 }
 
+/// `[[resource]]` entries: valid unique names and non-blank source fields.
+fn validate_resources(resources: &[Resource]) -> Result<()> {
+    let mut seen = std::collections::BTreeSet::new();
+    for r in resources {
+        crate::idval::validate_id("resource name", &r.name)
+            .map_err(|e| Error::Config(e.to_string()))?;
+        if !seen.insert(r.name.as_str()) {
+            return Err(Error::Config(format!(
+                "duplicate [[resource]] name {:?}",
+                r.name
+            )));
+        }
+        for (key, value) in [("manifest", &r.manifest), ("asset", &r.asset)] {
+            if value.trim().is_empty() {
+                return Err(Error::Config(format!(
+                    "[[resource]] {:?}: {key} must not be empty",
+                    r.name
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Semantic validation: non-empty key fields, source XOR, and numeric ranges.
 /// (Enum values are already checked by clap/serde at parse time.)
 fn validate(cfg: &Config) -> Result<()> {
@@ -1000,6 +1093,12 @@ fn validate(cfg: &Config) -> Result<()> {
                 .to_owned(),
         ));
     }
+    if cfg.global.app.contains('/') {
+        return Err(Error::Config(
+            "global.app must not contain `/` (`<app>/<name>` names a resource)".to_owned(),
+        ));
+    }
+    validate_resources(&cfg.resources)?;
     if cfg.update.channel.trim().is_empty() {
         return Err(Error::Config(
             "update.channel must not be empty (e.g. \"stable\")".to_owned(),
@@ -1088,6 +1187,71 @@ mod tests {
         assert!(cfg.http.credential_hosts.is_empty());
         assert!(!cfg.http.allow_insecure); // secure by default
         assert!(validate(&cfg).is_ok());
+    }
+
+    const RESOURCE_BASE: &str = "[global]\napp = \"myapp\"\n[update]\n\
+        manifest = \"https://r.example/m.json\"\nchannel = \"beta\"\npolicy = \"auto\"\n";
+
+    #[test]
+    fn resources_parse_with_defaults() {
+        let cfg = Config::from_toml(&format!(
+            "{RESOURCE_BASE}[[resource]]\nname = \"config\"\n\
+             manifest = \"https://r.example/config.json\"\nasset = \"config.tar.gz\"\n\
+             [[resource]]\nname = \"models\"\nmanifest = \"https://r.example/models.json\"\n\
+             asset = \"models.zip\"\nchannel = \"stable\"\npolicy = \"check\"\n\
+             notify = \"signal\"\nrequired = true\n"
+        ))
+        .unwrap();
+        assert_eq!(
+            cfg.resources,
+            vec![
+                Resource {
+                    name: "config".to_owned(),
+                    manifest: "https://r.example/config.json".to_owned(),
+                    asset: "config.tar.gz".to_owned(),
+                    channel: "beta".to_owned(),
+                    policy: Policy::Auto,
+                    notify: Notify::None,
+                    required: false,
+                },
+                Resource {
+                    name: "models".to_owned(),
+                    manifest: "https://r.example/models.json".to_owned(),
+                    asset: "models.zip".to_owned(),
+                    channel: "stable".to_owned(),
+                    policy: Policy::Check,
+                    notify: Notify::Signal,
+                    required: true,
+                },
+            ]
+        );
+        assert!(
+            Config::from_toml(RESOURCE_BASE)
+                .unwrap()
+                .resources
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn resources_and_app_names_are_validated() {
+        let one = |body: &str| Config::from_toml(&format!("{RESOURCE_BASE}[[resource]]\n{body}"));
+        assert!(one("name = \"c\"\nmanifest = \"https://r/c.json\"\nasset = \"c.zip\"\n").is_ok());
+        // Bad name, missing/blank fields, unknown keys.
+        assert!(
+            one("name = \"../c\"\nmanifest = \"https://r/c.json\"\nasset = \"c.zip\"\n").is_err()
+        );
+        assert!(one("name = \"c\"\nasset = \"c.zip\"\n").is_err());
+        assert!(one("name = \"c\"\nmanifest = \"https://r/c.json\"\nasset = \" \"\n").is_err());
+        assert!(
+            one("name = \"c\"\nmanifest = \"https://r/c.json\"\nasset = \"c.zip\"\nrun = \"x\"\n")
+                .is_err()
+        );
+        // Duplicate names.
+        let dup = "name = \"c\"\nmanifest = \"https://r/c.json\"\nasset = \"c.zip\"\n";
+        assert!(one(&format!("{dup}[[resource]]\n{dup}")).is_err());
+        // An app id never contains `/`: `<app>/<resource>` is a resource identity.
+        assert!(Config::from_toml("[global]\napp = \"my/app\"\n").is_err());
     }
 
     #[test]

@@ -16,8 +16,10 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"strings"
 	"syscall"
 	"time"
+	"unicode"
 )
 
 // Status is the lifecycle status lode reports (kebab-case on the wire).
@@ -41,6 +43,16 @@ type HistoryEntry struct {
 	Result  string `json:"result"` // "good" | "bad"
 }
 
+// ResourceState is lode's view of one [[resource]] (state.json resources.<name>):
+// the active version, a newer one found by a check, where the active version
+// lives (also LODE_RESOURCE_<NAME>), and why the last check or apply failed.
+type ResourceState struct {
+	Current   string `json:"current,omitempty"`
+	Available string `json:"available,omitempty"`
+	Path      string `json:"path,omitempty"`
+	Error     string `json:"error,omitempty"`
+}
+
 // State is the parsed state.json. lode writes the top group; the app writes
 // Target/RestartNonce/CheckNonce/Ready. CheckedNonce is the highest CheckNonce
 // lode has answered; CheckError is why the last requested check failed.
@@ -62,6 +74,10 @@ type State struct {
 	CheckNonce       uint64         `json:"check_nonce,omitempty"`
 	Hold             bool           `json:"hold,omitempty"`
 	Ready            string         `json:"ready,omitempty"`
+	// Resources is lode's per-resource state; ResourceTarget the pending
+	// requests (see ApplyResource).
+	Resources      map[string]ResourceState `json:"resources,omitempty"`
+	ResourceTarget map[string]string        `json:"resource_target,omitempty"`
 }
 
 // Client is a handle on one lode data directory. FromEnv for the supervised app;
@@ -188,6 +204,40 @@ func (c *Client) RequestUpdate(version string) error {
 		return errors.New("lode: RequestUpdate needs a non-empty version")
 	}
 	_, err := c.Update(func(m map[string]any) { m["target"] = version })
+	return err
+}
+
+// Resource is the state of [[resource]] name (nil until lode has recorded it).
+func (c *Client) Resource(name string) (*ResourceState, error) {
+	st, err := c.Read()
+	if err != nil || st == nil {
+		return nil, err
+	}
+	rs, ok := st.Resources[name]
+	if !ok {
+		return nil, nil
+	}
+	return &rs, nil
+}
+
+// ApplyResource asks lode to activate version ("" = "latest") of [[resource]]
+// name; an older version rolls it back. lode acts ~1s later, then records the
+// result in Resource(name) and notifies per the resource's notify.
+func (c *Client) ApplyResource(name, version string) error {
+	if name == "" {
+		return errors.New("lode: ApplyResource needs a non-empty name")
+	}
+	if version == "" {
+		version = "latest"
+	}
+	_, err := c.Update(func(m map[string]any) {
+		targets, ok := m["resource_target"].(map[string]any)
+		if !ok {
+			targets = map[string]any{}
+		}
+		targets[name] = version
+		m["resource_target"] = targets
+	})
 	return err
 }
 
@@ -396,6 +446,18 @@ func ReadConfig() (string, error) {
 
 // ActiveVersion is the version lode launched (LODE_ACTIVE_VERSION).
 func ActiveVersion() string { return os.Getenv("LODE_ACTIVE_VERSION") }
+
+// ResourcePath is the active path of [[resource]] name (LODE_RESOURCE_<NAME>);
+// empty when it is not installed.
+func ResourcePath(name string) string {
+	key := strings.Map(func(r rune) rune {
+		if r == '-' || r == '.' {
+			return '_'
+		}
+		return unicode.ToUpper(r)
+	}, name)
+	return os.Getenv("LODE_RESOURCE_" + key)
+}
 
 // InstanceID is this launch's unique id (LODE_INSTANCE, "{pid}-{nanoid}").
 func InstanceID() string { return os.Getenv("LODE_INSTANCE") }

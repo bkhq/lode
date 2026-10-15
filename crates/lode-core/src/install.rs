@@ -74,7 +74,7 @@ pub fn install(
 
     verify_download(cfg, version, asset, computed_sha)?;
 
-    let versions_dir = cfg.global.dir.join("versions");
+    let versions_dir = install_root(cfg).join("versions");
     fs::create_dir_all(&versions_dir)?;
     let staging = versions_dir.join(format!("{version}.tmp"));
     let _ = fs::remove_dir_all(&staging);
@@ -217,11 +217,21 @@ fn chmod_command_targets(cfg: &Config, asset: &Asset, dir: &Path) -> Result<()> 
     Ok(())
 }
 
+/// Where `cfg`'s versions, downloads and `current` live: `[global].dir`, or
+/// `resources/<name>` under it for a config scoped to a resource (whose app is
+/// `<app>/<name>`, see [`crate::resource`]).
+pub fn install_root(cfg: &Config) -> PathBuf {
+    match cfg.global.app.split_once('/') {
+        Some((_, name)) => cfg.global.dir.join("resources").join(name),
+        None => cfg.global.dir.clone(),
+    }
+}
+
 /// Atomically point `current` at `versions/<version>` via a temp-symlink rename.
 /// The link target is relative (`versions/<ver>`) so the data dir stays movable.
 #[cfg(unix)]
 pub fn switch_current(cfg: &Config, version: &str) -> Result<()> {
-    let dir = &cfg.global.dir;
+    let dir = &install_root(cfg);
     let version_dir = dir.join("versions").join(version);
     if !version_dir.is_dir() {
         return Err(Error::Install(format!(
@@ -242,7 +252,7 @@ pub fn switch_current(cfg: &Config, version: &str) -> Result<()> {
 /// current version. Only checks that the version is installed.
 #[cfg(not(unix))]
 pub fn switch_current(cfg: &Config, version: &str) -> Result<()> {
-    if !cfg.global.dir.join("versions").join(version).is_dir() {
+    if !install_root(cfg).join("versions").join(version).is_dir() {
         return Err(Error::Install(format!(
             "cannot activate {version}: versions/{version} is not installed"
         )));
@@ -259,7 +269,7 @@ pub fn switch_current(cfg: &Config, version: &str) -> Result<()> {
 /// (downloaded but not — or no longer — extracted) is pruned too unless it is in the
 /// keep set, so a failed install's artifact does not accumulate indefinitely.
 pub fn prune(cfg: &Config, current: Option<&str>, last_good: Option<&str>) -> Result<()> {
-    let dir = &cfg.global.dir;
+    let dir = &install_root(cfg);
     let versions_dir = dir.join("versions");
     let installed = collect_version_dirs(&versions_dir)?;
     let keep_n = usize::try_from(cfg.update.keep_versions).unwrap_or(usize::MAX);
@@ -328,7 +338,7 @@ fn cached_download_versions(downloads_dir: &Path) -> Vec<String> {
 // alongside other fallible setup), even though GC itself swallows I/O errors.
 #[allow(clippy::unnecessary_wraps)]
 pub fn gc(cfg: &Config) -> Result<()> {
-    let dir = &cfg.global.dir;
+    let dir = &install_root(cfg);
     if let Ok(entries) = fs::read_dir(dir.join("downloads")) {
         for entry in entries.flatten() {
             // Per-version cache dir: reap any interrupted `.part`, keep the rest.
@@ -1412,6 +1422,7 @@ mod tests {
                 restart: None,
             },
             env: std::collections::BTreeMap::new(),
+            resources: Vec::new(),
             config_path: None,
         }
     }

@@ -125,12 +125,12 @@ fn printable(notes: &str) -> String {
 /// single-instance `lode.pid` lock — which catches a paused (`pid: None`) or
 /// crash-backoff (dead `pid`) supervisor (P2-15) — or, belt-and-braces, when
 /// `state.pid` itself names a live process (a no-signal `kill` succeeds, §13).
-fn supervisor_running(st: &state::State, lock_holder: Option<u32>) -> bool {
+pub(crate) fn supervisor_running(st: &state::State, lock_holder: Option<u32>) -> bool {
     lock_holder.is_some() || st.pid.is_some_and(process_alive)
 }
 
 /// The pid of a live supervisor holding the single-instance lock, if any.
-fn live_holder(cfg: &Config) -> Option<u32> {
+pub(crate) fn live_holder(cfg: &Config) -> Option<u32> {
     crate::lock::live_holder(&cfg.global.dir)
 }
 

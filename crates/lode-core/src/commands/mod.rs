@@ -1,6 +1,7 @@
 //! lode management subcommands. `status` plus the three local (no-network)
 //! commands land here; `update` arrives with its own L3.
 
+pub mod pull;
 pub mod restart;
 pub mod rollback;
 // `seed` is the cli-only offline-install command (driven by `run_tool`); the

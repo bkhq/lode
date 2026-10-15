@@ -4,12 +4,12 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::time::{Duration, Instant, SystemTime};
 
-use lode_core::config::{Config, Policy, Readiness, RestartPolicy};
+use lode_core::config::{Config, Notify, Policy, Readiness, Resource, RestartPolicy};
 use lode_core::engine::{
     Target, ensure_runtime, locate, required_asset, resolve_target, version_installed,
 };
 use lode_core::state::{self, HistoryEntry, HistoryResult, State, Status};
-use lode_core::{Error, Result, download, install, manifest};
+use lode_core::{Error, Result, download, install, manifest, resource};
 
 use crate::launch::{build_run_argv, child_env, effective_command, expand_token, set_env};
 use crate::sys::{
@@ -164,6 +164,7 @@ pub fn serve_core(
             return Ok(code);
         }
         let runtime_dir = ensure_runtime(&cfg)?;
+        ensure_resources(&cfg)?;
         if let Some(code) = bootstrap_terminated(signals, &cfg) {
             return Ok(code);
         }
@@ -198,7 +199,7 @@ pub fn serve_core(
 
 /// The config sections a reload must NOT change, or which one `next` changes:
 /// `[trust]`, the `[update]` source (`manifest`/`github`/`github_api`), the
-/// `[http]` credential scope (`allow_insecure`, `credential_hosts`) and the
+/// `[[resource]]` sources (`name`/`manifest`), the `[http]` credential scope (`allow_insecure`, `credential_hosts`) and the
 /// `[runtime]` download (`download`/`sha256`).
 ///
 /// A reload is driven by the app-owned `restart_nonce` (design §7), and
@@ -218,6 +219,15 @@ fn trust_anchor_changed(initial: &Config, next: &Config) -> Option<&'static str>
     {
         return Some("[update] source");
     }
+    let sources = |c: &Config| {
+        c.resources
+            .iter()
+            .map(|r| (r.name.clone(), r.manifest.clone()))
+            .collect::<Vec<_>>()
+    };
+    if sources(initial) != sources(next) {
+        return Some("[[resource]] source");
+    }
     if initial.http.allow_insecure != next.http.allow_insecure
         || initial.http.credential_hosts != next.http.credential_hosts
     {
@@ -229,6 +239,69 @@ fn trust_anchor_changed(initial: &Config, next: &Config) -> Option<&'static str>
         return Some("[runtime] download");
     }
     None
+}
+
+/// Install every `[[resource]]` that has no active version yet. A `required`
+/// one that cannot be installed is fatal; any other only warns and is retried
+/// by the next check.
+fn ensure_resources(cfg: &Config) -> Result<()> {
+    for res in &cfg.resources {
+        if resource::current(cfg, &res.name).is_some() {
+            continue;
+        }
+        match resource::update(cfg, res, None) {
+            Ok(applied) => tracing::info!(resource = res.name, ?applied, "resource installed"),
+            Err(e) if res.required => return Err(e),
+            Err(e) => {
+                tracing::warn!(resource = res.name, error = %e, "resource not installed");
+                resource::record(cfg, &res.name, |r| r.error = Some(e.to_string()));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// The variable carrying a resource's path to the app: `LODE_RESOURCE_<NAME>`,
+/// upper-cased, with `-` and `.` as `_`.
+fn resource_env_name(name: &str) -> String {
+    let suffix: String = name
+        .chars()
+        .map(|c| match c {
+            '-' | '.' => '_',
+            c => c.to_ascii_uppercase(),
+        })
+        .collect();
+    format!("LODE_RESOURCE_{suffix}")
+}
+
+/// Fetch `res` and act on its policy (see [`Supervisor::run_resource_checks`]);
+/// `Ok(true)` when a new version was activated.
+fn check_resource(cfg: &Config, res: &Resource, requested: bool) -> Result<bool> {
+    let m = resource::fetch(cfg, res)?;
+    let latest = resource::latest(&m, res)?;
+    let decide = if requested {
+        requested_policy_action
+    } else {
+        policy_action
+    };
+    let action = match resource::current(cfg, &res.name) {
+        None => PolicyAction::Apply(latest),
+        Some(current) => decide(res.policy, false, &latest, &current),
+    };
+    let available = match action {
+        PolicyAction::Apply(v) => {
+            resource::activate(cfg, res, &m, &v)?;
+            tracing::info!(resource = res.name, version = v, "resource updated");
+            return Ok(true);
+        }
+        PolicyAction::Advertise(v) => Some(v),
+        PolicyAction::Idle => None,
+    };
+    resource::record(cfg, &res.name, |r| {
+        r.available = available;
+        r.error = None;
+    });
+    Ok(false)
 }
 
 /// The `LODE_READINESS` value injected for the child so it knows whether the
@@ -798,6 +871,8 @@ pub struct Supervisor<'c> {
     last_check_nonce: u64,
     /// When the next policy update check is due (`None` => no further checks).
     next_check_at: Option<Instant>,
+    /// When the next `[[resource]]` check is due (`None` => no further checks).
+    next_resource_check_at: Option<Instant>,
     /// Consecutive transient fetch failures (see [`TRANSIENT_FETCH_STRIKES`]); reset
     /// by the first success.
     fetch_failures: u32,
@@ -826,6 +901,11 @@ impl<'c> Supervisor<'c> {
         } else {
             Some(Instant::now())
         };
+        let next_resource_check_at = cfg
+            .resources
+            .iter()
+            .any(|r| !matches!(r.policy, Policy::Off))
+            .then(Instant::now);
         Self {
             forward: forward_signals(&cfg.signals.forward),
             restart: cfg.signals.restart.as_deref().and_then(parse_signal),
@@ -846,6 +926,7 @@ impl<'c> Supervisor<'c> {
             last_nonce,
             last_check_nonce,
             next_check_at,
+            next_resource_check_at,
             fetch_failures: 0,
             fetch_error: None,
         }
@@ -955,6 +1036,9 @@ impl<'c> Supervisor<'c> {
             }
             if !self.paused {
                 self.maybe_check_update();
+                if let Some(outcome) = self.maybe_check_resources() {
+                    return Ok(outcome);
+                }
             }
             if let Some(outcome) = self.poll_prepare() {
                 return Ok(outcome);
@@ -1001,6 +1085,16 @@ impl<'c> Supervisor<'c> {
         // The resolved lode.toml path, so the app can read lode's config (read-only).
         if let Some(p) = self.cfg.config_path.as_deref() {
             set_env(&mut env, "LODE_CONFIG", &p.display().to_string());
+        }
+        for res in &self.cfg.resources {
+            if let Some(version) = resource::current(self.cfg, &res.name) {
+                let path = resource::active_path(self.cfg, &res.name, &version);
+                set_env(
+                    &mut env,
+                    &resource_env_name(&res.name),
+                    &path.display().to_string(),
+                );
+            }
         }
 
         let pid = spawn_process(&argv, &workdir, &env)?;
@@ -1635,9 +1729,8 @@ impl<'c> Supervisor<'c> {
         // A requested check only reports, so it is answered even while held or
         // paused. Under `policy=auto` it may leave a `target`, which the next
         // poll picks up (the answer below changes the mtime).
-        if st.check_nonce > self.last_check_nonce {
-            self.last_check_nonce = st.check_nonce;
-            self.answer_check_request(st.check_nonce);
+        if let Some(outcome) = self.answer_requests(&st) {
+            return Some(outcome);
         }
 
         // Hold gates all (re)starts; while held, defer restart/target requests but
@@ -1746,6 +1839,20 @@ impl<'c> Supervisor<'c> {
         None
     }
 
+    /// Answer a bumped `check_nonce` and apply `resource_target` requests.
+    fn answer_requests(&mut self, st: &State) -> Option<Outcome> {
+        if st.check_nonce > self.last_check_nonce {
+            self.last_check_nonce = st.check_nonce;
+            if let Some(outcome) = self.answer_check_request(st.check_nonce) {
+                return Some(outcome);
+            }
+        }
+        if st.resource_target.is_empty() {
+            return None;
+        }
+        self.apply_resource_targets(&st.resource_target)
+    }
+
     /// Is the ~1s `state.json` poll due?
     fn state_poll_due(&self) -> bool {
         self.last_state_poll
@@ -1766,13 +1873,112 @@ impl<'c> Supervisor<'c> {
     /// answer it: `checked_nonce` tells the app this check is finished, and
     /// `check_error` whether it failed. Written last, so `available` is already
     /// current when the app sees the answer.
-    fn answer_check_request(&mut self, nonce: u64) {
+    /// Resources are checked too; their errors join the app's in `check_error`.
+    fn answer_check_request(&mut self, nonce: u64) -> Option<Outcome> {
         tracing::info!(nonce, "update check requested via state.json");
-        let error = self.run_update_check(true).err();
+        let mut errors: Vec<String> = self.run_update_check(true).err().into_iter().collect();
+        let (resource_errors, applied) = self.run_resource_checks(true);
+        errors.extend(resource_errors);
+        let error = (!errors.is_empty()).then(|| errors.join("; "));
         self.mutate_state(|st| {
             st.checked_nonce = nonce;
             st.check_error = error;
         });
+        self.notify_resources(&applied)
+    }
+
+    /// Run the `[[resource]]` policy check when due, then schedule the next one.
+    fn maybe_check_resources(&mut self) -> Option<Outcome> {
+        if self
+            .next_resource_check_at
+            .is_none_or(|at| Instant::now() < at)
+        {
+            return None;
+        }
+        let (_, applied) = self.run_resource_checks(false);
+        self.next_resource_check_at = (self.cfg.update.check_interval != 0)
+            .then(|| Instant::now() + Duration::from_secs(self.cfg.update.check_interval));
+        self.notify_resources(&applied)
+    }
+
+    /// Check every resource against its policy (a `requested` check also
+    /// reports under `off`): `auto` activates a newer version, `check` records
+    /// it as `available`. A resource with no active version is installed.
+    /// Returns the errors and the resources that changed.
+    fn run_resource_checks(&self, requested: bool) -> (Vec<String>, Vec<&'c Resource>) {
+        let cfg = self.cfg;
+        let mut errors = Vec::new();
+        let mut applied = Vec::new();
+        for res in &cfg.resources {
+            if !requested && matches!(res.policy, Policy::Off) {
+                continue;
+            }
+            match check_resource(cfg, res, requested) {
+                Ok(true) => applied.push(res),
+                Ok(false) => {}
+                Err(e) => {
+                    tracing::warn!(resource = res.name, error = %e, "resource check failed");
+                    resource::record(cfg, &res.name, |r| r.error = Some(e.to_string()));
+                    errors.push(format!("resource {}: {e}", res.name));
+                }
+            }
+        }
+        (errors, applied)
+    }
+
+    /// Apply the app's `resource_target` requests, then drop the ones handled.
+    fn apply_resource_targets(
+        &mut self,
+        targets: &std::collections::BTreeMap<String, String>,
+    ) -> Option<Outcome> {
+        let cfg = self.cfg;
+        let mut applied = Vec::new();
+        for (name, version) in targets {
+            let result = resource::find(cfg, name).and_then(|res| {
+                if let resource::Applied::Updated { to, .. } =
+                    resource::update(cfg, res, Some(version))?
+                {
+                    tracing::info!(resource = name, version = to, "resource applied");
+                    applied.push(res);
+                }
+                Ok(())
+            });
+            if let Err(e) = result {
+                tracing::warn!(resource = name, version, error = %e, "resource request failed");
+                resource::record(cfg, name, |r| r.error = Some(e.to_string()));
+            }
+        }
+        self.mutate_state(|st| {
+            st.resource_target
+                .retain(|name, version| targets.get(name) != Some(version));
+        });
+        self.notify_resources(&applied)
+    }
+
+    /// Tell the running app that `applied` resources changed: a restart if any
+    /// asks for one, else `SIGHUP` if any asks for a signal.
+    fn notify_resources(&mut self, applied: &[&Resource]) -> Option<Outcome> {
+        let child = self.child?;
+        if applied.iter().any(|r| r.notify == Notify::Restart) {
+            tracing::info!("resource updated; restarting the app");
+            if matches!(self.phase, Phase::Prepare(_)) {
+                self.abandon_prepare();
+            }
+            return self.graceful_restart();
+        }
+        if applied.iter().any(|r| r.notify == Notify::Signal) {
+            #[cfg(unix)]
+            {
+                tracing::info!("resource updated; sending SIGHUP to the app");
+                let _ = signal_child(child, Signal::SIGHUP);
+            }
+            #[cfg(not(unix))]
+            tracing::warn!(
+                pid = ?child,
+                "resource notify = \"signal\" is not supported on this platform"
+            );
+        }
+        None
     }
 
     /// Is a policy update check due?
@@ -2919,6 +3125,31 @@ mod tests {
             ),
             Some("[runtime] download")
         );
+        let with_resource = |manifest: &str| {
+            edited(
+                "bun.zip\"\n",
+                &format!(
+                    "bun.zip\"\n[[resource]]\nname = \"cfg\"\nmanifest = \"{manifest}\"\n\
+                     asset = \"c.json\"\n"
+                ),
+            )
+        };
+        let res = with_resource("https://r.example/cfg.json");
+        assert_eq!(
+            trust_anchor_changed(&initial, &res),
+            Some("[[resource]] source")
+        );
+        assert_eq!(
+            trust_anchor_changed(&res, &with_resource("https://evil.example/cfg.json")),
+            Some("[[resource]] source")
+        );
+        assert_eq!(trust_anchor_changed(&res, &res), None);
+    }
+
+    #[test]
+    fn resource_env_name_upper_cases_and_maps_separators() {
+        assert_eq!(resource_env_name("config"), "LODE_RESOURCE_CONFIG");
+        assert_eq!(resource_env_name("geo-db.v2"), "LODE_RESOURCE_GEO_DB_V2");
     }
 
     // --- C2: policy decision (off / check / auto + pin) ---
@@ -3428,6 +3659,7 @@ mod tests {
                 restart: None,
             },
             env: BTreeMap::new(),
+            resources: Vec::new(),
             config_path: None,
         }
     }

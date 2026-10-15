@@ -63,6 +63,23 @@ pub struct HistoryEntry {
     pub result: HistoryResult,
 }
 
+/// lode's view of one `[[resource]]` in `state.json`.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ResourceState {
+    /// Active version.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub current: Option<String>,
+    /// Newer version found by the last check.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub available: Option<String>,
+    /// Directory holding the active version.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub path: Option<String>,
+    /// Why the last check or update failed; absent when it succeeded.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
 /// Contents of `$LODE_DIR/state.json`. Fields default to empty so a partial file
 /// (or one written only by the app) still deserialises.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -110,6 +127,9 @@ pub struct State {
     /// Why the last requested check failed; absent when it succeeded.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub check_error: Option<String>,
+    /// Per-resource status, by `[[resource]]` name.
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub resources: std::collections::BTreeMap<String, ResourceState>,
 
     // --- app-owned (requests) ---
     /// Version the app asks lode to switch to.
@@ -122,6 +142,10 @@ pub struct State {
     /// lode answers through [`Self::checked_nonce`].
     #[serde(default)]
     pub check_nonce: u64,
+    /// Resource versions the app asks lode to switch to, by name (`"latest"` for
+    /// the channel latest). lode removes each entry once handled.
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub resource_target: std::collections::BTreeMap<String, String>,
     /// App-owned: set `true` to ask lode not to (re)start the process (maintenance);
     /// lode reports `status = held` and waits until it is cleared (design §7).
     #[serde(default)]

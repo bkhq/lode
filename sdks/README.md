@@ -63,6 +63,8 @@ Your **app** keeps its own directory convention (works with or without lode): se
 | `requestCheck()` | bump `check_nonce` → check for a newer version now, whatever the policy; returns the nonce. Done when `checkedNonce` reaches it: `checkError` if it failed, else `available` (absent = up to date) |
 | `requestUpdate(version)` | set `target` (a version or `"latest"`) → up/down-grade |
 | `rollback(version?)` | set `target` to `version`, else recorded `last_good` |
+| `resource(name)` | lode's state for `[[resource]]` `name`: `current` / `available` / `path` / `error` |
+| `applyResource(name, version)` | set `resource_target[name]` (a version, `"latest"`, or an older one to roll back) → lode activates it and notifies per `notify` |
 | `hold()` / `release()` | set/clear the `hold` flag — ask lode NOT to (re)start your process (planned maintenance); lode reports `status="held"` and waits |
 | `markReady()` | `ready = LODE_INSTANCE` — "I can serve now" (bare token) |
 | `markServing()` / `ackPrepared()` | phased handshake: report serving `-0` / ack cut-over `-2` |
@@ -70,7 +72,7 @@ Your **app** keeps its own directory convention (works with or without lode): se
 | `watch(...)` | poll loop with a change callback for every notification (config / version / status / available / error / prepare) |
 
 Plus free helpers: `isSupervised()`, `activeVersion()`, `instanceId()`,
-`readiness()`, the directory helpers `dataDir()` (resolves `DATA_DIR` > `LODE_DIR` >
+`readiness()`, `resourcePath(name)` (`LODE_RESOURCE_<NAME>`), the directory helpers `dataDir()` (resolves `DATA_DIR` > `LODE_DIR` >
 `ROOT_DIR`) / `rootDir()` / `lodeDir()` / `workdir()`, read-only config access
 `configPath()` / `readConfig()` (raw `lode.toml` text), and a graceful-stop handler
 (`onTerminate` in TS/Go; `install_term_handler()` + `terminating()` in Rust).
@@ -101,6 +103,7 @@ change events via `watch`). Every mutable field has a change callback:**
 | apply a pending config edit | `restart_nonce` | `reloadConfig()` |
 | check for an update now | `check_nonce` | `requestCheck()` |
 | upgrade / downgrade | `target` | `requestUpdate(v)` |
+| pull / roll back a resource | `resource_target` | `applyResource(name, v)` |
 | roll back to last good | `target` | `rollback()` |
 | hold off a (re)start for maintenance | `hold` | `hold()` / `release()` |
 | readiness / cut-over ack | `ready` | `markReady()` / `markServing()` / `ackPrepared()` |

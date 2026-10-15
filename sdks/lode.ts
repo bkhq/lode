@@ -19,6 +19,18 @@ export interface HistoryEntry {
   result: "good" | "bad";
 }
 
+/** lode's view of one [[resource]] (state.json `resources.<name>`). */
+export interface ResourceState {
+  /** The active version. */
+  current?: string;
+  /** A newer version found by a check (policy = "check"). */
+  available?: string;
+  /** Where the active version lives (also in LODE_RESOURCE_<NAME>). */
+  path?: string;
+  /** Why the last check or apply failed. */
+  error?: string;
+}
+
 /** Parsed state.json. lode writes the top group; the app writes target/restartNonce/checkNonce/ready. */
 export interface State {
   current?: string;
@@ -40,11 +52,16 @@ export interface State {
   checkNonce: number;
   hold: boolean;
   ready?: string;
+  /** Per-resource state, keyed by [[resource]] name. */
+  resources: Record<string, ResourceState>;
+  /** Pending resource requests (see {@link Lode.applyResource}). */
+  resourceTarget: Record<string, string>;
 }
 
 function toState(raw: Record<string, unknown>): State {
   const num = (v: unknown): number | undefined => (typeof v === "number" ? v : undefined);
   const str = (v: unknown): string | undefined => (typeof v === "string" ? v : undefined);
+  const obj = (v: unknown): Record<string, unknown> => (v && typeof v === "object" ? { ...(v as Record<string, unknown>) } : {});
   return {
     current: str(raw.current),
     lastGood: str(raw.last_good),
@@ -63,6 +80,8 @@ function toState(raw: Record<string, unknown>): State {
     checkNonce: num(raw.check_nonce) ?? 0,
     hold: raw.hold === true,
     ready: str(raw.ready),
+    resources: obj(raw.resources) as Record<string, ResourceState>,
+    resourceTarget: obj(raw.resource_target) as Record<string, string>,
   };
 }
 
@@ -250,6 +269,23 @@ export class Lode {
     });
   }
 
+  /** The state of [[resource]] `name` (undefined until lode has recorded it). */
+  resource(name: string): ResourceState | undefined {
+    return this.read()?.resources[name];
+  }
+
+  /** Ask lode to activate `version` (default "latest") of [[resource]] `name`;
+   *  an older version rolls it back. lode acts ~1s later, then records the
+   *  result in `resource(name)` and notifies per the resource's `notify`. */
+  applyResource(name: string, version = "latest"): void {
+    if (!name || !version) throw new Error("lode.applyResource: empty name or version");
+    this.update((raw) => {
+      const targets = raw.resource_target && typeof raw.resource_target === "object" ? (raw.resource_target as Record<string, unknown>) : {};
+      targets[name] = version;
+      raw.resource_target = targets;
+    });
+  }
+
   /** Ask lode NOT to (re)start your process (maintenance) → status "held"; a
    *  running child is left alone. Clear with {@link release}. */
   hold(): void {
@@ -407,6 +443,11 @@ export function readConfig(): string | undefined {
 }
 
 /** This launch's instance id ({pid}-{nanoid}), or "". */
+/** The active path of [[resource]] `name` (LODE_RESOURCE_<NAME>), when installed. */
+export function resourcePath(name: string): string | undefined {
+  return env[`LODE_RESOURCE_${name.toUpperCase().replace(/[-.]/g, "_")}`];
+}
+
 export function instanceId(): string {
   return env.LODE_INSTANCE ?? "";
 }

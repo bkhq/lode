@@ -72,7 +72,7 @@ restart      = "on-failure" # on-failure(默认,keep-alive:重试后暂停)| alw
 **lode 注入的环境变量:** `LODE_ACTIVE_VERSION`(当前版本)、`LODE_DIR`(lode 自己的目录 ——
 `state.json` 在 `$LODE_DIR/state.json`)、`LODE_WORKDIR`(app 的运行目录,即其 cwd)、
 `LODE_CONFIG`(lode 加载的 `lode.toml` 路径 —— 只读它即可看到 lode 的配置)、
-`LODE_INSTANCE`(本次启动唯一号 —— 写入 `state.ready`)、`LODE_READINESS`(`none`|`state`)。
+`LODE_INSTANCE`(本次启动唯一号 —— 写入 `state.ready`)、`LODE_READINESS`(`none`|`state`),以及每个已安装 `[[resource]]` 的 `LODE_RESOURCE_<NAME>`(其激活路径)。
 宿主环境(如 `PORT`)原样透传;内部 `LODE_*` 已剥离。operator 还可用 `[env]` 表追加变量——
 它们是**默认值**:同名的宿主 env(如部署时 `-e PORT`)会覆盖它们,而 lode 注入的变量始终最高。
 `LODE_DIR`/`LODE_WORKDIR` 与 app 自有的 `ROOT_DIR`/`DATA_DIR` 的关系见[数据目录与持久化](#数据目录与持久化)。
@@ -87,11 +87,13 @@ restart      = "on-failure" # on-failure(默认,keep-alive:重试后暂停)| alw
   "pid": 12345, "last_check": "…", "last_error": null,
   "config_generation": 0,     // 运行中编辑 lode.toml 时 lode 递增它 => 重启才生效
   "checked_nonce": 0,         // lode 最近应答的 check_nonce;该次检查失败的原因在 "check_error"
+  "resources": {},            // 每个 [[resource]]:{ current, available, path, error }
   // 应用写(请求 / 就绪):
   "target": null,             // 某版本或 "latest" => 请求升/降级
   "restart_nonce": 0,          // 递增 => 重启当前版本
   "check_nonce": 0,           // 递增 => 立即检查是否有新版本
   "hold": false,              // 置 true => lode 不再(重新)启动进程(维护)=> 状态 "held"
+  "resource_target": {},      // { "<name>": 版本 | "latest" } => 激活该资源版本
   "ready": null               // 写成 LODE_INSTANCE => "我能服务了"
 }
 ```
@@ -109,6 +111,12 @@ restart      = "on-failure" # on-failure(默认,keep-alive:重试后暂停)| alw
 - **请求更新/重启(可选):** 原子改写 `state.json` —— 设 `target`(版本或 `"latest"`)或递增 `restart_nonce`。lode 轮询文件 mtime(~1s)并执行;文件本身即通知。
 - **按需检查更新(可选):** 递增 `check_nonce`,lode 立即检查更新源,不受 `[update].policy` 和 `pin` 限制 —— "检查更新"按钮就用它。`checked_nonce` 达到你写入的值即表示检查结束:失败时 `check_error` 是原因,否则 `available` 是新版本(已是最新则不存在)。检查只报告结果;要升级就写 `target`。`policy = "auto"`(且没有 `pin`)时 lode 会像定时检查那样自行应用。SDK:`requestCheck()`。
 - **阻止(重新)启动(可选):** 设 `hold = true` 告诉 lode **不要**(重新)启动进程 —— 用于必须在 app 起来之前完成的计划维护(如需要 CLI 介入的 DB 迁移)。lode 报告 `status = "held"` 并等待 —— 开机时、子进程退出后、以及 `restart_nonce`/`target` 请求期间都不启动 —— 直到你设 `hold = false`。hold 只挡"启动",不杀正在运行的子进程:想为维护停掉 app,自己先 `exit(0)`(lode 随即转入 held 而非重拉)。运维也可同样方式驱动(`hold` 就是 `state.json` 的一个字段)。
+- **资源(可选):** 每个 `[[resource]]`(配置文件、数据、静态资源 ——
+  [architecture](architecture.zh-CN.md) §5)在你启动前已安装好,从 `$LODE_RESOURCE_<NAME>`
+  读取。lode 按资源的 `policy` 更新它,再按 `notify` 通知你(`SIGHUP`、重启,或不通知 ——
+  监听 `state.json` 的 `resources.<name>`)。要立即拉取,把 `resource_target.<name>` 设为某个
+  版本、`"latest"`,或更旧版本以回滚;`check_nonce` 也会检查资源。
+  SDK:`resource(name)`、`applyResource(name, version)`、`resourcePath(name)`。
 - **运行中应用 `lode.toml`/`[env]` 改动(可选):** lode **绝不**因配置编辑自动重启(运行中的 app 不被打扰)。`lode.toml` 被编辑时,lode **递增 `config_generation`** 通知你;你自定时机递增 `restart_nonce` 来应用 —— 那次重启会**重读 `lode.toml`**(新 `[env]`/配置生效)。想响应运维改动就监听 `config_generation`。(宿主进程 env —— `-e`/k8s —— 仍需重启 lode 自身。)
 
 ### 并发写入 —— `state.json.lock` 契约
@@ -281,6 +289,23 @@ lode-cli manifest-sign --into manifest.json --key ci.key --delegation delegation
 - 在 `not_after` 之前续签 delegation(例如 30 天有效、每周续签);delegation 过期的 manifest 无法安装。
 - 吊销泄露的子密钥:`lode-cli revoke --key root.key --list revocations.json --add <sub_key_id>`(也可用仍有效的子密钥加 `--delegation` 签名),发布该文件,并让运维方把 `[trust].revocation_url` 指向它。列表是可选的;没有它时,泄露的子密钥在 delegation 过期前仍可用。
 - lode 0.0.3 及更早版本会拒绝子密钥签名;先升级(`lode-cli status` 显示 `features: delegation, revocation`)。
+
+### 资源(`[[resource]]`)
+
+资源是一份独立的原生 `lode/v1` manifest,以身份 **`<app>/<name>`** 发布 —— 即 manifest
+的 `name`、每个签名绑定的 `--app`,以及其 delegation 的 `--app`。用与 app 相同的密钥签名:
+
+```sh
+lode-cli manifest dist/settings.tar.gz --app myapp/config --version 3 \
+  --url https://releases.example.com/myapp/config/3/settings.tar.gz \
+  --key ci.key --delegation config-delegation.json --into config.json
+lode-cli manifest-sign --into config.json --key ci.key --delegation config-delegation.json
+```
+
+运维方在 `lode.toml` 里添加(`[[resource]]`,含 `name`、`manifest`、`asset`;见
+[`lode.example.toml`](lode.example.toml))。资源 asset 不带 `run`/`exec`。delegation 只对应
+一个身份,所以 `myapp` 的子密钥不能为 `myapp/config` 签名(每个身份各签一份)。版本号格式
+不限;`auto` 只应用可证明的 semver 升级。
 
 ### 清单
 

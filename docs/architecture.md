@@ -162,6 +162,51 @@ target ≠ current and available (stop-start mode):
 - **Garbage collection**: clean up interrupted `downloads/<v>/*.part` and `versions/<v>.tmp` half-finished artifacts left by interruptions (the verified per-version download cache is kept); per `keep_versions`, retain current + last_good + the most recent N versions, deleting the rest of the version directories **and their `downloads/<v>/` caches**; `$LODE_DIR/runtime/` likewise keeps only the cache key in use.
 - **Verify on-disk consistency**: if the version the `current` symlink points to is missing/corrupted → fall back to last_good or re-bootstrap.
 
+### Resources (`[[resource]]`)
+
+Besides the app, lode distributes any number of separately published bundles —
+config files, data sets, models, static assets — under the same trust model. Each
+`[[resource]]` names its own native `lode/v1` manifest and asset:
+
+```toml
+[[resource]]
+name     = "config"                                         # letters, digits, . _ -; unique
+manifest = "https://releases.example.com/myapp/config.json"
+asset    = "settings.tar.gz"
+channel  = "stable"   # default: [update].channel
+policy   = "auto"     # off | check | auto; default: [update].policy
+notify   = "signal"   # none (default) | signal (SIGHUP) | restart
+required = true       # default false; true = lode will not start the app without it
+```
+
+- **Identity.** A resource is published as `<app>/<name>` (e.g. `myapp/config`): its
+  manifest `name`, the `app` its artifact signatures bind (§6) and the name its
+  delegation carries. App ids cannot contain `/`, so an app signature never verifies
+  as a resource signature or the reverse. `[trust]` (keys, `require_signature`,
+  `require_manifest`, revocation) applies unchanged. A resource asset must not
+  publish `run`/`exec`.
+- **Install.** The app's pipeline (download → sha256 + signature → land) into
+  `$LODE_DIR/resources/<name>/`, with its own `versions/`, `downloads/` and `current`
+  link, pruned by `keep_versions`. Formats as for the app.
+- **Boot.** Before the first spawn lode installs every resource with no active
+  version. A `required` one that fails stops lode; an optional one is logged,
+  recorded in `state.json` and retried by the next check.
+- **To the app.** The child gets `LODE_RESOURCE_<NAME>` (upper-cased, `-`/`.` → `_`)
+  = the active path: `resources/<name>/current` on Unix (stable across updates), the
+  version directory on Windows. `state.json` `resources.<name>` records `current`,
+  `available`, `path` and `error`.
+- **Updates.** Checked every `[update].check_interval` per the resource's `policy`
+  (`auto` activates a newer version, `check` records `available`), and on every
+  `check_nonce` (its `check_error` includes resource errors). The app requests a
+  version — `"latest"`, or an older one to roll back — in `resource_target.<name>`;
+  `lode-cli pull` does the same from outside. App and resource versions are
+  independent.
+- **Notify.** After activating a resource, lode tells a running app per `notify`:
+  nothing (read `state.json`), `SIGHUP` to its process group (Unix only), or a
+  graceful restart.
+- **Reload.** The `[[resource]]` sources (`name`, `manifest`) are pinned like the
+  `[update]` source; adding or repointing one needs a lode restart.
+
 ---
 
 ## 6. Verification and trust: file integrity + publisher identity
@@ -324,16 +369,18 @@ All communication goes through **`state.json`** (bidirectional, each side writin
   "history": [ { "version": "1.4.2", "at": "2026-06-04T21:00:00Z", "result": "good" } ],
   "config_generation": 0,
   "checked_nonce": 0,
+  "resources": { "config": { "current": "3", "path": "/data/resources/config/current" } },
 
   "target": null,
   "restart_nonce": 0,
   "check_nonce": 0,
   "hold": false,
+  "resource_target": {},
 
   "ready": "12345-k3x9q2-0"
 }
 ```
-The fields owned by lode vs. the fields owned by the app (`target`/`restart_nonce`/`check_nonce`/`hold`) do not overlap; `ready` is co-owned (§8); `status` ∈ `starting|running|held|updating|rolling-back|stopping|stopped|error`; `result` ∈ `good|bad`.
+The fields owned by lode vs. the fields owned by the app (`target`/`restart_nonce`/`check_nonce`/`hold`/`resource_target`) do not overlap; `ready` is co-owned (§8); `status` ∈ `starting|running|held|updating|rolling-back|stopping|stopped|error`; `result` ∈ `good|bad`.
 
 ---
 
@@ -601,6 +648,7 @@ lode-cli management (writes state.json, communicates with the running service in
   rollback     set target in state.json to last_good (or --version <v>)
   restart      increment restart_nonce in state.json, having the service restart the child process
   versions     list the locally installed versions
+  pull         fetch, verify and activate [[resource]] bundles (all, or --resource <name>; --version <v> pins or rolls back); a running service applies it via resource_target
   seed         dev/testing: install a LOCAL executable/archive as a version (no manifest, no download, no signature check) and activate it, so bare `lode` runs it fully offline
   self-update  replace this lode binary with the newest lode release, verified against the release keys built into the binary
 
@@ -648,6 +696,7 @@ $LODE_DIR/
   versions/<ver>/            # each version (raw/gz lands a single file / tar.gz/zip unpacked / binary chmod)
     .lode.json             #   that version's metadata (run/exec/format etc.) for offline running
   current -> versions/<ver>  # the atomically switched current symlink
+  resources/<name>/          # each [[resource]]: its own versions/, downloads/ and current (same layout)
 # Note: manifest.json is remote, not stored locally.
 ```
 

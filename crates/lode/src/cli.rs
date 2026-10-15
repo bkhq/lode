@@ -389,6 +389,17 @@ pub(crate) enum ToolCommand {
     Restart,
     /// List locally installed versions.
     Versions,
+    /// Fetch, verify and activate `[[resource]]` bundles (all, or `--resource`);
+    /// a running instance applies the request and notifies the app.
+    Pull {
+        /// Pull only this resource.
+        #[arg(long = "resource")]
+        resource: Option<String>,
+        /// Activate this version instead of the channel latest (needs
+        /// `--resource`); an older version rolls the resource back.
+        #[arg(long = "version")]
+        version: Option<String>,
+    },
     /// Update THIS lode binary: download the newest lode release (or `--version`),
     /// verify it against the release keys built into the binary, and replace the
     /// running executable in place. Restart lode to run the new version. Never

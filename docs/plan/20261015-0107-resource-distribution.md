@@ -1,8 +1,8 @@
 # 20261015-0107-resource-distribution Distribute arbitrary resources
 
-- **status**: draft
+- **status**: completed
 - **createdAt**: 2026-10-15 01:07
-- **approvedAt**: (pending)
+- **approvedAt**: 2026-10-15 01:20
 - **relatedTask**: 20261015-0106-resource-distribution
 
 ## Context
@@ -185,3 +185,18 @@ Decisions (2026-10-15):
    version (`applyResource`).
 2. No app/resource compatibility constraint.
 3. `lode-cli pull` is in the first round.
+
+Implementation deviations (2026-10-15):
+
+1. No `lode.resource.v1` message: the identity `<app>/<name>` is used as the `app`
+   field of the existing `lode.artifact.v2` message and as the manifest `name`.
+   App ids may not contain `/`, so app and resource signatures cannot be swapped,
+   and delegations scope to an identity unchanged.
+2. `required` defaults to `false`.
+3. The per-resource state field is `error` (not `last_error`).
+4. No env/CLI override for `[[resource]]`; resources come from `lode.toml` only.
+5. `lode-cli pull [--resource] [--version]` replaces `versions --resource`,
+   `update --resource` and `rollback --resource`; an older `--version` rolls back.
+6. Trust capabilities are reported by `status` only.
+7. `[[resource]]` sources (`name`, `manifest`) are pinned across config reloads,
+   like the `[update]` source.

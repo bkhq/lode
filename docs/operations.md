@@ -97,6 +97,7 @@ running instance.
 | `lode-cli update [--version <v>]` | Download, verify and install the channel's latest version, or `<v>`. |
 | `lode-cli rollback [--version <v>]` | Request a switch to the last good version, or `<v>`. |
 | `lode-cli restart` | Request a restart of the app on its current version. |
+| `lode-cli pull [--resource <name>] [--version <v>]` | Fetch, verify and activate `[[resource]]` bundles: all, or `<name>` at the channel latest or `<v>` (an older `<v>` rolls back). A running instance applies it and notifies the app. |
 | `lode-cli self-update` | Replace the lode binary (see §1). |
 | `lode-cli init [path]` | Write a starter `lode.toml` to `path`, or print it. |
 | `lode-cli seed <file>` | Install a local file as a version, for development. See [local testing](dev-local-testing.md). |

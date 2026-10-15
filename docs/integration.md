@@ -79,7 +79,8 @@ What *your app* implements. Any language — read/write one JSON file and handle
 (lode's dir — `state.json` lives at `$LODE_DIR/state.json`), `LODE_WORKDIR` (the app's
 run dir, i.e. its cwd), `LODE_CONFIG` (path to the `lode.toml` lode loaded — read it
 read-only to see lode's config), `LODE_INSTANCE` (unique id for this launch — write it
-to `state.ready`), `LODE_READINESS` (`none`|`state`). The host env (e.g. `PORT`) passes
+to `state.ready`), `LODE_READINESS` (`none`|`state`), and `LODE_RESOURCE_<NAME>` per
+installed `[[resource]]` (its active path). The host env (e.g. `PORT`) passes
 through; internal `LODE_*` are stripped. The operator can add more via the `[env]`
 table — those are **defaults**: an inherited host env var of the same name (e.g. a
 per-deploy `-e PORT`) wins over them, and lode's injected vars always win over everything.
@@ -96,11 +97,13 @@ See [Data directories & persistence](#data-directories--persistence) for the
   "pid": 12345, "last_check": "…", "last_error": null,
   "config_generation": 0,     // lode bumps this on a lode.toml edit while you run => restart to apply
   "checked_nonce": 0,         // the check_nonce lode last answered; "check_error" says why that check failed
+  "resources": {},            // per [[resource]]: { current, available, path, error }
   // app writes (requests / readiness):
   "target": null,             // a version or "latest" => request up/down-grade
   "restart_nonce": 0,          // increment => restart the current version
   "check_nonce": 0,           // increment => check for a newer version now
   "hold": false,              // set true => lode will NOT (re)start the process (maintenance) => status "held"
+  "resource_target": {},      // { "<name>": version | "latest" } => activate that resource version
   "ready": null               // set to LODE_INSTANCE => "I can serve now"
 }
 ```
@@ -118,8 +121,15 @@ Implement these (all but `SIGTERM` are optional, but recommended):
 - **Request an update/restart (optional):** atomically patch `state.json` — set `target` (a version or `"latest"`) or bump `restart_nonce`. lode polls the file's mtime (~1s) and acts; the file *is* the notification.
 - **Check for an update on demand (optional):** bump `check_nonce` to make lode check the source now, whatever `[update].policy` or `pin` say — the way to back a "check for updates" button. The check is finished once `checked_nonce` reaches the value you wrote: `check_error` then holds the reason if it failed, otherwise `available` is the newer version (absent when you are up to date). The check only reports; apply the version by setting `target`. Under `policy = "auto"` (without a `pin`) lode applies it by itself, as its periodic check would. SDK: `requestCheck()`.
 - **Hold off a (re)start (optional):** set `hold = true` to tell lode **not** to (re)start the process — for planned maintenance that must finish before the app comes up (e.g. a DB migration needing CLI intervention). lode reports `status = "held"` and waits — at boot, after the child exits, and across `restart_nonce`/`target` requests — until you set `hold = false`. A hold gates a *start*, not a running child: lode never kills the current process, so to take the app down for maintenance set `hold = true` then `exit(0)` yourself (lode then holds instead of respawning). An operator can drive this the same way (`hold` is just a `state.json` field).
+- **Resources (optional):** each `[[resource]]` (config files, data, assets —
+  [architecture](architecture.md) §5) is installed before you start; read it from
+  `$LODE_RESOURCE_<NAME>`. lode updates it per the resource's `policy`, then notifies
+  you per its `notify` (`SIGHUP`, a restart, or nothing — watch `resources.<name>` in
+  `state.json`). To pull one now, set `resource_target.<name>` to a version,
+  `"latest"`, or an older version to roll back; `check_nonce` checks resources too.
+  SDK: `resource(name)`, `applyResource(name, version)`, `resourcePath(name)`.
 - **Read lode's config (optional, read-only):** `$LODE_CONFIG` is the path to the `lode.toml` lode loaded — read it to inspect how lode is configured. It is the **operator's** file: never write it (the app's write channel is `state.json`). SDK: `configPath()` / `readConfig()` (raw text; parse with your own TOML lib for fields).
-- **Apply a `lode.toml`/`[env]` change while running (optional):** lode **never auto-restarts** on a config edit (a running app is never disturbed). When `lode.toml` is edited, lode **bumps `config_generation`** to notify you; apply the change at your own pace by bumping `restart_nonce` — that relaunch **re-reads `lode.toml`** (new `[env]`/config takes effect). Watch `config_generation` if you want to react to operator edits. (Host-process env — `-e`/k8s — still requires restarting lode itself.) `[trust]`, the `[update]` source, the `[http]` credential scope and the `[runtime]` download are **pinned for the life of the lode process**: a reload never changes them (the edit is refused and logged), so a restart request from the app can never weaken verification — those edits need lode itself restarted.
+- **Apply a `lode.toml`/`[env]` change while running (optional):** lode **never auto-restarts** on a config edit (a running app is never disturbed). When `lode.toml` is edited, lode **bumps `config_generation`** to notify you; apply the change at your own pace by bumping `restart_nonce` — that relaunch **re-reads `lode.toml`** (new `[env]`/config takes effect). Watch `config_generation` if you want to react to operator edits. (Host-process env — `-e`/k8s — still requires restarting lode itself.) `[trust]`, the `[update]` source, the `[[resource]]` sources, the `[http]` credential scope and the `[runtime]` download are **pinned for the life of the lode process**: a reload never changes them (the edit is refused and logged), so a restart request from the app can never weaken verification — those edits need lode itself restarted.
 
 ### Concurrent writes — the `state.json.lock` contract
 
@@ -324,6 +334,25 @@ lode-cli manifest-sign --into manifest.json --key ci.key --delegation delegation
   without it a leaked sub-key stays usable until its delegation expires.
 - Hosts on lode 0.0.3 or older reject sub-key signatures; upgrade them first
   (`lode-cli status` lists `features: delegation, revocation`).
+
+### Resources (`[[resource]]`)
+
+A resource is a native `lode/v1` manifest of its own, published under the identity
+**`<app>/<name>`** — the manifest `name`, the `--app` every signature binds, and the
+`--app` of its delegation. Sign it with the same keys as the app:
+
+```sh
+lode-cli manifest dist/settings.tar.gz --app myapp/config --version 3 \
+  --url https://releases.example.com/myapp/config/3/settings.tar.gz \
+  --key ci.key --delegation config-delegation.json --into config.json
+lode-cli manifest-sign --into config.json --key ci.key --delegation config-delegation.json
+```
+
+Operators add it to `lode.toml` (`[[resource]]` with `name`, `manifest`, `asset`; see
+[`lode.example.toml`](lode.example.toml)). Resource assets carry no `run`/`exec`.
+Delegations name one identity, so a sub-key for `myapp` cannot sign `myapp/config`
+(issue one per identity). Version strings are free-form; `auto` only applies a
+provable semver upgrade.
 
 ### Checklist
 

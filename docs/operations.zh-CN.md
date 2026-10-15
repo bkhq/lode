@@ -90,6 +90,7 @@ lode-cli self-update --version v0.0.1    # 指定 tag;降级也用它
 | `lode-cli update [--version <v>]` | 下载、校验并安装 channel 的最新版本,或指定的 `<v>`。 |
 | `lode-cli rollback [--version <v>]` | 请求切换到上一个良好版本,或指定的 `<v>`。 |
 | `lode-cli restart` | 请求在当前版本上重启 app。 |
+| `lode-cli pull [--resource <name>] [--version <v>]` | 拉取、校验并激活 `[[resource]]` 资源包:全部,或 `<name>` 的渠道最新版或 `<v>`(更旧的 `<v>` 即回滚)。实例运行时由其应用并通知 app。 |
 | `lode-cli self-update` | 替换 lode 二进制(见 §1)。 |
 | `lode-cli init [path]` | 把起始 `lode.toml` 写到 `path`,不给则打印。 |
 | `lode-cli seed <file>` | 把本地文件安装成一个版本,用于开发。见[本地测试](dev-local-testing.zh-CN.md)。 |

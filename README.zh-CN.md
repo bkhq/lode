@@ -92,9 +92,9 @@ lode 是 **multi-call 二进制**。以 `lode` 调用是加载器,**没有任何
 |---|---|
 | `lode` | 启动并监督应用(`[command].run`);按策略自动更新 |
 | `lode <args…>` / `lode -- <args…>` | 直通:执行 `[command].exec` + `<args>`(如 `lode run db:init`);参数与 lode 旗标同名时用 `--` |
-| `lode-cli status` / `update` / `rollback` / `restart` / `versions` / `seed` | 管理运行中的实例(经 `state.json`);`seed` 离线安装本地版本,用于开发/测试 |
+| `lode-cli status` / `update` / `rollback` / `restart` / `versions` / `pull` / `seed` | 管理运行中的实例(经 `state.json`);`seed` 离线安装本地版本,用于开发/测试 |
 | `lode-cli self-update` | 用最新的 lode release 替换当前这个 lode 二进制(以内置的发布公钥校验);重启 lode 后生效 |
-| `lode-cli keygen` / `sign` / `verify` / `manifest` / `manifest-sign` / `publish` / `init` | 发布方 / 运维工具 |
+| `lode-cli keygen` / `sign` / `verify` / `manifest` / `manifest-sign` / `delegate` / `revoke` / `publish` / `init` | 发布方 / 运维工具 |
 
 ## 三个文件
 
@@ -108,6 +108,7 @@ lode 是 **multi-call 二进制**。以 `lode` 调用是加载器,**没有任何
 - **回滚** —— 新版本若在 `health_grace` 内退出,回滚到上一个已知良好版本(单次触发)。
 - **重启** `[supervise].restart = off | on-failure | always` —— `on-failure`(默认,keep-alive)对失败的应用重试 `restart_max` 次后**暂停**(lode 保持存活,容器绝不陷入崩溃循环);`off` 退回镜像子进程的旧行为;lode 主动发起的更新/回滚/重启总会重新拉起。
 - **信任** —— `sha256` + `ed25519`(或 ECDSA P-256 / P-384,算法标在密钥上);设 `[trust].trusted_keys` + `require_signature = off | auto | enforce`。注意:校验默认为 `auto`(仅在配置了受信密钥时才强制)—— 生产环境请设 `require_signature = "enforce"`。根密钥可以离线:由它把签名委托给短期子密钥,并可选订阅吊销列表(`[trust].revocation_url`)。签名是发布方的事 —— 见[集成 §3](docs/integration.zh-CN.md)。
+- **资源** —— `[[resource]]` 按同一套信任模型分发配置文件、数据等资源包,以 `<app>/<name>` 发布:在 app 启动前安装,以 `LODE_RESOURCE_<NAME>` 交给 app,按各自的 `policy` 更新(通过 `SIGHUP` 或重启通知 app),也可经 `lode-cli pull` 或 SDK 按需拉取。→ [架构 §5](docs/architecture.zh-CN.md)
 - **私有源** —— `[http].headers`(支持 `${ENV}` 展开)用于 manifest 和同源资产的鉴权;其他主机只有列入 `[http].credential_hosts` 才会收到。
 - **发布** —— 把签名后的资产挂到 GitHub Releases、自托管原生 manifest,或用 `lode-cli publish` 发布到 [lode-server](https://github.com/bkhq/lode-server) registry(默认 `https://lode.bk.io/u`)。→ [集成 §3](docs/integration.zh-CN.md)
 

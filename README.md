@@ -95,9 +95,9 @@ shipped alongside it) it is the operator/publisher toolkit.
 |---|---|
 | `lode` | start & supervise the app (`[command].run`); auto-update per policy |
 | `lode <args…>` / `lode -- <args…>` | passthrough: run `[command].exec` + `<args>` (e.g. `lode run db:init`); use `--` when an arg collides with a lode flag |
-| `lode-cli status` / `update` / `rollback` / `restart` / `versions` / `seed` | manage a running instance (via `state.json`); `seed` installs a local version offline for dev/testing |
+| `lode-cli status` / `update` / `rollback` / `restart` / `versions` / `pull` / `seed` | manage a running instance (via `state.json`); `seed` installs a local version offline for dev/testing |
 | `lode-cli self-update` | replace this lode binary with the newest lode release (verified against the release key built into the binary); restart lode to run it |
-| `lode-cli keygen` / `sign` / `verify` / `manifest` / `manifest-sign` / `publish` / `init` | publisher/operator tools |
+| `lode-cli keygen` / `sign` / `verify` / `manifest` / `manifest-sign` / `delegate` / `revoke` / `publish` / `init` | publisher/operator tools |
 
 ## Three files
 
@@ -111,6 +111,7 @@ shipped alongside it) it is the operator/publisher toolkit.
 - **Rollback** — a new version that exits within `health_grace` is reverted to the last known-good (single-strike).
 - **Restart** `[supervise].restart = off | on-failure | always` — `on-failure` (default, keep-alive) retries a failing app `restart_max` times then **pauses** (lode stays alive, never crash-looping the container); `off` opts back into mirroring the child; lode-initiated update/rollback/restart always relaunch.
 - **Trust** — `sha256` + `ed25519` (or ECDSA P-256 / P-384, tagged on the key); set `[trust].trusted_keys` + `require_signature = off | auto | enforce`. Note: verification defaults to `auto` (enforced only when trusted keys are configured; without keys a manifest `run`/`exec` override is refused) — set `require_signature = "enforce"` for production (the starter config pins it). Trust settings, the update source and the runtime download are fixed for the life of the process — a config reload never changes them. The root key can stay offline: it delegates signing to short-lived sub-keys, with an optional revocation list (`[trust].revocation_url`). Signing is the publisher's job — see [Integration §3](docs/integration.md).
+- **Resources** — `[[resource]]` distributes config files, data and other bundles under the same trust model, published as `<app>/<name>`: installed before the app starts, handed to it as `LODE_RESOURCE_<NAME>`, updated per their own `policy` (the app notified by `SIGHUP` or a restart), and pulled on demand via `lode-cli pull` or the SDK. → [Architecture §5](docs/architecture.md)
 - **Private sources** — `[http].headers` (with `${ENV}` expansion) authenticate the manifest and same-origin asset fetches; other hosts receive them only when listed in `[http].credential_hosts`.
 - **Publishing** — sign and attach assets to GitHub Releases, host a native manifest, or release to a [lode-server](https://github.com/bkhq/lode-server) registry with `lode-cli publish` (default `https://lode.bk.io/u`). → [Integration §3](docs/integration.md)
 

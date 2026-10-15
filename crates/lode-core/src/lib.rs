@@ -42,6 +42,7 @@ pub mod lock;
 pub mod lock;
 mod logging;
 pub mod manifest;
+pub mod resource;
 pub mod self_update;
 pub mod state;
 #[cfg(test)]
@@ -49,8 +50,9 @@ mod stub;
 pub mod verify;
 
 pub use crate::config::{
-    Command, Config, ConfigBuilder, Global, Http, Overrides, Policy, Readiness, RequireManifest,
-    RequireSignature, RestartMode, RestartPolicy, Runtime, Signals, Supervise, Trust, Update,
+    Command, Config, ConfigBuilder, Global, Http, Notify, Overrides, Policy, Readiness,
+    RequireManifest, RequireSignature, Resource, RestartMode, RestartPolicy, Runtime, Signals,
+    Supervise, Trust, Update,
 };
 pub use crate::engine::{CheckResult, Engine};
 pub use crate::error::{Error, Result};

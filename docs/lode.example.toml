@@ -126,3 +126,16 @@ restart_mode        = "stop-start"   # stop-start | reuseport-overlap | socket-a
 [signals]
 # forward = ["SIGHUP", "SIGUSR1", "SIGUSR2", "SIGWINCH", "SIGCONT", "SIGTSTP"]  # forwarded to the child (default set)
 # restart = "SIGUSR2"   # this signal triggers a graceful restart instead of being forwarded
+
+# --- resources: separately published bundles (config, data, assets), repeatable ---
+# Published as "<app>/<name>" (manifest name + signature identity) and verified with
+# [trust]; installed under $LODE_DIR/resources/<name>, handed to the app as
+# LODE_RESOURCE_<NAME>. `lode-cli pull` / state.json resource_target fetch on demand.
+# [[resource]]
+# name     = "config"                                          # letters, digits, . _ -; unique
+# manifest = "https://releases.example.com/myapp/config.json"  # native lode/v1 manifest
+# asset    = "settings.tar.gz"
+# channel  = "stable"   # default: [update].channel
+# policy   = "auto"     # off | check | auto; default: [update].policy
+# notify   = "signal"   # none (default) | signal = SIGHUP the app | restart = restart it
+# required = true       # true = lode will not start the app without it (default false)

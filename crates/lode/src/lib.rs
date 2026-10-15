@@ -211,6 +211,11 @@ fn run_tool() -> anyhow::Result<ExitCode> {
         }
         ToolCommand::Restart => commands::restart::run(&config_cli::resolve(&cli.globals)?)?,
         ToolCommand::Versions => commands::versions::run(&config_cli::resolve(&cli.globals)?)?,
+        ToolCommand::Pull { resource, version } => commands::pull::run(
+            &config_cli::resolve(&cli.globals)?,
+            resource.as_deref(),
+            version.as_deref(),
+        )?,
         // lode's own update: a self-contained source + trust set (see the command's
         // docs) — deliberately NOT `config_cli::resolve`, which would pick up the
         // app's `lode.toml` / `LODE_*` source and trusted keys.
