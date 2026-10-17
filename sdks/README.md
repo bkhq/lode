@@ -9,7 +9,7 @@ locking rules.
 |---|---|---|
 | [`lode.ts`](lode.ts) | TypeScript / JavaScript (Bun or Node) | none (node:fs builtins; real `flock(2)` via `bun:ffi` under Bun) |
 | [`lode.go`](lode.go) | Go (+ `lock_unix.go` / `lock_windows.go` / `lock_other.go`) | none (stdlib only) |
-| [`lode.rs`](lode.rs) | Rust (Unix) | `serde` (derive) + `serde_json` |
+| [`lode.rs`](lode.rs) | Rust 1.89+ (Unix) | `serde` (derive) + `serde_json` + `signal-hook`; no `unsafe` |
 
 Drop the file for your language into your project and import it (for Go, the four
 `.go` files, or `go get github.com/bkhq/lode/sdks`). Each is a faithful port of the
@@ -206,7 +206,7 @@ go c.Watch(stop, time.Second, lode.Handlers{
 
 ### Rust
 
-`Cargo.toml`: `serde = { version = "1", features = ["derive"] }` and `serde_json = "1"`.
+`Cargo.toml`: `serde = { version = "1", features = ["derive"] }`, `serde_json = "1"` and `signal-hook = "0.4"`.
 Then `mod lode;` and:
 
 ```rust

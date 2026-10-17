@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- The Rust SDK (`sdks/lode.rs`) no longer uses `unsafe`: the `state.json.lock`
+  guard takes std's `File::lock` (the lock lode itself takes) and
+  `install_term_handler` uses `signal-hook`. Apps that vendor the file must add
+  `signal-hook = "0.4"`; it needs Rust 1.89+.
+
 ## [0.1.0] - 2026-10-15
 
 ### Added

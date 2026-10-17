@@ -2,16 +2,17 @@
 //! Wraps the state.json contract: read status, request upgrade/restart/rollback,
 //! report readiness, subscribe to lode's notifications. The SDK only *signals* lode
 //! (writes target/restart_nonce/check_nonce/ready under state.json.lock); lode does the heavy
-//! fetch→verify→install→observe. Requires serde + serde_json; Unix only.
+//! fetch→verify→install→observe. Requires serde + serde_json + signal-hook and
+//! Rust 1.89+; Unix only.
 //! Drop in as `mod lode;`. Contract: ../docs/integration.md §2.
 #![allow(dead_code)]
+#![forbid(unsafe_code)]
 
 use std::fs;
 use std::io;
-use std::os::raw::c_int;
-use std::os::unix::io::AsRawFd;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, OnceLock};
 use std::thread;
 use std::time::Duration;
 
@@ -21,17 +22,6 @@ use serde_json::{Map, Value};
 /// Boxed error, so the single file stays light yet ergonomic with `?`.
 pub type Error = Box<dyn std::error::Error + Send + Sync>;
 pub type Result<T> = std::result::Result<T, Error>;
-
-// flock(2) / signal(2): std exposes neither, so declare the two libc symbols we
-// need (mirrors tests/apps/web-rust's `signal` shim).
-extern "C" {
-    fn flock(fd: c_int, op: c_int) -> c_int;
-    fn signal(signum: c_int, handler: extern "C" fn(c_int)) -> *const ();
-}
-const LOCK_EX: c_int = 2;
-const LOCK_UN: c_int = 8;
-const SIGINT: c_int = 2;
-const SIGTERM: c_int = 15;
 
 /// Lifecycle status lode reports (kebab-case on the wire).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -448,26 +438,21 @@ pub struct Handlers<'a> {
     pub on_state: Option<Box<dyn FnMut(&State) + 'a>>,
 }
 
-/// RAII flock(2) guard for the RMW cycle; a failed open/lock degrades to lock-free.
+/// RAII exclusive lock (`flock(2)` on Unix, as lode takes it) for the RMW cycle;
+/// a failed open/lock degrades to lock-free.
 struct LockGuard(Option<fs::File>);
 
 impl LockGuard {
     fn acquire(path: &Path) -> Self {
-        match fs::OpenOptions::new().create(true).append(true).open(path) {
-            Ok(file) => {
-                // SAFETY: a valid fd from an open File; flock takes (fd, op).
-                unsafe { flock(file.as_raw_fd(), LOCK_EX) };
-                LockGuard(Some(file))
-            }
-            Err(_) => LockGuard(None),
-        }
+        let file = fs::OpenOptions::new().create(true).append(true).open(path);
+        LockGuard(file.ok().filter(|f| f.lock().is_ok()))
     }
 }
 
 impl Drop for LockGuard {
     fn drop(&mut self) {
         if let Some(file) = &self.0 {
-            unsafe { flock(file.as_raw_fd(), LOCK_UN) };
+            let _ = file.unlock();
         }
     }
 }
@@ -549,23 +534,20 @@ pub fn readiness() -> Option<String> {
         .filter(|s| !s.is_empty())
 }
 
-static TERMINATING: AtomicBool = AtomicBool::new(false);
-
-extern "C" fn on_term(_sig: c_int) {
-    // Async-signal-safe: a single atomic store.
-    TERMINATING.store(true, Ordering::SeqCst);
+fn term_flag() -> &'static Arc<AtomicBool> {
+    static FLAG: OnceLock<Arc<AtomicBool>> = OnceLock::new();
+    FLAG.get_or_init(|| Arc::new(AtomicBool::new(false)))
 }
 
 /// Install SIGTERM/SIGINT handlers that flip [`terminating`]; poll it from your
 /// serve loop and drain + `exit(0)`.
 pub fn install_term_handler() {
-    unsafe {
-        signal(SIGTERM, on_term);
-        signal(SIGINT, on_term);
+    for sig in [signal_hook::consts::SIGTERM, signal_hook::consts::SIGINT] {
+        let _ = signal_hook::flag::register(sig, Arc::clone(term_flag()));
     }
 }
 
 /// Whether SIGTERM/SIGINT has arrived since [`install_term_handler`].
 pub fn terminating() -> bool {
-    TERMINATING.load(Ordering::SeqCst)
+    term_flag().load(Ordering::SeqCst)
 }

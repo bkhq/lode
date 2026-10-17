@@ -104,6 +104,9 @@ jobs:
       # The embedding example is its own workspace; keep it compiling against the crates.
       - name: cargo check (examples/embed)
         run: cargo check --manifest-path examples/embed/Cargo.toml --locked
+      # The Rust demo app compiles the single-file SDK under `forbid(unsafe_code)`.
+      - name: cargo check (examples/rust)
+        run: cargo check --manifest-path examples/rust/Cargo.toml --locked
 
   # Runs the built binaries end to end, including a supervised service. This job
   # is the only place the Windows build is exercised.

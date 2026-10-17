@@ -12,8 +12,10 @@
 //! Standalone (no lode): LODE_DIR is unset, so `Lode::from_env()` is `None`
 //! and the request endpoints reply 503 — you still get a working server.
 
-// The single-file SDK, referenced in place (no copy). It needs serde + serde_json
-// (see Cargo.toml); an app may use ordinary libraries — lode does not constrain them.
+#![forbid(unsafe_code)]
+
+// The single-file SDK, referenced in place (no copy). It needs serde + serde_json +
+// signal-hook (see Cargo.toml); an app may use ordinary libraries — lode does not constrain them.
 #[path = "../../../sdks/lode.rs"]
 mod lode;
 
