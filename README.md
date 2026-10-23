@@ -129,8 +129,8 @@ belong to unrelated projects) — depend on a release tag of this repository:
 
 ```toml
 [dependencies]
-lode-core = { git = "https://github.com/bkhq/lode", tag = "v0.2.0" }        # config + Engine (no clap, no signals)
-lode-supervisor = { git = "https://github.com/bkhq/lode", tag = "v0.2.0" }  # + the supervise loop, driven by an injected SignalSource
+lode-core = { git = "https://github.com/bkhq/lode", tag = "v0.2.1" }        # config + Engine (no clap, no signals)
+lode-supervisor = { git = "https://github.com/bkhq/lode", tag = "v0.2.1" }  # + the supervise loop, driven by an injected SignalSource
 ```
 
 The guide is [docs/embedding.md](docs/embedding.md): a program that updates its own

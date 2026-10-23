@@ -7,12 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.1] - 2026-10-23
+
 ### Added
 
 - **Status reporting from the builder.** `Config::builder()` gains
   `report_endpoint`, `report_interval`, `report_header`, `report_attribute` and
   `report_instance_id`, so a host embedding `serve_embedded` can turn on
   `[report]` without TOML; the embedding guide documents what it reports.
+
+### Security
+
+- Update `rustls-webpki` to 0.103.16 (RUSTSEC-2026-0382) and `webpki-roots`
+  to 1.0.10 (RUSTSEC-2026-0381).
 
 ## [0.2.0] - 2026-10-23
 
