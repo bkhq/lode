@@ -15,6 +15,8 @@ log_level = "info"         # trace | debug | info | warn | error
 manifest = "https://releases.example.com/myapp/manifest.json"   # native: lode/v1 manifest URL  ← edit this
 # github     = "owner/myapp"               # ...or GitHub Releases instead of `manifest`
 # github_api = "https://api.github.com"    # override for GitHub Enterprise
+# github_token = "${GITHUB_TOKEN}"        # private repo: fine-grained token with Contents read-only (classic: `repo`);
+#                                         # sent to the github_api host only, assets come through the release-asset API
 #   (github: the release's own assets are the catalog — no manifest.json asset needed)
 
 asset          = "myapp-linux-x86_64.tar.gz"   # the asset filename to install on THIS host (the selection key) ← edit this
@@ -126,6 +128,20 @@ restart_mode        = "stop-start"   # stop-start | reuseport-overlap | socket-a
 [signals]
 # forward = ["SIGHUP", "SIGUSR1", "SIGUSR2", "SIGWINCH", "SIGCONT", "SIGTSTP"]  # forwarded to the child (default set)
 # restart = "SIGUSR2"   # this signal triggers a graceful restart instead of being forwarded
+
+# --- report: push this host's status over OpenTelemetry OTLP/HTTP (bare `lode` only; off unless endpoint is set) ---
+# Metrics every `interval` (status, version, restarts, uptime, update available) and
+# events (lode.started / lode.stopping / lode.updated / lode.rolled_back / lode.paused /
+# lode.resource.updated / lode.check.failed) as OTLP JSON to {endpoint}/v1/metrics and
+# {endpoint}/v1/logs. Any OTLP receiver works; for a lode-server registry use
+# "https://<host>/r/otlp" with a token that has a grant on the package.
+# Fixed for the life of the process, like [trust].
+# [report]
+# endpoint    = "https://lode.bk.io/r/otlp"                  # HTTPS (or loopback http) unless [http].allow_insecure
+# interval    = 300                                          # seconds between metric exports
+# headers     = ["Authorization: Bearer ${LODE_REGISTRY_TOKEN}"]   # sent to `endpoint` only; ${ENV} expanded per request
+# instance_id = "web-01"                                     # service.instance.id; default: the host name
+# attributes  = { "deployment.environment.name" = "prod" }   # extra resource attributes
 
 # --- resources: separately published bundles (config, data, assets), repeatable ---
 # Published as "<app>/<name>" (manifest name + signature identity) and verified with

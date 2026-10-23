@@ -171,6 +171,30 @@ lode writes its log to **stdout**, one line per event, next to whatever the app 
 - Header values, tokens and private keys are never logged; URLs are logged without
   their query string.
 
+### Status reporting
+
+To see a fleet's hosts in one place, set `[report]`: lode then pushes each host's status
+(app version, run state, restarts, available update) and lifecycle events (start, stop,
+update, rollback, pause) over OpenTelemetry OTLP/HTTP:
+
+```toml
+[report]
+endpoint = "https://lode.bk.io/r/otlp"   # any OTLP/HTTP receiver
+headers  = ["Authorization: Bearer ${LODE_REGISTRY_TOKEN}"]
+# interval = 300
+```
+
+- A lode-server registry shows the hosts on the package's Observability tab; the token
+  needs a grant on the package. An OpenTelemetry Collector or another OTLP backend takes
+  the same block with its own endpoint and headers.
+- `--report-endpoint` / `LODE_REPORT_ENDPOINT` and `--report-interval` /
+  `LODE_REPORT_INTERVAL` set it without editing `lode.toml`.
+- A failing receiver only logs `status reporting: …` warnings; supervision is not
+  affected. `export partly rejected` means the receiver refused the data — for
+  lode-server, usually a token without a grant on the package, or a `[global].app` that
+  is not the package slug.
+- Changing `[report]` takes a restart of lode.
+
 ---
 
 ## 4. Exit status

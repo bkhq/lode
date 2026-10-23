@@ -179,6 +179,68 @@ pub fn get_reader(
     .into_reader())
 }
 
+/// End-to-end cap for a status-report POST ([`post_json`]): reports run on
+/// their own thread, but a dead endpoint must still let it move on.
+const POST_CAP: Duration = Duration::from_secs(10);
+
+/// Byte cap on the response body [`post_json`] reads back.
+const POST_RESPONSE_LIMIT: u64 = 64 * 1024;
+
+/// What a [`post_json`] endpoint answered.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PostResponse {
+    /// HTTP status; non-2xx is returned, not an error.
+    pub status: u16,
+    /// `Retry-After` in seconds, when the server sent one.
+    pub retry_after: Option<u64>,
+    /// The response body, up to 64 KiB.
+    pub body: Vec<u8>,
+}
+
+/// POST a JSON `body` to `url` with `headers` (status reports).
+///
+/// Time-capped by [`POST_CAP`]; redirects are not followed (a 3xx is
+/// returned as the status). `allow_insecure` waives the HTTPS requirement as
+/// for fetches. Only transport failures are errors.
+pub fn post_json(
+    url: &str,
+    headers: &[(String, String)],
+    body: &[u8],
+    allow_insecure: bool,
+) -> Result<PostResponse> {
+    enforce_scheme(url, allow_insecure)?;
+    let mut request = AGENT
+        .post(url)
+        .config()
+        .timeout_global(Some(POST_CAP))
+        .http_status_as_error(false)
+        .build()
+        .header("Content-Type", "application/json");
+    for (name, value) in headers {
+        request = request.header(name.as_str(), value.as_str());
+    }
+    let response = request
+        .send(body)
+        .map_err(|e| Error::Http(format!("POST {}: {e}", redact_url(url))))?;
+    let status = response.status().as_u16();
+    let retry_after = response
+        .headers()
+        .get(ureq::http::header::RETRY_AFTER)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.trim().parse().ok());
+    let body = response
+        .into_body()
+        .into_with_config()
+        .limit(POST_RESPONSE_LIMIT)
+        .read_to_vec()
+        .unwrap_or_default();
+    Ok(PostResponse {
+        status,
+        retry_after,
+        body,
+    })
+}
+
 /// Issue a blocking GET via `agent`, following up to [`MAX_REDIRECT_HOPS`]
 /// redirects **manually**, and hand back the final response body. 4xx/5xx are
 /// surfaced as errors (ureq's default `http_status_as_error`); `cap` is the
@@ -212,12 +274,21 @@ fn send(
         let host = url_host(&current);
         let attach_here = host.is_some_and(attach);
         if !attach_here && !headers.is_empty() {
-            // Headers withheld from this hop's host. Only the host is logged.
-            tracing::warn!(
-                host = host.unwrap_or("?"),
-                hops,
-                "custom headers not attached to non-allowlisted host"
-            );
+            // Headers withheld from this hop's host. Only the host is logged. A
+            // redirect to storage (pre-signed URLs, GitHub's asset host) is the
+            // normal case, so only the initial request warns.
+            if hops == 0 {
+                tracing::warn!(
+                    host = host.unwrap_or("?"),
+                    "custom headers not attached to non-allowlisted host"
+                );
+            } else {
+                tracing::debug!(
+                    host = host.unwrap_or("?"),
+                    hops,
+                    "custom headers not attached to redirect host"
+                );
+            }
         }
         let hop_headers: &[(String, String)] = if attach_here { headers } else { &[] };
         tracing::debug!(url = %redact_url(&current), hops, headers = hop_headers.len(), "http get");
@@ -824,5 +895,35 @@ mod tests {
             "https://h.example/p"
         );
         assert_eq!(redact_url("https://h.example/p"), "https://h.example/p");
+    }
+
+    #[test]
+    fn post_json_returns_status_retry_after_and_body() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = serve_one(
+            listener,
+            "HTTP/1.1 429 Too Many Requests\r\nRetry-After: 7\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}"
+                .to_owned(),
+        );
+        let answer = post_json(
+            &format!("http://127.0.0.1:{port}/v1/logs"),
+            &[("Authorization".to_owned(), "Bearer t".to_owned())],
+            b"{}",
+            false,
+        )
+        .unwrap();
+        assert_eq!(answer.status, 429);
+        assert_eq!(answer.retry_after, Some(7));
+        assert_eq!(answer.body, b"{}");
+        let head = server.join().unwrap().to_ascii_lowercase();
+        assert!(head.starts_with("post /v1/logs http/1.1"), "{head}");
+        assert!(head.contains("authorization: bearer t"), "{head}");
+        assert!(head.contains("content-type: application/json"), "{head}");
+    }
+
+    #[test]
+    fn post_json_refuses_remote_http() {
+        assert!(post_json("http://otel.example/v1/logs", &[], b"{}", false).is_err());
     }
 }

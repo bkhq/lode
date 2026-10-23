@@ -77,20 +77,21 @@ pub fn fetch_artifact(
     fs::create_dir_all(&cache_dir)?;
     let temp = cache_dir.join(format!("{}.part", asset.name));
 
-    let headers = if asset.auth && !cfg.http.headers.is_empty() {
-        if host_allowed(&asset.url, allowed_hosts) {
-            crate::http::expand_headers(&cfg.http.headers)?
-        } else {
-            // Cross-origin (relative to the source) and not allowlisted: drop the
-            // credentials rather than leak them to the asset host. Only the host
-            // (never a header value) is logged.
-            tracing::warn!(
-                host = crate::http::url_host(&asset.url).unwrap_or("?"),
-                "credentials not attached to cross-origin host"
-            );
-            Vec::new()
-        }
+    let credentials = if asset.auth {
+        crate::manifest::credentials(cfg)?
     } else {
+        Vec::new()
+    };
+    let headers = if credentials.is_empty() || host_allowed(&asset.url, allowed_hosts) {
+        credentials
+    } else {
+        // Cross-origin (relative to the source) and not allowlisted: drop the
+        // credentials rather than leak them to the asset host. Only the host
+        // (never a header value) is logged.
+        tracing::warn!(
+            host = crate::http::url_host(&asset.url).unwrap_or("?"),
+            "credentials not attached to cross-origin host"
+        );
         Vec::new()
     };
 

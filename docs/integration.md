@@ -230,8 +230,9 @@ jobs:
   the signature from the `<asset>.sig` sidecar asset (or the asset `label`, which
   GitHub would show in place of the filename).
   `channel = stable` → `/releases/latest`; other channels → newest non-draft prerelease;
-  `pin` → a specific tag. No `manifest.json` asset is needed. Private repo: token in
-  `[http].headers`.
+  `pin` → a specific tag. No `manifest.json` asset is needed. Private repo:
+  `[update].github_token = "${GITHUB_TOKEN}"` (a fine-grained token with *Contents:
+  read-only* on the repository); lode then downloads through the release-asset API.
 - Name assets `<app>-<os>-<arch>.<ext>`; each operator sets `[update].asset` to the exact
   filename for their host.
 

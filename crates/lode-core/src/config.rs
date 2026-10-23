@@ -38,6 +38,8 @@ pub const DEFAULT_DIR: &str = r"C:\ProgramData\lode";
 pub const STARTER_TOML: &str = include_str!("../../../docs/lode.starter.toml");
 const DEFAULT_GITHUB_API: &str = "https://api.github.com";
 const DEFAULT_CHANNEL: &str = "stable";
+/// Default seconds between `[report]` metric exports.
+pub const DEFAULT_REPORT_INTERVAL: u64 = 300;
 /// Placeholder in `[command]` values that expands to the running version directory.
 pub const DEFAULT_WORKDIR_PLACEHOLDER: &str = "{dir}";
 
@@ -172,6 +174,8 @@ pub struct Config {
     pub env: BTreeMap<String, String>,
     /// `[[resource]]` — separately published bundles installed beside the app.
     pub resources: Vec<Resource>,
+    /// `[report]` section.
+    pub report: Report,
     /// The `lode.toml` path this config was read from (`None` when running
     /// file-less). The supervisor watches its mtime to recover a *paused* app after
     /// the operator edits it (design §8); a running app is never disturbed.
@@ -220,6 +224,9 @@ pub struct Update {
     pub github: Option<String>,
     /// GitHub API base URL (override for GitHub Enterprise).
     pub github_api: String,
+    /// GitHub token for a private repository (github source only). Stored raw;
+    /// `${ENV}` is expanded per request and the value is never logged.
+    pub github_token: Option<String>,
     /// The asset filename to install on this host — the source-agnostic selection
     /// key (source-adapters §3/§7). Required to resolve a download.
     pub asset: Option<String>,
@@ -262,6 +269,23 @@ pub struct Trust {
     pub trusted_keys_file: Option<String>,
     /// Optional URL of a signed revocation list for delegated keys.
     pub revocation_url: Option<String>,
+}
+
+/// `[report]` — push the host's status to an OpenTelemetry OTLP/HTTP endpoint.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Report {
+    /// OTLP/HTTP base URL; exports go to `{endpoint}/v1/metrics` and
+    /// `{endpoint}/v1/logs`. `None` turns reporting off.
+    pub endpoint: Option<String>,
+    /// Seconds between metric exports.
+    pub interval: u64,
+    /// Request headers for the endpoint only, as raw `Name: value` lines
+    /// (`${ENV}` expanded per request, like `[http].headers`).
+    pub headers: Vec<String>,
+    /// Extra OpenTelemetry resource attributes.
+    pub attributes: BTreeMap<String, String>,
+    /// `service.instance.id`; the host name when unset.
+    pub instance_id: Option<String>,
 }
 
 /// `[command]` — how to launch the app.
@@ -378,6 +402,18 @@ struct TomlConfig {
     env: BTreeMap<String, String>,
     #[serde(default)]
     resource: Vec<TomlResource>,
+    #[serde(default)]
+    report: TomlReport,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct TomlReport {
+    endpoint: Option<String>,
+    interval: Option<u64>,
+    headers: Option<Vec<String>>,
+    attributes: Option<BTreeMap<String, String>>,
+    instance_id: Option<String>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -408,6 +444,7 @@ struct TomlUpdate {
     manifest: Option<String>,
     github: Option<String>,
     github_api: Option<String>,
+    github_token: Option<String>,
     asset: Option<String>,
     channel: Option<String>,
     policy: Option<Policy>,
@@ -503,6 +540,8 @@ pub struct Overrides {
     pub github: Option<String>,
     /// Overrides `[update].github_api`.
     pub github_api: Option<String>,
+    /// Overrides `[update].github_token`.
+    pub github_token: Option<String>,
     /// Overrides `[update].asset`.
     pub asset: Option<String>,
     /// Overrides `[update].channel`.
@@ -569,6 +608,10 @@ pub struct Overrides {
     pub forward_signals: Option<String>,
     /// Overrides `[signals].restart`.
     pub restart_signal: Option<String>,
+    /// Overrides `[report].endpoint`.
+    pub report_endpoint: Option<String>,
+    /// Overrides `[report].interval`.
+    pub report_interval: Option<u64>,
 }
 
 // --- resolution ------------------------------------------------------------
@@ -739,6 +782,7 @@ fn merge(o: &Overrides, t: &TomlConfig) -> Config {
         // host env var; see `child_env`).
         env: t.env.clone(),
         resources: merge_resources(o, t),
+        report: merge_report(o, &t.report),
         config_path: None, // filled in by `resolve` after merge
     }
 }
@@ -757,6 +801,23 @@ fn merge_resources(o: &Overrides, t: &TomlConfig) -> Vec<Resource> {
             required: r.required,
         })
         .collect()
+}
+
+fn merge_report(o: &Overrides, t: &TomlReport) -> Report {
+    Report {
+        endpoint: o
+            .report_endpoint
+            .clone()
+            .or_else(|| t.endpoint.clone())
+            .filter(|e| !e.trim().is_empty()),
+        interval: o
+            .report_interval
+            .or(t.interval)
+            .unwrap_or(DEFAULT_REPORT_INTERVAL),
+        headers: t.headers.clone().unwrap_or_default(),
+        attributes: t.attributes.clone().unwrap_or_default(),
+        instance_id: t.instance_id.clone(),
+    }
 }
 
 fn merge_global(o: &Overrides, t: &TomlGlobal) -> Global {
@@ -788,6 +849,11 @@ fn merge_update(o: &Overrides, t: &TomlUpdate) -> Update {
             .clone()
             .or_else(|| t.github_api.clone())
             .unwrap_or_else(|| DEFAULT_GITHUB_API.to_owned()),
+        github_token: o
+            .github_token
+            .clone()
+            .or_else(|| t.github_token.clone())
+            .filter(|t| !t.trim().is_empty()),
         asset: o.asset.clone().or_else(|| t.asset.clone()),
         channel: o
             .channel
@@ -1084,6 +1150,32 @@ fn validate_resources(resources: &[Resource]) -> Result<()> {
     Ok(())
 }
 
+/// `[report]`: an `http(s)` endpoint (HTTPS unless loopback or
+/// `allow_insecure`) and a positive interval.
+fn validate_report(report: &Report, allow_insecure: bool) -> Result<()> {
+    let Some(endpoint) = report.endpoint.as_deref() else {
+        return Ok(());
+    };
+    let lower = endpoint.to_ascii_lowercase();
+    if !(lower.starts_with("https://") || lower.starts_with("http://")) {
+        return Err(Error::Config(
+            "report.endpoint must be an http(s) URL (the OTLP/HTTP base)".to_owned(),
+        ));
+    }
+    if !allow_insecure && !crate::http::scheme_allowed(endpoint) {
+        return Err(Error::Config(
+            "report.endpoint must be https (or loopback http); set [http].allow_insecure=true to override"
+                .to_owned(),
+        ));
+    }
+    if report.interval == 0 {
+        return Err(Error::Config(
+            "report.interval must be at least 1 second".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
 /// Semantic validation: non-empty key fields, source XOR, and numeric ranges.
 /// (Enum values are already checked by clap/serde at parse time.)
 fn validate(cfg: &Config) -> Result<()> {
@@ -1124,6 +1216,12 @@ fn validate(cfg: &Config) -> Result<()> {
         }
         _ => {}
     }
+    if cfg.update.github_token.is_some() && cfg.update.github.is_none() {
+        return Err(Error::Config(
+            "update.github_token is only used with update.github (a private GitHub repository)"
+                .to_owned(),
+        ));
+    }
     if cfg.update.github.is_some() && cfg.trust.require_manifest != RequireManifest::Off {
         return Err(Error::Config(format!(
             "trust.require_manifest = \"{}\" needs a native manifest source: \
@@ -1138,6 +1236,7 @@ fn validate(cfg: &Config) -> Result<()> {
             "runtime.sha256 must be the 64-character hex sha256 of the runtime download".to_owned(),
         ));
     }
+    validate_report(&cfg.report, cfg.http.allow_insecure)?;
     if cfg.supervise.restart_backoff_max < cfg.supervise.restart_backoff {
         return Err(Error::Config(format!(
             "supervise.restart_backoff_max ({}) must be >= restart_backoff ({})",
@@ -1156,6 +1255,85 @@ mod tests {
     /// names mirror the CLI knobs, so the existing tests mutate it verbatim.
     fn blank_cli() -> Overrides {
         Overrides::default()
+    }
+
+    #[test]
+    fn github_token_needs_the_github_source() {
+        let cfg = Config::from_toml("[update]\ngithub = \"o/r\"\ngithub_token = \"${GH_TOKEN}\"\n")
+            .unwrap();
+        assert_eq!(cfg.update.github_token.as_deref(), Some("${GH_TOKEN}"));
+        assert!(
+            Config::from_toml(
+                "[update]\nmanifest = \"https://r.example/m.json\"\ngithub_token = \"t\"\n"
+            )
+            .is_err()
+        );
+        let mut cli = blank_cli();
+        cli.github_token = Some("${OTHER}".to_owned());
+        let parsed: TomlConfig = toml::from_str("[update]\ngithub_token = \"x\"\n").unwrap();
+        assert_eq!(
+            merge(&cli, &parsed).update.github_token.as_deref(),
+            Some("${OTHER}")
+        );
+    }
+
+    #[test]
+    fn report_is_off_by_default() {
+        let cfg = merge(&blank_cli(), &TomlConfig::default());
+        assert_eq!(cfg.report.endpoint, None);
+        assert_eq!(cfg.report.interval, 300);
+        assert!(cfg.report.headers.is_empty());
+    }
+
+    #[test]
+    fn report_parses_and_cli_overrides() {
+        let toml = "[report]\nendpoint = \"https://otel.example/r/otlp\"\ninterval = 60\n\
+                    headers = [\"Authorization: Bearer ${T}\"]\ninstance_id = \"web-01\"\n\
+                    attributes = { region = \"hk\" }\n";
+        let parsed: TomlConfig = toml::from_str(toml).unwrap();
+        let cfg = merge(&blank_cli(), &parsed);
+        assert_eq!(
+            cfg.report.endpoint.as_deref(),
+            Some("https://otel.example/r/otlp")
+        );
+        assert_eq!(cfg.report.interval, 60);
+        assert_eq!(
+            cfg.report.headers,
+            vec!["Authorization: Bearer ${T}".to_owned()]
+        );
+        assert_eq!(cfg.report.instance_id.as_deref(), Some("web-01"));
+        assert_eq!(
+            cfg.report.attributes.get("region").map(String::as_str),
+            Some("hk")
+        );
+
+        let mut cli = blank_cli();
+        cli.report_endpoint = Some("https://other.example".to_owned());
+        cli.report_interval = Some(30);
+        let cfg = merge(&cli, &parsed);
+        assert_eq!(
+            cfg.report.endpoint.as_deref(),
+            Some("https://other.example")
+        );
+        assert_eq!(cfg.report.interval, 30);
+    }
+
+    #[test]
+    fn report_endpoint_must_be_secure_and_interval_positive() {
+        let base = "[update]\npolicy = \"off\"\n";
+        let with = |report: &str| Config::from_toml(&format!("{base}[report]\n{report}"));
+        assert!(with("endpoint = \"https://otel.example\"").is_ok());
+        assert!(with("endpoint = \"http://127.0.0.1:4318\"").is_ok());
+        assert!(with("endpoint = \"http://otel.example\"").is_err());
+        assert!(with("endpoint = \"otel.example\"").is_err());
+        assert!(with("endpoint = \"https://otel.example\"\ninterval = 0").is_err());
+        assert!(with("interval = 0").is_ok()); // off: nothing to check
+        assert!(
+            Config::from_toml(&format!(
+                "{base}[http]\nallow_insecure = true\n[report]\nendpoint = \"http://otel.example\""
+            ))
+            .is_ok()
+        );
     }
 
     #[test]

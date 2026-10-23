@@ -7,12 +7,41 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **Status reporting.** `[report]` (`--report-endpoint` / `LODE_REPORT_ENDPOINT`,
+  `--report-interval` / `LODE_REPORT_INTERVAL`) pushes the host's status over
+  OpenTelemetry OTLP/HTTP (JSON): metrics every `interval` (default 300 s) —
+  `lode.app.up`, `lode.app.status`, `lode.app.restarts`, `lode.app.uptime`,
+  `lode.update.available`, `lode.app.last_good`, `lode.resource.version` — and
+  lifecycle events (`lode.started`, `lode.stopping`, `lode.updated`,
+  `lode.rolled_back`, `lode.paused`, `lode.resource.updated`,
+  `lode.check.failed`) with standard resource attributes (`service.name`,
+  `service.version`, `service.instance.id`, `host.*`, `os.type`). Works with any
+  OTLP receiver, a lode-server registry (`/r/otlp`) included. Off unless an
+  endpoint is set; reporting runs on its own thread and never delays
+  supervision.
+- **Private GitHub repositories.** `[update].github_token` (`--github-token`,
+  `LODE_GITHUB_TOKEN`, `${ENV}` expanded) authenticates the GitHub source.
+  With a token, assets, `.sig` sidecars and delegations are downloaded through
+  the release-asset API (`browser_download_url` answers 404 for a private
+  repository), and the token is sent to the API host only — never to the
+  storage host the API redirects to. A 404 from the API now says whether a
+  token is missing or lacks access.
+
 ### Changed
 
 - The Rust SDK (`sdks/lode.rs`) no longer uses `unsafe`: the `state.json.lock`
   guard takes std's `File::lock` (the lock lode itself takes) and
   `install_term_handler` uses `signal-hook`. Apps that vendor the file must add
   `signal-hook = "0.4"`; it needs Rust 1.89+.
+
+### Fixed
+
+- A token in `[http].headers` could not download assets from a private GitHub
+  repository; use `[update].github_token`.
+- Credentials stripped on a redirect hop (normal for pre-signed storage URLs)
+  are logged at debug level instead of a warning on every download.
 
 ## [0.1.0] - 2026-10-15
 

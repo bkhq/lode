@@ -434,6 +434,16 @@ lode 发 `SIGTERM` 后,**在 `stop_timeout` 秒内绝不 SIGKILL**,给 app 充�
 - operator 把 `stop_timeout` 设为 ≥ app 最坏清理耗时,且 **< 容器/编排的停止宽限**(如 Docker 默认 10s,否则容器层会先 SIGKILL)。
 - app 收到 `SIGTERM` 必须尽快收尾并 `exit(0)`;只有超时才被 SIGKILL。
 
+### 状态上报(`[report]`)
+
+设置 `[report].endpoint` 后,裸 `lode` 会把主机状态以 **OpenTelemetry OTLP/HTTP**(JSON 编码)推送到 `{endpoint}/v1/metrics` 和 `{endpoint}/v1/logs`。任何 OTLP 接收端都可以:OpenTelemetry Collector、厂商后端,或 lode-server registry(`https://<host>/r/otlp`,配一个对该包有授权的令牌)。没有针对某个接收端的开关:接收端按 resource 属性识别应用。
+
+- **Resource:** `service.name`(= `[global].app`)、`service.version`(当前版本)、`service.instance.id`(`instance_id`,默认主机名)、`host.name`、`host.arch`、`os.type`、`process.pid`、`lode.version`、`lode.channel`、`lode.report.interval`,以及 `[report].attributes`(不会覆盖上述属性)。
+- **指标**(启动时、每个 `interval` 和关闭时各一次):`lode.app.up`、`lode.app.status`(属性 `status` = `state.json` 的状态)、`lode.app.restarts`(累计 sum)、`lode.app.uptime`(秒)、`lode.update.available`(属性 `version`)、`lode.app.last_good`(属性 `version`)、`lode.resource.version`(属性 `resource`、`version`)。
+- **事件**(log record,以 `eventName` 和 `event.name` 属性命名,发生时即发送):`lode.started`、`lode.stopping`、`lode.updated`(`from`、`to`)、`lode.rolled_back`(`from`、`to`、`reason`)、`lode.paused`、`lode.resource.updated`(`resource`、`version`)、`lode.check.failed`。
+- **运行方式:** 所有上报 I/O 在独立线程中进行(每个请求最多 10 秒),慢或不可达的接收端不会拖慢监管。最多排队 100 个事件;上报失败只记日志并丢弃(不落盘、不重放);`429`/`503` 按 `Retry-After` 暂停上报。关闭时最多等 5 秒发出最后的上报。
+- **凭据:** `[report].headers` 只发给该 endpoint,`[http].headers` 绝不发给它。除非 `[http].allow_insecure`,endpoint 必须是 HTTPS(或回环 http)。`[report]` 与 `[trust]` 一样,在进程生命周期内固定。
+
 ---
 
 ## 9. PID 锁
@@ -462,6 +472,7 @@ lode 发 `SIGTERM` 后,**在 `stop_timeout` 秒内绝不 SIGKILL**,给 app 充�
 | `LODE_MANIFEST` | `--manifest <url>` | `update.manifest` | — | **native 源**:lode/v1 manifest URL(与 `github` 二选一) |
 | `LODE_GITHUB` | `--github <owner/name>` | `update.github` | — | **github 源**:仓库(与 `manifest` 二选一) |
 | `LODE_GITHUB_API` | `--github-api <url>` | `update.github_api` | `https://api.github.com` | (github)API 基址(GHE) |
+| `LODE_GITHUB_TOKEN` | `--github-token <token>` | `update.github_token` | — | (github)私有仓库的 token,每次请求时展开 `${ENV}`,§12 |
 | `LODE_ASSET` | `--asset <file>` | `update.asset` | — | 本机要装的资产**文件名**(选择键,§4/§12) |
 | `LODE_CHANNEL` | `--channel <name>` | `update.channel` | `stable` | 跟随的通道(manifest 可定义多个) |
 | `LODE_UPDATE_POLICY` | `--policy <off\|check\|auto>` | `update.policy` | `check` | 更新策略,§5 |
@@ -503,6 +514,12 @@ lode 发 `SIGTERM` 后,**在 `stop_timeout` 秒内绝不 SIGKILL**,给 app 充�
 | **`[signals]` —— 信号** | | | | |
 | `LODE_FORWARD_SIGNALS` | `--forward-signals <list>` | `signals.forward` | (标准集) | 透传给子进程的信号集,§8 |
 | `LODE_RESTART_SIGNAL` | `--restart-signal <sig>` | `signals.restart` | — | 触发优雅重启的信号(默认不设),§8 |
+| **`[report]` —— 状态上报** | | | | |
+| `LODE_REPORT_ENDPOINT` | `--report-endpoint <url>` | `report.endpoint` | — | 上报的 OTLP/HTTP 基础 URL;不设则不上报,§8 |
+| `LODE_REPORT_INTERVAL` | `--report-interval <sec>` | `report.interval` | `300` | 指标上报间隔(秒) |
+| — | — | `report.headers` | — | 只发给该 endpoint 的请求头(`"Name: Value"`,支持 `${ENV}` 展开) |
+| — | — | `report.instance_id` | 主机名 | `service.instance.id` |
+| — | — | `report.attributes`(表) | — | 额外的 OpenTelemetry resource 属性 |
 
 子进程环境:透传宿主环境并**剥离配置类 `LODE_*`**;把 operator 的 `[env]` 表作为**默认值**应用(仅对宿主 env 没有的 key);把运行时目录前置到 PATH;再注入只读自省变量 `LODE_ACTIVE_VERSION`、`LODE_DIR`、`LODE_WORKDIR`(解析后的 cwd)、`LODE_CONFIG`(加载的 `lode.toml` 路径,仅在加载了配置文件时)、`LODE_READINESS`(`none`|`state`)与 `LODE_INSTANCE`(`{pid}-{nanoid}`,本次启动唯一 id,由 app 拼上握手相位,§8)。优先级 低→高:`[env]` 默认值 < 继承的宿主 env < 运行时 PATH 前置 < 注入的 `LODE_*`。
 
@@ -612,7 +629,7 @@ lode-cli sign hello.js --app hello --version 1.0.0 --key publisher.key
 
 - **版本号**:用 release 的 `tag_name`(数字前的 `v` 前缀去掉)—— 以 GitHub 为准。以原始 tag 给出的 `pin`(或 `--version`)也解析到这个去掉 `v` 的 id,因此 `versions/<id>` 与签名绑定的 `version` 不取决于 release 是怎么被选中的 —— 发布方用去掉 `v` 的 id 签名。
 - **GitHub 无 catalog(顶层)签名**:新鲜度由 tag 权威保证;每资产 `sig`(sidecar 或 label)仍保护各自下载。
-- **私有 repo**:`[http].headers` 放 GitHub token(`Authorization: Bearer <PAT>`),API 与同主机资产下载都带。
+- **私有 repo**:设置 `[update].github_token`(如 `"${GITHUB_TOKEN}"`;fine-grained token 对该仓库授予 *Contents: read-only*,或 classic token 的 `repo` 权限)。token 只以 `Authorization: Bearer` 发给 `github_api` 主机。此时资产、`.sig` sidecar 和 delegation 改从 release 资产 API(`/repos/<o>/<r>/releases/assets/<id>`,`Accept: application/octet-stream`)下载,而不是对私有仓库返回 404 的 `browser_download_url`;API 会重定向到 GitHub 存储主机上的短期签名 URL,跟随时不带 token。404 会提示可能的原因(未配置 token,或 token 无权访问)。
 
 > 最简用法只需 `github = "owner/repo"` + `asset = "<filename>"`,`stable` 直接走 `/releases/latest`。两源都产出相同的内部资产列表 → 同一校验/安装路径。CI 签名可选 —— 见 [`docs/source-adapters.zh-CN.md`](source-adapters.zh-CN.md) §5 的 release workflow 配方。
 

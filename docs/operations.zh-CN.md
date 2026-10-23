@@ -158,6 +158,27 @@ stderr):
   上报告 `publish: <原因>`。
 - 请求头的值、令牌和私钥从不写入日志;URL 写入日志时不带查询串。
 
+### 状态上报
+
+要集中查看一批主机,设置 `[report]`:lode 会通过 OpenTelemetry OTLP/HTTP 推送每台主机的状态
+(应用版本、运行状态、重启次数、可用更新)和生命周期事件(启动、停止、更新、回滚、暂停):
+
+```toml
+[report]
+endpoint = "https://lode.bk.io/r/otlp"   # 任何 OTLP/HTTP 接收端
+headers  = ["Authorization: Bearer ${LODE_REGISTRY_TOKEN}"]
+# interval = 300
+```
+
+- lode-server registry 在包的"观测"标签页展示这些主机;令牌需要对该包有授权。
+  OpenTelemetry Collector 或其他 OTLP 后端使用同样的配置块,换成各自的 endpoint 和请求头即可。
+- 也可以用 `--report-endpoint` / `LODE_REPORT_ENDPOINT` 和 `--report-interval` /
+  `LODE_REPORT_INTERVAL` 设置,无需修改 `lode.toml`。
+- 接收端出错只会记录 `status reporting: …` 警告,不影响监管。`export partly rejected`
+  表示接收端拒收了数据——对 lode-server 来说,通常是令牌对该包没有授权,或 `[global].app`
+  不是包标识。
+- 修改 `[report]` 需要重启 lode。
+
 ---
 
 ## 4. 退出码

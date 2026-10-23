@@ -122,3 +122,29 @@ test("a non-stable channel follows the newest prerelease", async () => {
   expect(lode.readState()?.channel).toBe("beta");
   expect(lode.exited).toBe(false);
 });
+
+test("a private repository is read with --github-token through the asset API", async () => {
+  h = await Harness.start();
+  gh = GithubServer.start({ token: "gh-e2e-secret" });
+  buildDir = mkTmp("lode-gh-build-");
+  await release("0.0.1");
+  process.env.GH_E2E_TOKEN = "gh-e2e-secret";
+
+  // Without the token the repository is invisible (GitHub answers 404).
+  const blind = h.runLodeRaw(githubArgs("stable"));
+  await blind.waitForStdout(/needs \[update\]\.github_token/, { label: "404 names the token" });
+  blind.signal("SIGTERM");
+  await blind.waitExit();
+
+  const lode = h.runLodeRaw([...githubArgs("stable"), "--github-token", "${GH_E2E_TOKEN}"]);
+  await lode.waitForState((s) => s.status === "running" && s.current === "0.0.1", {
+    timeout: 20000,
+    label: "running v0.0.1 from the private repository",
+  });
+  await release("0.0.2");
+  await lode.waitForState((s) => s.status === "running" && s.current === "0.0.2", {
+    timeout: 20000,
+    label: "auto-applied v0.0.2 from the private repository",
+  });
+  expect(lode.exited).toBe(false);
+});

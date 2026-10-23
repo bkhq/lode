@@ -268,14 +268,64 @@ pub fn allowed_hosts(cfg: &Config) -> Vec<String> {
             if let Some(host) = crate::http::url_host(&cfg.update.github_api) {
                 hosts.push(host.to_owned());
             }
-            hosts.push("github.com".to_owned());
-            hosts.push("objects.githubusercontent.com".to_owned());
-            hosts.push("codeload.github.com".to_owned());
         }
         (None, None) => {}
     }
+    // With a token every release asset is fetched from the API host, so nothing
+    // else needs credentials; without one, `[http].headers` keep riding GitHub's
+    // download hosts as before.
+    if cfg.update.manifest.is_none()
+        && cfg.update.github.is_some()
+        && cfg.update.github_token.is_none()
+    {
+        hosts.push("github.com".to_owned());
+        hosts.push("objects.githubusercontent.com".to_owned());
+        hosts.push("codeload.github.com".to_owned());
+    }
     hosts.extend(cfg.http.credential_hosts.iter().cloned());
     hosts
+}
+
+/// GitHub's media type for raw release-asset bytes from the asset API.
+const GITHUB_OCTET_STREAM: &str = "application/octet-stream";
+/// GitHub's media type for API JSON.
+const GITHUB_JSON: &str = "application/vnd.github+json";
+const GITHUB_API_VERSION: &str = "2022-11-28";
+
+/// `Authorization` and `X-GitHub-Api-Version` for `[update].github_token`, the
+/// token `${ENV}`-expanded now; empty without a token.
+fn github_token_headers(cfg: &Config) -> Result<Vec<(String, String)>> {
+    let Some(token) = cfg.update.github_token.as_deref() else {
+        return Ok(Vec::new());
+    };
+    let mut headers =
+        crate::http::expand_headers(&[format!("Authorization: Bearer {}", token.trim())])
+            .map_err(|e| Error::Config(format!("update.github_token: {e}")))?;
+    headers.push((
+        "X-GitHub-Api-Version".to_owned(),
+        GITHUB_API_VERSION.to_owned(),
+    ));
+    Ok(headers)
+}
+
+/// The credentials an asset, sidecar or delegation download carries.
+///
+/// They go only to the hosts [`allowed_hosts`] admits: `[http].headers`, plus
+/// the GitHub token and `Accept: application/octet-stream` (the asset API's
+/// raw-bytes form) for a private GitHub repository.
+///
+/// # Errors
+/// A malformed header, or a `${ENV}` naming an unset variable.
+pub fn credentials(cfg: &Config) -> Result<Vec<(String, String)>> {
+    let mut headers = crate::http::expand_headers(&cfg.http.headers)?;
+    if cfg.update.manifest.is_none() && cfg.update.github.is_some() {
+        let token = github_token_headers(cfg)?;
+        if !token.is_empty() {
+            headers.extend(token);
+            headers.push(("Accept".to_owned(), GITHUB_OCTET_STREAM.to_owned()));
+        }
+    }
+    Ok(headers)
 }
 
 /// Native source: download the `lode/v1` JSON over HTTP, parse it, then back-fill
@@ -404,13 +454,10 @@ fn sidecar_url(entry: &VersionEntry, asset: &Asset, lookup: SidecarLookup) -> Op
 /// host is same-origin/allowlisted, reusing [`crate::download`]'s gate so the rule
 /// is identical to the asset download.
 fn fetch_sidecar(cfg: &Config, url: &str, auth: bool, allowed_hosts: &[String]) -> Option<String> {
-    let headers = if auth
-        && !cfg.http.headers.is_empty()
-        && crate::download::host_allowed(url, allowed_hosts)
-    {
+    let headers = if auth && crate::download::host_allowed(url, allowed_hosts) {
         // Can't build the credentials (e.g. an unset `${ENV}`) → skip the sidecar;
         // the asset download surfaces the real header error.
-        crate::http::expand_headers(&cfg.http.headers).ok()?
+        credentials(cfg).ok()?
     } else {
         Vec::new()
     };
@@ -439,15 +486,22 @@ fn sidecar_signature(body: &[u8]) -> String {
 fn fetch_github(cfg: &Config, repo: &str) -> Result<Manifest> {
     let (owner, name) = parse_repo(repo)?;
     let base = cfg.update.github_api.trim_end_matches('/');
-    // `[http].headers` (e.g. an `Authorization` token for private repos) ride both
-    // the API call and the asset download; values are never logged (see http.rs).
-    let headers = crate::http::expand_headers(&cfg.http.headers)?;
+    // `[http].headers` and the `github_token` ride the API call; values are never
+    // logged (see http.rs).
+    let mut headers = crate::http::expand_headers(&cfg.http.headers)?;
+    let token = github_token_headers(cfg)?;
+    let private = !token.is_empty();
+    if private {
+        headers.extend(token);
+        headers.push(("Accept".to_owned(), GITHUB_JSON.to_owned()));
+    }
     let channel = cfg.update.channel.as_str();
     let pin = cfg.update.pin.as_deref();
     let insecure = cfg.http.allow_insecure;
 
-    let release = select_release(base, owner, name, channel, pin, &headers, insecure)?;
-    let mut manifest = map_release(&cfg.global.app, release, channel)?;
+    let release = select_release(base, owner, name, channel, pin, &headers, insecure)
+        .map_err(|e| github_error_hint(e, private))?;
+    let mut manifest = map_release(&cfg.global.app, release, channel, private)?;
     // §5: a release may ship a signature as a `<name>.sig` sidecar asset instead of
     // the asset `label` (which GitHub renders in place of the filename); the label
     // wins when both are present.
@@ -534,6 +588,26 @@ fn get_json<T: serde::de::DeserializeOwned>(
     )?)?)
 }
 
+/// Name the likely cause of a failed GitHub API call: a rejected token, or a
+/// repository the caller cannot see (GitHub answers 404 for both "missing" and
+/// "private without access").
+fn github_error_hint(e: Error, private: bool) -> Error {
+    let Error::Http(message) = &e else {
+        return e;
+    };
+    let hint = if message.contains("status: 401") {
+        "the GitHub token was rejected (expired or revoked?)"
+    } else if message.contains("status: 404") && private {
+        "repository or release not found, or the token cannot read it \
+         (fine-grained token: Contents read-only on this repository; classic: `repo` scope)"
+    } else if message.contains("status: 404") {
+        "repository or release not found; a private repository needs [update].github_token"
+    } else {
+        return e;
+    };
+    Error::Http(format!("{message}: {hint}"))
+}
+
 /// Split a `"owner/name"` repo spec, rejecting empty parts or extra slashes.
 fn parse_repo(repo: &str) -> Result<(&str, &str)> {
     let repo = repo.trim();
@@ -563,13 +637,17 @@ fn select_prerelease(releases: Vec<GhRelease>) -> Result<GhRelease> {
 /// or a `pin` on the raw tag (see [`canonical_id`]) — and `app` is the manifest
 /// `name` (it must match `[global].app`). The result carries one synthesised
 /// `channel` whose `latest` points at that version.
-fn map_release(app: &str, release: GhRelease, channel: &str) -> Result<Manifest> {
+fn map_release(app: &str, release: GhRelease, channel: &str, private: bool) -> Result<Manifest> {
     let ver = strip_v(&release.tag_name).to_owned();
     // The release tag becomes a `versions` key (→ a filesystem path); validate it
     // before it can be inserted or used downstream.
     validate_id("version", &ver)?;
 
-    let assets: Vec<Asset> = release.assets.into_iter().map(gh_asset_to_asset).collect();
+    let assets: Vec<Asset> = release
+        .assets
+        .into_iter()
+        .map(|a| gh_asset_to_asset(a, private))
+        .collect();
     if assets.is_empty() {
         return Err(Error::Manifest(format!("release {ver:?} has no assets")));
     }
@@ -605,16 +683,23 @@ fn map_release(app: &str, release: GhRelease, channel: &str) -> Result<Manifest>
 /// sidecar asset fills it in afterwards when the label is absent —
 /// [`resolve_sidecars`]); `size` carried through. GitHub has no slot for the `run`/`exec` launch overrides, so they are
 /// `None` (the operator's `[command]` decides the launch); credentials may ride the
-/// asset host (gated by `allowed_hosts`), so `auth` is on.
-fn gh_asset_to_asset(a: GhAsset) -> Asset {
+/// asset host (gated by `allowed_hosts`), so `auth` is on. For a private
+/// repository (`private`) the asset API `url` replaces `browser_download_url`,
+/// which answers 404 to a token.
+fn gh_asset_to_asset(a: GhAsset, private: bool) -> Asset {
     let sha256 = a
         .digest
         .as_deref()
         .map(|d| d.strip_prefix("sha256:").unwrap_or(d).to_owned())
         .unwrap_or_default();
+    let url = if private && !a.url.is_empty() {
+        a.url
+    } else {
+        a.browser_download_url
+    };
     Asset {
         name: a.name,
-        url: a.browser_download_url,
+        url,
         sha256,
         // An asset with no label comes back as `"label": ""`, not `null`, so a
         // blank label MUST decay to "unsigned". Kept as `Some("")` it would read
@@ -666,6 +751,9 @@ struct GhRelease {
 struct GhAsset {
     name: String,
     browser_download_url: String,
+    /// The asset API URL (`…/releases/assets/<id>`).
+    #[serde(default)]
+    url: String,
     #[serde(default)]
     digest: Option<String>,
     #[serde(default)]
@@ -1258,7 +1346,7 @@ mod tests {
         let release = select_prerelease(list).unwrap();
         assert_eq!(release.tag_name, "v1.6.0-beta.2");
 
-        let m = map_release("myapp", release, "beta").unwrap();
+        let m = map_release("myapp", release, "beta", false).unwrap();
         assert_eq!(m.schema, "lode/v1");
         assert_eq!(m.name, "myapp"); // from the configured app, not a manifest asset
         assert!(m.key_id.is_none());
@@ -1302,7 +1390,7 @@ mod tests {
         // The release is known by ONE id, the stripped tag: a pin (or explicit
         // version) given as the raw tag lands on it too, so `versions/<id>` and the
         // signed `version` are the same whichever way the release was selected.
-        let m = map_release("myapp", release, "stable").unwrap();
+        let m = map_release("myapp", release, "stable", false).unwrap();
         assert!(m.versions.contains_key("1.5.0"));
         assert!(!m.versions.contains_key("v1.5.0"));
         assert_eq!(
@@ -1340,7 +1428,7 @@ mod tests {
     fn map_release_rejects_empty_asset_list() {
         let release: GhRelease =
             serde_json::from_slice(br#"{ "tag_name": "v1.0.0", "assets": [] }"#).unwrap();
-        assert!(map_release("myapp", release, "stable").is_err());
+        assert!(map_release("myapp", release, "stable", false).is_err());
     }
 
     // --- `.sig` sidecar resolution over a loopback stub -------------------------
@@ -1385,6 +1473,145 @@ mod tests {
             ));
             routes
         })
+    }
+
+    /// A loopback server answering by `handler(request head)`; returns its port
+    /// and the request heads it saw (lower-cased).
+    fn serve_heads(
+        handler: impl Fn(&str) -> String + Send + 'static,
+    ) -> (u16, std::sync::Arc<std::sync::Mutex<Vec<String>>>) {
+        use std::io::{Read as _, Write as _};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let heads = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let log = std::sync::Arc::clone(&heads);
+        std::thread::spawn(move || {
+            for sock in listener.incoming() {
+                let Ok(mut sock) = sock else { break };
+                let mut buf = Vec::new();
+                let mut byte = [0u8; 1];
+                while !buf.ends_with(b"\r\n\r\n") {
+                    if sock.read(&mut byte).unwrap_or(0) == 0 {
+                        break;
+                    }
+                    buf.push(byte[0]);
+                }
+                let head = String::from_utf8_lossy(&buf).to_ascii_lowercase();
+                log.lock().unwrap().push(head.clone());
+                let _ = sock.write_all(handler(&head).as_bytes());
+            }
+        });
+        (port, heads)
+    }
+
+    fn respond(status: &str, extra: &str, body: &str) -> String {
+        format!(
+            "HTTP/1.1 {status}\r\n{extra}Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        )
+    }
+
+    #[test]
+    fn github_token_reads_a_private_release_through_the_asset_api() {
+        let bytes = "private bytes";
+        let sha = crate::verify::sha256_hex(bytes.as_bytes());
+        let digest = sha.clone();
+        // GitHub's storage host: a different host name than the API, so the
+        // token must not follow the redirect here.
+        let (storage, storage_heads) = serve_heads(move |head| {
+            if head.starts_with("get /blob/a.bin.sig?") {
+                respond("200 OK", "", "SIG==\n")
+            } else if head.starts_with("get /blob/a.bin?") {
+                respond("200 OK", "", bytes)
+            } else {
+                respond("404 Not Found", "", "")
+            }
+        });
+        let (api, api_heads) = serve_heads(move |head| {
+            if !head.contains("authorization: bearer secret") {
+                return respond("404 Not Found", "", "");
+            }
+            let base = head
+                .lines()
+                .find_map(|l| l.strip_prefix("host: "))
+                .map(|h| format!("http://{}", h.trim()))
+                .unwrap_or_default();
+            if head.starts_with("get /repos/o/r/releases/latest ") {
+                let release = serde_json::json!({
+                    "tag_name": "v1.0.0",
+                    "assets": [
+                        { "name": "a.bin", "browser_download_url": format!("{base}/dl/a.bin"),
+                          "url": format!("{base}/repos/o/r/releases/assets/1"), "digest": format!("sha256:{digest}") },
+                        { "name": "a.bin.sig", "browser_download_url": format!("{base}/dl/a.bin.sig"),
+                          "url": format!("{base}/repos/o/r/releases/assets/2") },
+                    ],
+                });
+                return respond("200 OK", "", &release.to_string());
+            }
+            let blob = match head.split_whitespace().nth(1) {
+                Some("/repos/o/r/releases/assets/1") => "a.bin",
+                Some("/repos/o/r/releases/assets/2") => "a.bin.sig",
+                _ => return respond("404 Not Found", "", ""),
+            };
+            assert!(head.contains("accept: application/octet-stream"), "{head}");
+            respond(
+                "302 Found",
+                &format!("Location: http://localhost:{storage}/blob/{blob}?sig=x\r\n"),
+                "",
+            )
+        });
+        let dir = std::env::temp_dir().join(format!("lode-gh-private-{}", std::process::id()));
+        let cfg = Config::from_toml(&format!(
+            "[global]\napp = \"myapp\"\ndir = {:?}\n[update]\ngithub = \"o/r\"\n\
+             github_api = \"http://127.0.0.1:{api}\"\ngithub_token = \"secret\"\nasset = \"a.bin\"\n\
+             [trust]\nrequire_signature = \"enforce\"\n",
+            dir.display().to_string()
+        ))
+        .unwrap();
+
+        let m = fetch(&cfg).unwrap();
+        let asset = select_asset(version_entry(&m, "1.0.0").unwrap(), "a.bin").unwrap();
+        assert_eq!(
+            asset.url,
+            format!("http://127.0.0.1:{api}/repos/o/r/releases/assets/1")
+        );
+        assert_eq!(
+            asset.sig.as_deref(),
+            Some("SIG=="),
+            "sidecar via the asset API"
+        );
+        let (path, got) =
+            crate::download::fetch_artifact(&cfg, asset, "1.0.0", &allowed_hosts(&cfg)).unwrap();
+        assert_eq!(got, sha);
+        assert_eq!(std::fs::read_to_string(path).unwrap(), bytes);
+        let _ = std::fs::remove_dir_all(&dir);
+
+        let first = api_heads.lock().unwrap()[0].clone();
+        assert!(first.contains("accept: application/vnd.github+json"));
+        assert!(first.contains("x-github-api-version: 2022-11-28"));
+        let storage_heads = storage_heads.lock().unwrap().clone();
+        assert_eq!(storage_heads.len(), 2);
+        assert!(
+            storage_heads.iter().all(|h| !h.contains("authorization")),
+            "the token never leaves the API host"
+        );
+        assert_eq!(allowed_hosts(&cfg), vec!["127.0.0.1".to_owned()]);
+    }
+
+    #[test]
+    fn github_not_found_names_the_token() {
+        let (api, _) = serve_heads(|_| respond("404 Not Found", "", ""));
+        let base = format!("http://127.0.0.1:{api}");
+        let err = fetch(&github_cfg(&base, "a.bin", "off"))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("needs [update].github_token"), "{err}");
+        let cfg = Config::from_toml(&format!(
+            "[update]\ngithub = \"o/r\"\ngithub_api = \"{base}\"\ngithub_token = \"t\"\n"
+        ))
+        .unwrap();
+        let err = fetch(&cfg).unwrap_err().to_string();
+        assert!(err.contains("the token cannot read it"), "{err}");
     }
 
     fn selected_sig(m: &Manifest) -> Option<String> {

@@ -8,6 +8,7 @@ use lode_core::config::{Config, Notify, Policy, Readiness, Resource, RestartPoli
 use lode_core::engine::{
     Target, ensure_runtime, locate, required_asset, resolve_target, version_installed,
 };
+use lode_core::report::Reporter;
 use lode_core::state::{self, HistoryEntry, HistoryResult, State, Status};
 use lode_core::{Error, Result, download, install, manifest, resource};
 
@@ -150,6 +151,9 @@ pub fn serve_core(
     }
     // Held for the whole run (across reloads); dropped on return releases the lock.
     let _lock = opts.acquire_lock.then(|| lock_acquire(&cfg)).transpose()?;
+    // Reports outlive config reloads; `[report]` is pinned like the trust anchors.
+    let reporter = ReportGuard(Reporter::start(&cfg));
+    let mut announced = false;
     // What this process trusts and where it fetches from is fixed at start: a
     // reload may change anything else (see [`trust_anchor_changed`]).
     let anchors = cfg.clone();
@@ -160,6 +164,15 @@ pub fn serve_core(
         }
         let target = resolve_target(&cfg)?;
         install::switch_current(&cfg, &target.version)?;
+        if let Some(r) = &reporter.0
+            && !std::mem::replace(&mut announced, true)
+        {
+            r.event(
+                "lode.started",
+                &format!("lode started {}", target.version),
+                &[("version", target.version.as_str())],
+            );
+        }
         if let Some(code) = bootstrap_terminated(signals, &cfg) {
             return Ok(code);
         }
@@ -170,6 +183,7 @@ pub fn serve_core(
         }
 
         let mut supervisor = Supervisor::new(&cfg, target, runtime_dir);
+        supervisor.report.clone_from(&reporter.0);
         match supervisor.run(signals)? {
             Outcome::Exit(code) => return Ok(code),
             // A paused app whose `lode.toml` was edited: reload and re-attempt.
@@ -197,8 +211,24 @@ pub fn serve_core(
     }
 }
 
+/// How long shutdown waits for the last reports to go out.
+const REPORT_STOP_WAIT: Duration = Duration::from_secs(5);
+
+/// Sends `lode.stopping` and a final export when [`serve_core`] returns,
+/// whichever way it does.
+struct ReportGuard(Option<Reporter>);
+
+impl Drop for ReportGuard {
+    fn drop(&mut self) {
+        if let Some(r) = &self.0 {
+            r.event("lode.stopping", "lode stopping", &[]);
+            r.stop(REPORT_STOP_WAIT);
+        }
+    }
+}
+
 /// The config sections a reload must NOT change, or which one `next` changes:
-/// `[trust]`, the `[update]` source (`manifest`/`github`/`github_api`), the
+/// `[trust]`, the `[update]` source (`manifest`/`github`/`github_api`/`github_token`), the
 /// `[[resource]]` sources (`name`/`manifest`), the `[http]` credential scope (`allow_insecure`, `credential_hosts`) and the
 /// `[runtime]` download (`download`/`sha256`).
 ///
@@ -216,6 +246,7 @@ fn trust_anchor_changed(initial: &Config, next: &Config) -> Option<&'static str>
     if initial.update.manifest != next.update.manifest
         || initial.update.github != next.update.github
         || initial.update.github_api != next.update.github_api
+        || initial.update.github_token != next.update.github_token
     {
         return Some("[update] source");
     }
@@ -232,6 +263,9 @@ fn trust_anchor_changed(initial: &Config, next: &Config) -> Option<&'static str>
         || initial.http.credential_hosts != next.http.credential_hosts
     {
         return Some("[http] credential scope");
+    }
+    if initial.report != next.report {
+        return Some("[report]");
     }
     if initial.runtime.download != next.runtime.download
         || initial.runtime.sha256 != next.runtime.sha256
@@ -880,6 +914,8 @@ pub struct Supervisor<'c> {
     /// failure, so a later success clears exactly that message and never a
     /// definitive error someone else recorded.
     fetch_error: Option<String>,
+    /// Status reporting, when `[report]` is on.
+    report: Option<Reporter>,
 }
 
 impl<'c> Supervisor<'c> {
@@ -929,6 +965,14 @@ impl<'c> Supervisor<'c> {
             next_resource_check_at,
             fetch_failures: 0,
             fetch_error: None,
+            report: None,
+        }
+    }
+
+    /// Queue a status-report event, when reporting is on.
+    fn report_event(&self, name: &str, body: &str, attributes: &[(&str, &str)]) {
+        if let Some(r) = &self.report {
+            r.event(name, body, attributes);
         }
     }
 
@@ -1101,6 +1145,9 @@ impl<'c> Supervisor<'c> {
         self.child = Some(pid);
         self.spawn_at = Instant::now();
         self.instance.clone_from(&instance);
+        if let Some(r) = &self.report {
+            r.app_spawned();
+        }
         tracing::info!(
             version = self.target.version,
             pid = pid.as_raw(),
@@ -1217,12 +1264,16 @@ impl<'c> Supervisor<'c> {
             .config_path
             .as_deref()
             .and_then(|p| state::mtime(p).ok().flatten());
+        let message = format!("paused after {attempts} failed start attempts (last exit {code})");
+        self.report_event(
+            "lode.paused",
+            &message,
+            &[("version", self.target.version.as_str())],
+        );
         self.mutate_state(|st| {
             st.status = Some(Status::Error);
             st.pid = None;
-            st.last_error = Some(format!(
-                "paused after {attempts} failed start attempts (last exit {code})"
-            ));
+            st.last_error = Some(message);
         });
     }
 
@@ -1656,6 +1707,7 @@ impl<'c> Supervisor<'c> {
     /// reported immediately.
     fn note_fetch_failure(&mut self, message: &str, e: &Error) {
         if !is_transient_fetch(e) {
+            self.report_event("lode.check.failed", message, &[]);
             self.fetch_failures = 0;
             self.fetch_error = None; // this message is not ours to clear later
             self.note_error(message);
@@ -1671,6 +1723,7 @@ impl<'c> Supervisor<'c> {
             return;
         }
         tracing::error!(error = %e, strikes = self.fetch_failures, "fetch keeps failing; reporting to state.json");
+        self.report_event("lode.check.failed", message, &[]);
         self.note_error(message);
         self.fetch_error = Some(message.to_owned());
     }
@@ -1958,6 +2011,17 @@ impl<'c> Supervisor<'c> {
     /// Tell the running app that `applied` resources changed: a restart if any
     /// asks for one, else `SIGHUP` if any asks for a signal.
     fn notify_resources(&mut self, applied: &[&Resource]) -> Option<Outcome> {
+        for res in applied {
+            let version = resource::current(self.cfg, &res.name).unwrap_or_default();
+            self.report_event(
+                "lode.resource.updated",
+                &format!("resource {} updated to {version}", res.name),
+                &[
+                    ("resource", res.name.as_str()),
+                    ("version", version.as_str()),
+                ],
+            );
+        }
         let child = self.child?;
         if applied.iter().any(|r| r.notify == Notify::Restart) {
             tracing::info!("resource updated; restarting the app");
@@ -2353,11 +2417,19 @@ impl<'c> Supervisor<'c> {
     /// Commit the observed target: mark it `running` + `last_good`, append a `good`
     /// history entry, prune old versions, and return to the `Run` phase.
     fn commit_update(&mut self) {
-        let applied = match &self.phase {
-            Phase::Observe(obs) => obs.applied.clone(),
+        let (applied, from) = match &self.phase {
+            Phase::Observe(obs) => (
+                obs.applied.clone(),
+                obs.fallback.clone().unwrap_or_default(),
+            ),
             Phase::Run | Phase::Prepare(_) => return,
         };
         tracing::info!(version = applied, "update ready — committing as last_good");
+        self.report_event(
+            "lode.updated",
+            &format!("updated {from} -> {applied}"),
+            &[("from", from.as_str()), ("to", applied.as_str())],
+        );
         self.restart_count = 0;
         let at = now_timestamp();
         self.mutate_state(|st| {
@@ -2420,6 +2492,11 @@ impl<'c> Supervisor<'c> {
             fallback,
             reason,
             "update failed — rolling back"
+        );
+        self.report_event(
+            "lode.rolled_back",
+            &format!("rolled back {applied} -> {fallback}: {reason}"),
+            &[("from", applied), ("to", fallback), ("reason", reason)],
         );
         self.set_status(Status::RollingBack);
         if self.child.is_some() {
@@ -3125,6 +3202,16 @@ mod tests {
             ),
             Some("[runtime] download")
         );
+        assert_eq!(
+            trust_anchor_changed(
+                &initial,
+                &edited(
+                    "[trust]",
+                    "[report]\nendpoint = \"https://evil.example\"\n[trust]"
+                )
+            ),
+            Some("[report]")
+        );
         let with_resource = |manifest: &str| {
             edited(
                 "bun.zip\"\n",
@@ -3610,6 +3697,7 @@ mod tests {
                 manifest: None,
                 github: None,
                 github_api: "https://api.github.com".to_owned(),
+                github_token: None,
                 asset: None,
                 channel: "stable".to_owned(),
                 policy: Policy::Off,
@@ -3660,6 +3748,13 @@ mod tests {
             },
             env: BTreeMap::new(),
             resources: Vec::new(),
+            report: lode_core::config::Report {
+                endpoint: None,
+                interval: 300,
+                headers: Vec::new(),
+                attributes: BTreeMap::new(),
+                instance_id: None,
+            },
             config_path: None,
         }
     }

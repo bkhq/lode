@@ -203,7 +203,7 @@ jobs:
 - lode 选 `name` 等于运维 `[update].asset` 的资产;`sha256` 取自资产 `digest`(对字节复验),
   `version` 取自 tag 去掉前导 `v`(签名必须绑定的 id,所以上面用 `${TAG#v}`),签名取自
   `<asset>.sig` sidecar 资产(或资产 `label`,但 GitHub 会用它代替文件名显示)。`channel = stable` → `/releases/latest`;其它 channel → 最新非草稿
-  prerelease;`pin` → 指定 tag。无需 `manifest.json` 资源。私有库:token 放 `[http].headers`。
+  prerelease;`pin` → 指定 tag。无需 `manifest.json` 资源。私有库:设置 `[update].github_token = "${GITHUB_TOKEN}"`(对该仓库有 *Contents: read-only* 权限的 fine-grained token),lode 会改走 release 资产 API 下载。
 - 资产命名 `<app>-<os>-<arch>.<ext>`;每台主机的运维把 `[update].asset` 设为本机对应的确切
   文件名。
 

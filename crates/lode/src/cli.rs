@@ -185,6 +185,14 @@ pub(crate) struct Globals {
     /// GitHub API base URL (for GitHub Enterprise).
     #[arg(long = "github-api", env = "LODE_GITHUB_API", global = true)]
     pub(crate) github_api: Option<String>,
+    /// GitHub token for a private repository (`${ENV}` is expanded per request).
+    #[arg(
+        long = "github-token",
+        env = "LODE_GITHUB_TOKEN",
+        global = true,
+        hide_env_values = true
+    )]
+    pub(crate) github_token: Option<String>,
     /// Asset filename to install on this host (the source-agnostic selection key).
     #[arg(long = "asset", env = "LODE_ASSET", global = true)]
     pub(crate) asset: Option<String>,
@@ -340,6 +348,14 @@ pub(crate) struct Globals {
     /// Signal that triggers a graceful restart instead of being forwarded.
     #[arg(long = "restart-signal", env = "LODE_RESTART_SIGNAL", global = true)]
     pub(crate) restart_signal: Option<String>,
+
+    // --- [report] ---
+    /// OTLP/HTTP base URL to report this host's status to (off when unset).
+    #[arg(long = "report-endpoint", env = "LODE_REPORT_ENDPOINT", global = true)]
+    pub(crate) report_endpoint: Option<String>,
+    /// Seconds between status reports.
+    #[arg(long = "report-interval", env = "LODE_REPORT_INTERVAL", global = true)]
+    pub(crate) report_interval: Option<u64>,
 }
 
 /// The **loader** CLI (`lode`). No subcommands: bare `lode` starts the supervised

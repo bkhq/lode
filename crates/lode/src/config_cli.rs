@@ -60,6 +60,7 @@ fn overrides_from_globals(cli: &Globals) -> Overrides {
         manifest: cli.manifest.clone(),
         github: cli.github.clone(),
         github_api: cli.github_api.clone(),
+        github_token: cli.github_token.clone(),
         asset: cli.asset.clone(),
         channel: cli.channel.clone(),
         policy: cli.policy.map(Into::into),
@@ -93,5 +94,7 @@ fn overrides_from_globals(cli: &Globals) -> Overrides {
         listen: cli.listen.clone(),
         forward_signals: cli.forward_signals.clone(),
         restart_signal: cli.restart_signal.clone(),
+        report_endpoint: cli.report_endpoint.clone(),
+        report_interval: cli.report_interval,
     }
 }

@@ -53,7 +53,7 @@ rustls = "0.23"
 ureq = { version = "3", default-features = false, features = ["rustls"] }
 # process / signals / hardening: Unix-only (see each crate's cfg(unix) table)
 signal-hook = "0.4"
-nix = { version = "0.31", default-features = false, features = ["signal", "process", "fs"] }
+nix = { version = "0.31", default-features = false, features = ["signal", "process", "fs", "hostname"] }
 rlimit = "0.11"
 
 # === Lock 4 — workspace lints (deny-warnings policy lives here, not on the CLI) ===

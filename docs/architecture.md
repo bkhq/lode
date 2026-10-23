@@ -442,6 +442,16 @@ After lode sends `SIGTERM`, it **absolutely will not SIGKILL within `stop_timeou
 - The operator sets `stop_timeout` to ≥ the app's worst-case cleanup time, and **< the container/orchestrator's stop grace** (e.g. Docker's default 10s, otherwise the container layer will SIGKILL first).
 - On receiving `SIGTERM`, the app must finish up as quickly as possible and `exit(0)`; only a timeout results in SIGKILL.
 
+### Status reporting (`[report]`)
+
+With `[report].endpoint` set, bare `lode` pushes the host's status to an **OpenTelemetry OTLP/HTTP** receiver, JSON encoding: `{endpoint}/v1/metrics` and `{endpoint}/v1/logs`. Any OTLP receiver works — an OpenTelemetry Collector, a vendor backend, or a lode-server registry (`https://<host>/r/otlp`, with a token that has a grant on the package). There is no receiver-specific switch: the receiver identifies the app from the resource attributes.
+
+- **Resource:** `service.name` (= `[global].app`), `service.version` (current version), `service.instance.id` (`instance_id`, default the host name), `host.name`, `host.arch`, `os.type`, `process.pid`, `lode.version`, `lode.channel`, `lode.report.interval`, plus `[report].attributes` (which never replace these).
+- **Metrics** (at start, every `interval` and on shutdown): `lode.app.up`, `lode.app.status` (attribute `status` = the `state.json` status), `lode.app.restarts` (cumulative sum), `lode.app.uptime` (s), `lode.update.available` (attribute `version`), `lode.app.last_good` (attribute `version`), `lode.resource.version` (attributes `resource`, `version`).
+- **Events** (log records named by `eventName` and the `event.name` attribute, sent as they happen): `lode.started`, `lode.stopping`, `lode.updated` (`from`, `to`), `lode.rolled_back` (`from`, `to`, `reason`), `lode.paused`, `lode.resource.updated` (`resource`, `version`), `lode.check.failed`.
+- **Runtime:** a separate thread does all reporting I/O (at most 10 s per request), so a slow or dead receiver never delays supervision. Up to 100 events queue; a failed export is logged and dropped (no disk queue, no replay); `429`/`503` pause exports for `Retry-After`. Shutdown waits at most 5 s for the last export.
+- **Credentials:** `[report].headers` go to the endpoint only and `[http].headers` never do. The endpoint must be HTTPS (or loopback http) unless `[http].allow_insecure`. `[report]` is fixed for the life of the process, like `[trust]`.
+
 ---
 
 ## 9. PID lock
@@ -470,6 +480,7 @@ Key names: `lode.toml` uses snake_case (see `docs/lode.example.toml`); environme
 | `LODE_MANIFEST` | `--manifest <url>` | `update.manifest` | — | **native source**: lode/v1 manifest URL (mutually exclusive with `github`) |
 | `LODE_GITHUB` | `--github <owner/name>` | `update.github` | — | **github source**: the repository (mutually exclusive with `manifest`) |
 | `LODE_GITHUB_API` | `--github-api <url>` | `update.github_api` | `https://api.github.com` | (github) API base URL (GHE) |
+| `LODE_GITHUB_TOKEN` | `--github-token <token>` | `update.github_token` | — | (github) token for a private repository, `${ENV}` expanded per request, §12 |
 | `LODE_ASSET` | `--asset <file>` | `update.asset` | — | the asset **filename** to install on this host (the selection key, §4/§12) |
 | `LODE_CHANNEL` | `--channel <name>` | `update.channel` | `stable` | the channel to follow (a manifest may define multiple) |
 | `LODE_UPDATE_POLICY` | `--policy <off\|check\|auto>` | `update.policy` | `check` | update strategy, §5 |
@@ -511,6 +522,12 @@ Key names: `lode.toml` uses snake_case (see `docs/lode.example.toml`); environme
 | **`[signals]` — signals** | | | | |
 | `LODE_FORWARD_SIGNALS` | `--forward-signals <list>` | `signals.forward` | (standard set) | the set of signals forwarded to the child process, §8 |
 | `LODE_RESTART_SIGNAL` | `--restart-signal <sig>` | `signals.restart` | — | the signal that triggers a graceful restart (unset by default), §8 |
+| **`[report]` — status reporting** | | | | |
+| `LODE_REPORT_ENDPOINT` | `--report-endpoint <url>` | `report.endpoint` | — | OTLP/HTTP base URL to report to; reporting is off when unset, §8 |
+| `LODE_REPORT_INTERVAL` | `--report-interval <sec>` | `report.interval` | `300` | seconds between metric exports |
+| — | — | `report.headers` | — | headers sent to the endpoint only (`"Name: Value"`, `${ENV}` expanded) |
+| — | — | `report.instance_id` | host name | `service.instance.id` |
+| — | — | `report.attributes` (table) | — | extra OpenTelemetry resource attributes |
 
 Child-process environment: pass through the host environment and **strip configuration-class `LODE_*`**; apply the operator's `[env]` table as **defaults** (only for keys the host env doesn't already set); prepend the runtime dir to PATH; then inject the read-only introspection variables `LODE_ACTIVE_VERSION`, `LODE_DIR`, `LODE_WORKDIR` (the resolved cwd), `LODE_CONFIG` (the loaded `lode.toml` path; only when a config file was loaded), `LODE_READINESS` (`none`|`state`) and `LODE_INSTANCE` (`{pid}-{nanoid}`, the unique id for this startup that the app suffixes with the handshake phase, §8). Precedence low→high: `[env]` defaults < inherited host env < runtime PATH-prepend < injected `LODE_*`.
 
@@ -620,7 +637,7 @@ The native manifest is the authoritative format (explicit, signable, and placeab
 
 - **Version number**: use the release's `tag_name` (with a leading `v` before a digit stripped) — GitHub is authoritative for the version. A `pin` (or `--version`) given as the raw tag resolves to that same stripped id, so `versions/<id>` and the signed `version` never depend on how the release was selected — publishers sign with the stripped id.
 - **No catalog (manifest-level) signature on GitHub**: freshness comes from tag authority; per-asset `sig` (sidecar or label) still protects each download.
-- **Private repo**: put the GitHub token in `[http].headers` (`Authorization: Bearer <PAT>`), carried by the API and same-host asset downloads.
+- **Private repo**: set `[update].github_token` (e.g. `"${GITHUB_TOKEN}"`; a fine-grained token with *Contents: read-only* on the repository, or a classic token with `repo`). The token goes to the `github_api` host only, as `Authorization: Bearer`. Assets, `.sig` sidecars and the delegation are then fetched from the release-asset API (`/repos/<o>/<r>/releases/assets/<id>`, `Accept: application/octet-stream`) instead of `browser_download_url`, which answers 404 for a private repository; the API redirects to a short-lived signed URL on GitHub's storage host, followed without the token. A 404 names the likely cause (no token, or a token without access).
 
 > The simplest usage needs only `github = "owner/repo"` + `asset = "<filename>"`; `stable` goes straight to `/releases/latest`. Both sources produce the same internal asset list → the same verify/install path. Signing in CI is optional — see the release-workflow recipe in [`docs/source-adapters.md`](source-adapters.md) §5.
 

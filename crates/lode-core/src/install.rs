@@ -1373,6 +1373,7 @@ mod tests {
                 manifest: None,
                 github: None,
                 github_api: "https://api.github.com".to_owned(),
+                github_token: None,
                 asset: None,
                 channel: "stable".to_owned(),
                 policy: Policy::Check,
@@ -1423,6 +1424,13 @@ mod tests {
             },
             env: std::collections::BTreeMap::new(),
             resources: Vec::new(),
+            report: crate::config::Report {
+                endpoint: None,
+                interval: 300,
+                headers: Vec::new(),
+                attributes: std::collections::BTreeMap::new(),
+                instance_id: None,
+            },
             config_path: None,
         }
     }

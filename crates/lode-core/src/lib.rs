@@ -42,6 +42,7 @@ pub mod lock;
 pub mod lock;
 mod logging;
 pub mod manifest;
+pub mod report;
 pub mod resource;
 pub mod self_update;
 pub mod state;
