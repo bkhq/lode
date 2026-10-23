@@ -272,9 +272,32 @@ let cfg = Config::builder()
     .build()?;
 ```
 
-builder 覆盖源、资产、通道、策略、版本固定和启动命令。`[trust]`、`[http]`、`[supervise]`、
-`[runtime]` 请用 `from_toml`,键名与 [`lode.example.toml`](lode.example.toml) 一致。
+builder 覆盖源、资产、通道、策略、版本固定、启动命令和 `[report]`。`[trust]`、`[http]`、
+`[supervise]`、`[runtime]` 请用 `from_toml`,键名与 [`lode.example.toml`](lode.example.toml) 一致。
 两者都不读取文件,也不读取 `LODE_*` 环境变量。
+
+### 状态上报
+
+配置了 `[report]` 端点后,循环会通过 OTLP/HTTP 推送应用状态,与 `lode` 二进制完全一致:
+启动时、每个 `interval` 以及停止前各导出一次指标(`lode.app.status`、重启次数、运行时长、
+可用版本与最近可用版本、资源版本),并在发生时发送 `lode.*` 生命周期事件(`started`、
+`updated`、`rolled_back`、`paused`、`check.failed`、`stopping`)。`service.name` 是被监管的应用,
+`process.pid` 是宿主进程本身。
+
+```rust
+let cfg = Config::builder()
+    .app("worker")
+    .manifest("https://lode.bk.io/r/<namespace>/<slug>/manifest.json")
+    .report_endpoint("https://lode.bk.io/r/otlp")   // 任意 OTLP/HTTP 基址
+    .report_header("Authorization: Bearer ${LODE_REGISTRY_TOKEN}")
+    .report_attribute("deployment.environment.name", "prod")
+    .report_interval(300)                           // 默认值
+    .build()?;
+```
+
+这些请求头只发往上报端点,`${ENV}` 在每次请求时展开。端点必须是 https(或回环 http),
+除非设置了 `[http].allow_insecure`。上报在独立线程中运行,不会阻塞循环;`[report]` 与 `[trust]`
+一样在循环生命周期内固定。各项导出内容见 [operations.zh-CN.md](operations.zh-CN.md#状态上报)。
 
 ### 谁负责什么
 

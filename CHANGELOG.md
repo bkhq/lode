@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **Status reporting from the builder.** `Config::builder()` gains
+  `report_endpoint`, `report_interval`, `report_header`, `report_attribute` and
+  `report_instance_id`, so a host embedding `serve_embedded` can turn on
+  `[report]` without TOML; the embedding guide documents what it reports.
+
 ## [0.2.0] - 2026-10-23
 
 ### Added

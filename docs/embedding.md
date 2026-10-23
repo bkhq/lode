@@ -310,10 +310,37 @@ let cfg = Config::builder()
     .build()?;
 ```
 
-The builder covers the source, the asset, the channel, the policy, a pin and
-the launch commands. For `[trust]`, `[http]`, `[supervise]` or `[runtime]` use
-`from_toml`; the keys are those of [`lode.example.toml`](lode.example.toml).
-Neither reads a file or the `LODE_*` environment.
+The builder covers the source, the asset, the channel, the policy, a pin, the
+launch commands and `[report]`. For `[trust]`, `[http]`, `[supervise]` or
+`[runtime]` use `from_toml`; the keys are those of
+[`lode.example.toml`](lode.example.toml). Neither reads a file or the `LODE_*`
+environment.
+
+### Status reporting
+
+With a `[report]` endpoint the loop pushes the app's status over OTLP/HTTP,
+exactly as the `lode` binary does: metrics (`lode.app.status`, restarts,
+uptime, available and last good version, resource versions) at start, every
+`interval` and once more on shutdown, and the `lode.*` lifecycle events
+(`started`, `updated`, `rolled_back`, `paused`, `check.failed`, `stopping`).
+`service.name` is the app, `process.pid` the host's own process.
+
+```rust
+let cfg = Config::builder()
+    .app("worker")
+    .manifest("https://lode.bk.io/r/<namespace>/<slug>/manifest.json")
+    .report_endpoint("https://lode.bk.io/r/otlp")   // any OTLP/HTTP base
+    .report_header("Authorization: Bearer ${LODE_REGISTRY_TOKEN}")
+    .report_attribute("deployment.environment.name", "prod")
+    .report_interval(300)                           // the default
+    .build()?;
+```
+
+The headers go to the report endpoint only; `${ENV}` is expanded per request.
+The endpoint must be https (or loopback http) unless `[http].allow_insecure`.
+Reporting runs on its own thread and never blocks the loop; `[report]` is fixed
+for the life of the loop, like `[trust]`. See
+[operations.md](operations.md#status-reporting) for what each export carries.
 
 ### Who owns what
 

@@ -1038,6 +1038,9 @@ impl Config {
 #[derive(Debug, Default, Clone)]
 pub struct ConfigBuilder {
     overrides: Overrides,
+    report_headers: Vec<String>,
+    report_attributes: BTreeMap<String, String>,
+    report_instance_id: Option<String>,
 }
 
 impl ConfigBuilder {
@@ -1113,14 +1116,54 @@ impl ConfigBuilder {
         self
     }
 
+    /// `[report].endpoint` — OTLP/HTTP base URL; turns status reporting on.
+    #[must_use]
+    pub fn report_endpoint(mut self, endpoint: impl Into<String>) -> Self {
+        self.overrides.report_endpoint = Some(endpoint.into());
+        self
+    }
+
+    /// `[report].interval` — seconds between metric exports (defaults to 300).
+    #[must_use]
+    pub const fn report_interval(mut self, seconds: u64) -> Self {
+        self.overrides.report_interval = Some(seconds);
+        self
+    }
+
+    /// Add a `[report].headers` line (`Name: value`, `${ENV}` expanded per
+    /// request); sent to the report endpoint only.
+    #[must_use]
+    pub fn report_header(mut self, line: impl Into<String>) -> Self {
+        self.report_headers.push(line.into());
+        self
+    }
+
+    /// Add a `[report].attributes` resource attribute.
+    #[must_use]
+    pub fn report_attribute(mut self, key: impl Into<String>, value: impl Into<String>) -> Self {
+        self.report_attributes.insert(key.into(), value.into());
+        self
+    }
+
+    /// `[report].instance_id` — `service.instance.id` (defaults to the host name).
+    #[must_use]
+    pub fn report_instance_id(mut self, id: impl Into<String>) -> Self {
+        self.report_instance_id = Some(id.into());
+        self
+    }
+
     /// Resolve over the design defaults and run the same semantic [`validate`] as
     /// `resolve`. [`config_path`](Config::config_path) is `None` (file-less).
     ///
     /// # Errors
     /// Returns [`Error::Config`] if the resulting config fails validation (empty
-    /// key field, both sources set, or an out-of-range backoff window).
+    /// key field, both sources set, an out-of-range backoff window, or an
+    /// insecure report endpoint).
     pub fn build(self) -> Result<Config> {
-        let cfg = merge(&self.overrides, &TomlConfig::default());
+        let mut cfg = merge(&self.overrides, &TomlConfig::default());
+        cfg.report.headers = self.report_headers;
+        cfg.report.attributes = self.report_attributes;
+        cfg.report.instance_id = self.report_instance_id;
         validate(&cfg)?;
         Ok(cfg)
     }
@@ -1868,6 +1911,49 @@ mod tests {
         // Unset knobs still fall through to the design defaults.
         assert_eq!(cfg.supervise.restart, RestartPolicy::OnFailure);
         assert!(cfg.config_path.is_none());
+    }
+
+    #[test]
+    fn builder_sets_report() {
+        let cfg = Config::builder()
+            .report_endpoint("https://otel.example/r/otlp")
+            .report_interval(60)
+            .report_header("Authorization: Bearer ${T}")
+            .report_header("X-Team: ops")
+            .report_attribute("region", "hk")
+            .report_instance_id("web-01")
+            .build()
+            .unwrap();
+        assert_eq!(
+            cfg.report.endpoint.as_deref(),
+            Some("https://otel.example/r/otlp")
+        );
+        assert_eq!(cfg.report.interval, 60);
+        assert_eq!(
+            cfg.report.headers,
+            ["Authorization: Bearer ${T}", "X-Team: ops"]
+        );
+        assert_eq!(cfg.report.attributes["region"], "hk");
+        assert_eq!(cfg.report.instance_id.as_deref(), Some("web-01"));
+        // Off by default.
+        let cfg = Config::builder().build().unwrap();
+        assert!(cfg.report.endpoint.is_none());
+        assert_eq!(cfg.report.interval, DEFAULT_REPORT_INTERVAL);
+    }
+
+    #[test]
+    fn builder_validates_report() {
+        let err = Config::builder()
+            .report_endpoint("http://otel.example")
+            .build()
+            .unwrap_err();
+        assert!(err.to_string().contains("report.endpoint"), "got: {err}");
+        let err = Config::builder()
+            .report_endpoint("https://otel.example")
+            .report_interval(0)
+            .build()
+            .unwrap_err();
+        assert!(err.to_string().contains("report.interval"), "got: {err}");
     }
 
     #[test]
