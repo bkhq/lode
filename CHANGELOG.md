@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Security
+
+- Update `ctutils` to 0.4.5 (RUSTSEC-2026-0385).
+
 ## [0.2.1] - 2026-10-23
 
 ### Added
