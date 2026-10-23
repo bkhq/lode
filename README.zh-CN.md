@@ -125,8 +125,8 @@ lode 由三个 crate 组成:**`lode-core`**(不含 clap、不碰信号——配�
 
 ```toml
 [dependencies]
-lode-core = { git = "https://github.com/bkhq/lode", tag = "v0.1.0" }        # 配置 + Engine(无 clap、无信号)
-lode-supervisor = { git = "https://github.com/bkhq/lode", tag = "v0.1.0" }  # + 监管循环,由注入的 SignalSource 驱动
+lode-core = { git = "https://github.com/bkhq/lode", tag = "v0.2.0" }        # 配置 + Engine(无 clap、无信号)
+lode-supervisor = { git = "https://github.com/bkhq/lode", tag = "v0.2.0" }  # + 监管循环,由注入的 SignalSource 驱动
 ```
 
 完整指南见 [docs/embedding.zh-CN.md](docs/embedding.zh-CN.md):程序更新自己的可执行文件

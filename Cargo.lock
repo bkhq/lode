@@ -642,7 +642,7 @@ checksum = "32a66949e030da00e8c7d4434b251670a91556f4144941d37452769c25d58a53"
 
 [[package]]
 name = "lode"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "base64",
@@ -662,7 +662,7 @@ dependencies = [
 
 [[package]]
 name = "lode-core"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "base64",
@@ -689,7 +689,7 @@ dependencies = [
 
 [[package]]
 name = "lode-supervisor"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "ctrlc",
  "getrandom 0.4.3",
@@ -704,7 +704,7 @@ dependencies = [
 
 [[package]]
 name = "lode-winproc"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "windows-sys 0.61.2",
 ]
