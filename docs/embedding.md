@@ -21,8 +21,8 @@ projects). Depend on a release tag:
 
 ```toml
 [dependencies]
-lode-core       = { git = "https://github.com/bkhq/lode", tag = "v0.3.0" }
-lode-supervisor = { git = "https://github.com/bkhq/lode", tag = "v0.3.0" }   # only to supervise a child
+lode-core       = { git = "https://github.com/bkhq/lode", tag = "v0.4.0" }
+lode-supervisor = { git = "https://github.com/bkhq/lode", tag = "v0.4.0" }   # only to supervise a child
 ```
 
 ### Process-wide effects are opt-in
