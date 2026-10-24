@@ -9,7 +9,7 @@ import { join } from "node:path";
 import { type AppMode, buildApp } from "./app.ts";
 import { LodeRunner } from "./lode.ts";
 import { ManifestServer } from "./manifestServer.ts";
-import { Signer } from "./sign.ts";
+import { type AssetRuntime, Signer } from "./sign.ts";
 import { baseEnv, flipHex, mkTmp, rmTmp } from "./util.ts";
 
 export interface PublishVersionOpts {
@@ -29,6 +29,8 @@ export interface PublishVersionOpts {
   run?: string;
   /** Manifest-published `exec` launch override (signed, like `run`). */
   exec?: string;
+  /** The asset's runtime (signed into the artifact signature). */
+  runtime?: AssetRuntime;
 }
 
 const APP_NAME = "e2e-app";
@@ -109,7 +111,7 @@ export class Harness {
     // The signature binds the asset filename (basename) + version + sha256 + the
     // optional run/exec overrides; it never sees the url. `name` is the selection
     // key, so published overrides must ride the same sign call verbatim.
-    const signed = await this.signer.sign(artifactPath, version, { run: opts.run, exec: opts.exec });
+    const signed = await this.signer.sign(artifactPath, version, { run: opts.run, exec: opts.exec, runtime: opts.runtime });
     const sha256 = opts.tamperSha ? flipHex(signed.sha256) : signed.sha256;
     const sig = opts.omitSig ? undefined : signed.sig;
     const keyId = opts.omitSig ? undefined : this.signer.keyId;
@@ -122,6 +124,7 @@ export class Harness {
       keyId,
       run: opts.run,
       exec: opts.exec,
+      runtime: opts.runtime,
       latest: opts.latest ?? true,
     });
   }

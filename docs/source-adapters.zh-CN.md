@@ -33,6 +33,10 @@ lode.artifact.v2
 | `run` | manifest 发布的裸跑启动命令覆盖(缺省为空字符串) | 资产的 `run` 字段,或 `""` |
 | `exec` | manifest 发布的透传启动命令覆盖(缺省为空字符串) | 资产的 `exec` 字段,或 `""` |
 
+带 `runtime` 的资产改签 `lode.artifact.v3`:先是 v2 的各字段,再接 `{runtime}`、
+`{runtime_version}`、`{runtime_version_check}`、`{runtime_sha256}`(缺省为空)。运行时的下载
+URL 不签,它的 `sha256` 要签。不带运行时的资产仍用 v2,签名不变。
+
 `name` 是**资产文件名,不是应用名**;`app` 才是应用名。两者共同绑定"这份签名授权的是
 *哪个应用*的*哪个* artifact",因此防止把某个 artifact 的签名重放到别的资产或版本上;发布者
 用同一把密钥签多个应用时,也无法重放到另一个应用上。文件名还按惯例承载品牌与
@@ -73,9 +77,9 @@ native 清单**可**携带顶层 `key_id` + `sig`。它是一层**可选**的防
   资产摘要);存在但无效 → 拒绝。
 - **缺失** → 任何 policy 下(含 `enforce`)都接受。
 
-运维可以选择强制:`[trust].require_manifest = "signed"` 拒绝没有有效 `sig` 的 manifest,
-`"fresh"` 还要求已签名且未过期的 `expires`(`lode-cli manifest-sign --expires-in`),从而阻止
-源把主机按在旧目录上。见[架构 §6](architecture.zh-CN.md)。
+运维可以选择强制:`[trust].require_manifest = "signed"` 拒绝没有有效 `sig` 的 manifest
+(`"fresh"` 是其弃用别名)。`expires`(`lode-cli manifest-sign --expires-in`)存在时会验证。
+见[架构 §6](architecture.zh-CN.md)。
 
 真正强制信任的因此**不是**目录签名,而是两层始终生效、与源无关的机制:**per-artifact**
 签名(§1,由 `require_signature` 门控,绑定每个下载文件),以及**客户端禁降级 floor**
@@ -92,7 +96,10 @@ lode.manifest.v1
 ```
 
 `canonical` 按排序列出每个 `channel\t{name}\t{latest}`,以及每版每资产的
-`asset\t{name}\t{sha256}`。GitHub 没有目录签名 —— 它的新鲜度来自 tag 权威(§5)。
+`asset\t{name}\t{sha256}`(资产带运行时时后接其运行时字段)。GitHub 没有目录签名 —— 它的新鲜度来自 tag 权威(§5)。
+
+目录还可以是一个**提交**(`generation`、`parent`、`created`、`commit_sig`):lode 会拒绝比已接受
+的更旧的 generation。见 [architecture §6](architecture.zh-CN.md)(manifest 提交)。
 
 ### 2a. 客户端禁降级 floor(`latest` 回滚保护)
 
@@ -255,6 +262,7 @@ asset    = "myapp-linux-x64.tar.gz"
 | `alg` | | 提示性:签名密钥的算法(缺省为 `ed25519`);验证始终用受信密钥自身的算法 |
 | `run` | | 可选字面启动命令覆盖(已签名;覆盖 `[command].run`;见 §4) |
 | `exec` | | 可选 CLI 透传命令覆盖(已签名;覆盖 `[command].exec`;见 §4) |
+| `runtime` | | 可选 `{runtime, version, version_check, download, sha256}`:经验证的签名覆盖它时,替换该版本的 `[runtime]`(§1);`download` 必须带 `sha256` |
 | `size` | | 期望字节数(额外完整性校验) |
 | `auth` | | 默认 `true`;`false` = 不给该 URL 附 `[http].headers` |
 

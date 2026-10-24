@@ -54,10 +54,9 @@ require_signature = "enforce" # off | auto | enforce — enforce for production 
 #                          # verified, so it is never run). [trust], the [update] source, [http] credential
 #                          # scope and [runtime] download are pinned for the life of the process: a reload
 #                          # (restart_nonce) never applies changes to them — restart lode.
-# require_manifest = "off"   # off | signed | fresh — what the manifest itself must prove:
-#                          # signed = a valid top-level `sig`; fresh = also a signed,
-#                          # unexpired `expires` (`lode-cli manifest-sign --expires-in 30d`).
-#                          # Native manifest sources only.
+# require_manifest = "off"   # off | signed — signed = the manifest must carry a valid
+#                          # top-level `sig`. An `expires` is verified when present.
+#                          # (`fresh` is a deprecated alias of `signed`.) Native manifest sources only.
 trusted_keys = ["9787ab11e55b4cbc:nyQSShSI8fAtHZNiJWDemBbcaX6V9OvmXtovkITm4fc="]
 #                          # entries are `[<alg>:]<key_id>:<base64>` as printed by `lode-cli keygen`;
 #                          # no tag = ed25519, e.g. "ecdsa-p256:<key_id>:<base64>" for an ECDSA P-256 key.
@@ -97,6 +96,7 @@ download = "https://example.com/bun-linux-x64.zip"   # raw/.gz/.zip/.tar.gz; the
 #                              # PATH/cache entry is bypassed for a fresh download; a downloaded mismatch is
 #                              # a hard error. Pins the runtime version without manually clearing the cache.
 # version_check = "--version"  # arg(s) that print the version (default "--version"); only used with `version`
+# A release whose manifest asset carries a signed `runtime` replaces this table for that version.
 
 # --- run: extra environment variables for the child (a plain key=value table) ---
 # DEFAULTS: applied only for keys the inherited host env doesn't already set, so a

@@ -21,6 +21,7 @@ use lode_core::verify::{
     artifact_message, effective_keys, key_entry, sha256_hex_file, verify_signature,
 };
 
+use lode_core::manifest::RuntimeSpec;
 use lode_core::verify::{B64, decode_b64};
 
 /// A publisher's private key, tagged with its algorithm (the secret half of a
@@ -108,7 +109,7 @@ impl SecretKey {
     }
 
     /// Raw signature bytes over `message` (64 bytes ed25519 / P-256, 96 bytes P-384).
-    fn sign(&self, message: &[u8]) -> Vec<u8> {
+    pub(crate) fn sign(&self, message: &[u8]) -> Vec<u8> {
         match self {
             Self::Ed25519(k) => k.sign(message).to_bytes().to_vec(),
             Self::EcdsaP256(k) => {
@@ -257,6 +258,7 @@ pub(crate) fn sign(
     version: &str,
     run: Option<&str>,
     exec: Option<&str>,
+    runtime: Option<&RuntimeSpec>,
     key: Option<&str>,
     key_env: Option<&str>,
 ) -> Result<()> {
@@ -270,6 +272,7 @@ pub(crate) fn sign(
         path: artifact,
         run,
         exec,
+        runtime,
     };
     let (sha256, sig_b64, id) = sign_artifact(&a, &key)?;
     let mut stdout = io::stdout().lock();
@@ -298,12 +301,14 @@ pub(crate) fn validate_overrides(run: Option<&str>, exec: Option<&str>) -> Resul
 /// `verify` — recompute sha256 and check the signature locally. `run`/`exec` must
 /// match the published overrides (they are part of the signed message). `public`
 /// is the key as `keygen` prints it (base64, or `<alg>:<base64>` for ECDSA).
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn verify(
     app: &str,
     artifact: &str,
     version: &str,
     run: Option<&str>,
     exec: Option<&str>,
+    runtime: Option<&RuntimeSpec>,
     public: &str,
     sig_b64: &str,
     delegation: Option<&str>,
@@ -316,6 +321,7 @@ pub(crate) fn verify(
         path: artifact,
         run,
         exec,
+        runtime,
     };
     let sha256 = sha256_hex_file(Path::new(a.path))?;
     let message = artifact_message(&a, &sha256);
@@ -356,7 +362,7 @@ pub(crate) fn verify(
 /// the asset is upserted (by `name`) into `versions[version].assets` and
 /// `channels[channel].latest` is set to `version`. `app` is the manifest top-level
 /// `name` (from `--app`/`LODE_APP_NAME`); it is preserved when merging.
-#[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 pub(crate) fn manifest(
     app: &str,
     artifact: &str,
@@ -364,6 +370,7 @@ pub(crate) fn manifest(
     url: &str,
     run: Option<&str>,
     exec: Option<&str>,
+    runtime: Option<&RuntimeSpec>,
     size: Option<u64>,
     channel: &str,
     key_path: &str,
@@ -379,6 +386,7 @@ pub(crate) fn manifest(
         path: artifact,
         run,
         exec,
+        runtime,
     };
     let key = key_from_file(key_path)?;
     let alg = key.algorithm();
@@ -403,6 +411,9 @@ pub(crate) fn manifest(
     }
     if let Some(x) = exec {
         asset.insert("exec".to_owned(), json!(x));
+    }
+    if let Some(rt) = runtime {
+        asset.insert("runtime".to_owned(), json!(rt));
     }
     if let Some(s) = size {
         asset.insert("size".to_owned(), json!(s));
@@ -817,13 +828,14 @@ mod tests {
                 path: artifact_path.to_str().unwrap(),
                 run: None,
                 exec: None,
+                runtime: None,
             };
             let (sha256, sig_b64, id) = sign_artifact(&a, &key).unwrap();
             assert!(public_line.contains(&id));
             let trusted = vec![public_line.trim().to_owned()];
             assert!(
                 lode_core::verify::verify_artifact_sig(
-                    "myapp", "app.bin", "1.0.0", &sha256, None, None, &sig_b64, &trusted
+                    "myapp", "app.bin", "1.0.0", &sha256, None, None, None, &sig_b64, &trusted
                 )
                 .is_ok()
             );
@@ -836,6 +848,7 @@ mod tests {
                     "app.bin",
                     "1.0.0",
                     &sha256,
+                    None,
                     None,
                     None,
                     &sig_b64,
@@ -1095,6 +1108,59 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
     }
 
+    /// `manifest` with a runtime writes it into the asset and signs it (v3).
+    #[test]
+    fn manifest_signs_the_asset_runtime() {
+        let dir = scratch("manifest-runtime");
+        keygen(Some(&path_str(&dir, "id")), "ed25519").unwrap();
+        let artifact = path_str(&dir, "a.tar.gz");
+        fs::write(&artifact, b"payload").unwrap();
+        let into = path_str(&dir, "manifest.json");
+        let rt = RuntimeSpec {
+            runtime: "node".to_owned(),
+            version: Some("v22.".to_owned()),
+            version_check: None,
+            download: Some("https://example.com/node.tar.gz".to_owned()),
+            sha256: Some("a".repeat(64)),
+        };
+        manifest(
+            "x",
+            &artifact,
+            "1.0.0",
+            "https://example.com/a.tar.gz",
+            None,
+            None,
+            Some(&rt),
+            None,
+            "stable",
+            &path_str(&dir, "id.key"),
+            Some(&into),
+            None,
+        )
+        .unwrap();
+        let man = lode_core::manifest::parse(&fs::read(&into).unwrap()).unwrap();
+        let asset = &man.versions["1.0.0"].assets[0];
+        assert_eq!(asset.runtime.as_ref(), Some(&rt));
+        let keys = [pub_line(&dir, "id")];
+        let sig = asset.sig.as_deref().unwrap();
+        let check = |runtime| {
+            lode_core::verify::verify_artifact_sig(
+                "x",
+                "a.tar.gz",
+                "1.0.0",
+                &asset.sha256,
+                None,
+                None,
+                runtime,
+                sig,
+                &keys,
+            )
+        };
+        assert!(check(Some(&rt)).is_ok());
+        assert!(check(None).is_err());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
     /// `verify --delegation` checks a sub-key signature against the root key.
     #[test]
     fn verify_accepts_a_sub_key_signature_through_a_delegation() {
@@ -1120,15 +1186,17 @@ mod tests {
             path: &artifact,
             run: None,
             exec: None,
+            runtime: None,
         };
         let (_, sig, _) =
             sign_artifact(&a, &key_from_file(&path_str(&dir, "sub.key")).unwrap()).unwrap();
         let root = pub_line(&dir, "root");
-        assert!(verify("x", &artifact, "1.0.0", None, None, &root, &sig, None).is_err());
+        assert!(verify("x", &artifact, "1.0.0", None, None, None, &root, &sig, None).is_err());
         verify(
             "x",
             &artifact,
             "1.0.0",
+            None,
             None,
             None,
             &root,
@@ -1141,6 +1209,7 @@ mod tests {
                 "y",
                 &artifact,
                 "1.0.0",
+                None,
                 None,
                 None,
                 &root,

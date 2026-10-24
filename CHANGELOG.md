@@ -7,6 +7,43 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **A release can bring its own runtime.** A manifest asset may carry a
+  `runtime` object (`runtime`, `version`, `version_check`, `download`,
+  `sha256`). Once a verified signature covers it, it replaces `[runtime]` for
+  that version: a hot update starts the new version under its runtime and a
+  rollback returns to the old one. The asset signature covers it as
+  `lode.artifact.v3` (the download URL is not signed, its `sha256` is), and so
+  does the catalog signature. An uncovered `runtime` is ignored with a warning.
+- `lode-cli sign`, `verify`, `manifest` and `publish` take
+  `--asset-runtime <name>` and `--asset-runtime-version`, `-version-check`,
+  `-download`, `-sha256`.
+- The runtime cache keeps the runtimes of all installed versions.
+- **Manifest commits stop rollbacks.** A manifest may carry `generation`,
+  `parent`, `created` and `commit_sig` (over `lode.manifest-commit.v1`; its
+  sha256 is the commit id). With trusted keys, lode records the newest commit
+  per manifest `name` in `commits.json` and refuses an older generation, the
+  same generation with another id, or a manifest without a signed commit once
+  one was accepted. `sig` is unchanged, so older lodes still verify it.
+- `lode-cli publish --key` releases to a lode-server registry as a signed
+  manifest commit, building again on the new head when another release got
+  there first. New `lode-cli yank` and `lode-cli channel` drop a version or
+  move a channel the same way.
+
+### Changed
+
+- `lode_core::verify::Artifact` has a `runtime` field and
+  `verify_artifact_sig` takes the runtime; embedders set `runtime: None` and
+  pass `None` to keep the old behavior.
+- A lode older than this release cannot verify an asset signed with a runtime.
+
+### Deprecated
+
+- `[trust].require_manifest = "fresh"` (`--require-manifest fresh`) now means
+  `signed` and logs a warning: a signed expiry is verified when present but no
+  longer required. Manifest commits and the downgrade floor stop rollbacks.
+
 ## [0.3.0] - 2026-10-24
 
 ### Added

@@ -377,11 +377,9 @@ impl SelfUpdate {
     }
 
     /// What the manifest itself has to prove. By default its signature and
-    /// expiry are verified when present and never required, so a source that
-    /// keeps answering with an old, validly signed manifest holds the program
-    /// on an old version for good. [`RequireManifest::Fresh`] refuses a
-    /// manifest without a signed expiry that is still ahead;
-    /// [`RequireManifest::Signed`] one without a signature. Both need a
+    /// expiry are verified when present and never required.
+    /// [`RequireManifest::Signed`] refuses a manifest without a signature
+    /// ([`RequireManifest::Fresh`] is a deprecated alias). It needs a
     /// [`Source::Manifest`] whose publisher signs it; with a GitHub source,
     /// which has no manifest to sign, the update is a configuration error.
     #[must_use]
@@ -534,8 +532,8 @@ fn resolve(
     cfg: &Config,
     current_version: &str,
 ) -> std::result::Result<(manifest::Manifest, Option<String>), SelfUpdateError> {
-    let manifest = manifest::fetch(cfg)?;
-    install::verify_manifest_identity(cfg, &manifest)?;
+    let mut manifest = manifest::fetch(cfg)?;
+    install::verify_manifest_identity(cfg, &mut manifest)?;
     // No floor: the plan below decides against the running binary's version;
     // a named version is the caller's deliberate choice (also the downgrade
     // path) and is installed as is.
@@ -1281,6 +1279,7 @@ mod tests {
             path: "",
             run: None,
             exec: None,
+            runtime: None,
         };
         let sig = B64.encode(key.sign(&artifact_message(&artifact, &sha)).to_bytes());
         let public = key.verifying_key().to_bytes();
@@ -1613,7 +1612,7 @@ mod tests {
 
         let strict = update
             .clone()
-            .require_manifest(RequireManifest::Fresh)
+            .require_manifest(RequireManifest::Signed)
             .config(&dir.join("scratch"))
             .unwrap();
         let err = run_with(&strict, &exe, &[], BINARY, "0.1.0").unwrap_err();

@@ -78,9 +78,8 @@ mod demo {
             .asset(ASSET)
             // Compiled into a real program, never read from its configuration.
             .trusted_keys([release.trusted_key.clone()])
-            // Refuse a manifest without a signed, unexpired expiry: a source
-            // cannot hold the program on an old version by replaying one.
-            .require_manifest(RequireManifest::Fresh)
+            // Refuse a manifest without a valid signature over its channels.
+            .require_manifest(RequireManifest::Signed)
             .exe(&exe);
 
         // 1. Look, without downloading. Notes and time are unsigned: display only.
@@ -172,6 +171,7 @@ mod demo {
             path: "",
             run: None,
             exec: None,
+            runtime: None,
         };
         let sig = B64.encode(key.sign(&artifact_message(&artifact, &sha256)).to_bytes());
 

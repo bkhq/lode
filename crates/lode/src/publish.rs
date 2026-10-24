@@ -1,6 +1,7 @@
 //! `lode-cli publish` — release one version of a package to a lode-server
 //! registry: register the signing key, create the draft, upload every asset,
-//! publish to a channel.
+//! publish to a channel. With a signing key the release is a signed manifest
+//! commit ([`commit`]); `lode-cli yank` and `channel` make commits too.
 //!
 //! Everything that can be checked locally is checked before the first request.
 //! Re-running after a failure continues into the draft the earlier run left.
@@ -21,10 +22,13 @@ use base64::Engine as _;
 use serde_json::{Value, json};
 use zeroize::Zeroizing;
 
+use lode_core::manifest::RuntimeSpec;
 use lode_core::verify::{Algorithm, Artifact, B64, sha256_hex_file};
 
 use crate::authoring::{self, SecretKey};
-use crate::cli::PublishArgs;
+use crate::cli::{ChannelArgs, CommitTarget, PublishArgs, YankArgs};
+
+mod commit;
 
 /// Registry used when `--registry` is not given.
 pub(crate) const DEFAULT_REGISTRY: &str = "https://lode.bk.io/u";
@@ -54,6 +58,7 @@ struct Request<'a> {
     key_env: Option<&'a str>,
     run: Option<&'a str>,
     exec: Option<&'a str>,
+    runtime: Option<&'a RuntimeSpec>,
     allow_insecure: bool,
     files: &'a [String],
 }
@@ -80,6 +85,7 @@ pub(crate) fn command(args: &PublishArgs) -> ExitCode {
 }
 
 fn publish(args: &PublishArgs) -> Result<()> {
+    let runtime = args.asset_runtime.spec()?;
     let req = Request {
         registry: &args.registry,
         package: &args.package,
@@ -90,6 +96,7 @@ fn publish(args: &PublishArgs) -> Result<()> {
         key_env: args.key_env.as_deref(),
         run: args.run.as_deref(),
         exec: args.exec.as_deref(),
+        runtime: runtime.as_ref(),
         allow_insecure: args.allow_insecure,
         files: &args.files,
     };
@@ -111,7 +118,7 @@ fn publish(args: &PublishArgs) -> Result<()> {
 
 fn run(req: &Request<'_>, env: &Env<'_>, out: &mut dyn io::Write) -> Result<()> {
     let assets = validate(req, env)?;
-    let key = signing_key(req)?;
+    let key = registry_key(req.key, req.key_env)?;
     let client = Client::new(req.registry, env);
     let package = req.package;
     let version = req.version;
@@ -123,6 +130,7 @@ fn run(req: &Request<'_>, env: &Env<'_>, out: &mut dyn io::Write) -> Result<()> 
     }
     create_draft(&client, req, &drafts_url, &version_url, out)?;
 
+    let mut entries = Vec::with_capacity(assets.len());
     for asset in &assets {
         client.check_interrupt()?;
         // The registry verifies the signature under the package slug, which is
@@ -134,6 +142,7 @@ fn run(req: &Request<'_>, env: &Env<'_>, out: &mut dyn io::Write) -> Result<()> 
             path: &asset.path,
             run: req.run,
             exec: req.exec,
+            runtime: req.runtime,
         };
         let (sha256, sig) = match &key {
             Some(key) => {
@@ -158,12 +167,30 @@ fn run(req: &Request<'_>, env: &Env<'_>, out: &mut dyn io::Write) -> Result<()> 
             sig: sig.as_deref(),
             run: req.run,
             exec: req.exec,
+            runtime: req.runtime,
         };
         if asset.size <= env.single_max {
             upload_single(&client, &version_url, &upload)?;
         } else {
             upload_multipart(&client, &version_url, &upload, out)?;
         }
+        entries.push(manifest_asset(&upload, key.as_ref()));
+    }
+
+    if let Some(key) = &key {
+        let change = commit::Change::Publish {
+            version,
+            channel: req.channel,
+            notes: req.notes,
+            assets: entries,
+        };
+        commit::commit(&client, package, key, &change, out)?;
+        writeln!(
+            out,
+            "publish: published {package}@{version} to {}",
+            req.channel
+        )?;
+        return Ok(());
     }
 
     client.check_interrupt()?;
@@ -179,6 +206,94 @@ fn run(req: &Request<'_>, env: &Env<'_>, out: &mut dyn io::Write) -> Result<()> 
         req.channel
     )?;
     Ok(())
+}
+
+/// The manifest asset object of an uploaded asset; the registry fills in `url`.
+fn manifest_asset(upload: &Upload<'_>, key: Option<&SecretKey>) -> Value {
+    let mut asset = json!({
+        "name": upload.asset.name,
+        "url": "",
+        "sha256": upload.sha256,
+        "size": upload.asset.size,
+    });
+    if let (Some(sig), Some(key)) = (upload.sig, key) {
+        asset["sig"] = json!(sig);
+        asset["key_id"] = json!(key.public().key_id());
+    }
+    for (field, value) in [("run", upload.run), ("exec", upload.exec)] {
+        if let Some(value) = value {
+            asset[field] = json!(value);
+        }
+    }
+    if let Some(rt) = upload.runtime {
+        asset["runtime"] = json!(rt);
+    }
+    asset
+}
+
+/// `yank` — see [`commit::Change::Yank`].
+pub(crate) fn yank(args: &YankArgs) -> ExitCode {
+    let change = commit::Change::Yank {
+        version: &args.version,
+    };
+    report("yank", commit_to(&args.target, &change))
+}
+
+/// `channel` — see [`commit::Change::Channel`].
+pub(crate) fn channel(args: &ChannelArgs) -> ExitCode {
+    let change = commit::Change::Channel {
+        channel: &args.channel,
+        version: &args.version,
+    };
+    report("channel", commit_to(&args.target, &change))
+}
+
+fn report(command: &str, result: Result<()>) -> ExitCode {
+    match result {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(error) => {
+            let _ = writeln!(io::stderr().lock(), "{command}: {error:#}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+fn commit_to(target: &CommitTarget, change: &commit::Change<'_>) -> Result<()> {
+    let token = Zeroizing::new(std::env::var(TOKEN_ENV).unwrap_or_default());
+    let interrupted = AtomicBool::new(false);
+    let env = Env {
+        token: &token,
+        interrupted: &interrupted,
+        retry_pause: RETRY_PAUSE,
+        single_max: SINGLE_REQUEST_MAX,
+        asset_max: ASSET_MAX,
+    };
+    commit_with(target, change, &env, &mut io::stdout().lock())
+}
+
+fn commit_with(
+    target: &CommitTarget,
+    change: &commit::Change<'_>,
+    env: &Env<'_>,
+    out: &mut dyn io::Write,
+) -> Result<()> {
+    check_registry(&target.registry, target.allow_insecure)?;
+    if !is_package(&target.package) {
+        bail!("--package must be <namespace>/<slug>");
+    }
+    match change {
+        commit::Change::Yank { version } => check_id("--version", version)?,
+        commit::Change::Channel { channel, version } => {
+            check_id("--channel", channel)?;
+            check_id("--version", version)?;
+        }
+        commit::Change::Publish { .. } => {}
+    }
+    check_token(env.token)?;
+    let key = registry_key(target.key.as_deref(), target.key_env.as_deref())?
+        .context("a commit is signed: pass --key or --key-env")?;
+    let client = Client::new(&target.registry, env);
+    commit::commit(&client, &target.package, &key, change, out)
 }
 
 // --- local checks -----------------------------------------------------------
@@ -211,25 +326,45 @@ fn is_package(value: &str) -> bool {
         && slug.bytes().all(|b| lower_or_digit(b) || b == b'-')
 }
 
-/// Check the arguments, the files and the token; nothing is sent.
-fn validate(req: &Request<'_>, env: &Env<'_>) -> Result<Vec<Asset>> {
-    const ID_RULE: &str = "may only contain A-Z a-z 0-9 . _ - and must not start with . or -";
-    let registry = req.registry;
+const ID_RULE: &str = "may only contain A-Z a-z 0-9 . _ - and must not start with . or -";
+
+fn check_registry(registry: &str, allow_insecure: bool) -> Result<()> {
     if !(registry.starts_with("https://") || registry.starts_with("http://")) {
         bail!("--registry must be an http(s) URL");
     }
-    if !req.allow_insecure && !lode_core::http::scheme_allowed(registry) {
+    if !allow_insecure && !lode_core::http::scheme_allowed(registry) {
         bail!("refusing a non-HTTPS registry; pass --allow-insecure to override");
     }
+    Ok(())
+}
+
+fn check_id(flag: &str, value: &str) -> Result<()> {
+    if !is_id(value) {
+        bail!("{flag} {ID_RULE}");
+    }
+    Ok(())
+}
+
+fn check_token(token: &str) -> Result<()> {
+    if token.is_empty() {
+        bail!("{TOKEN_ENV} is not set");
+    }
+    // The token becomes a header value, so it has to be plain.
+    let plain = |b: u8| b.is_ascii_alphanumeric() || b"._~+/=-".contains(&b);
+    if !token.bytes().all(plain) {
+        bail!("{TOKEN_ENV} contains characters a token never has");
+    }
+    Ok(())
+}
+
+/// Check the arguments, the files and the token; nothing is sent.
+fn validate(req: &Request<'_>, env: &Env<'_>) -> Result<Vec<Asset>> {
+    check_registry(req.registry, req.allow_insecure)?;
     if !is_package(req.package) {
         bail!("--package must be <namespace>/<slug>");
     }
-    if !is_id(req.version) {
-        bail!("--version {ID_RULE}");
-    }
-    if !is_id(req.channel) {
-        bail!("--channel {ID_RULE}");
-    }
+    check_id("--version", req.version)?;
+    check_id("--channel", req.channel)?;
     authoring::validate_overrides(req.run, req.exec)?;
     if req.files.is_empty() {
         bail!("no asset files given");
@@ -266,23 +401,16 @@ fn validate(req: &Request<'_>, env: &Env<'_>) -> Result<Vec<Asset>> {
         });
     }
 
-    if env.token.is_empty() {
-        bail!("{TOKEN_ENV} is not set");
-    }
-    // The token becomes a header value, so it has to be plain.
-    let plain = |b: u8| b.is_ascii_alphanumeric() || b"._~+/=-".contains(&b);
-    if !env.token.bytes().all(plain) {
-        bail!("{TOKEN_ENV} contains characters a token never has");
-    }
+    check_token(env.token)?;
     Ok(assets)
 }
 
 /// The signing key, when one was given. The registry verifies ed25519 only.
-fn signing_key(req: &Request<'_>) -> Result<Option<SecretKey>> {
-    if req.key.is_none() && req.key_env.is_none() {
+fn registry_key(key: Option<&str>, key_env: Option<&str>) -> Result<Option<SecretKey>> {
+    if key.is_none() && key_env.is_none() {
         return Ok(None);
     }
-    let key = authoring::resolve_sign_key(req.key, req.key_env)?;
+    let key = authoring::resolve_sign_key(key, key_env)?;
     if key.algorithm() != Algorithm::Ed25519 {
         bail!(
             "the signing key is {}; the registry accepts ed25519 keys only",
@@ -357,16 +485,33 @@ struct Upload<'a> {
     sig: Option<&'a str>,
     run: Option<&'a str>,
     exec: Option<&'a str>,
+    runtime: Option<&'a RuntimeSpec>,
+}
+
+impl Upload<'_> {
+    /// The optional fields sent with the asset, by registry parameter name.
+    fn fields(&self) -> [(&'static str, Option<&str>); 8] {
+        let rt = self.runtime;
+        [
+            ("sig", self.sig),
+            ("run", self.run),
+            ("exec", self.exec),
+            ("runtime", rt.map(|rt| rt.runtime.as_str())),
+            ("runtime_version", rt.and_then(|rt| rt.version.as_deref())),
+            (
+                "runtime_version_check",
+                rt.and_then(|rt| rt.version_check.as_deref()),
+            ),
+            ("runtime_download", rt.and_then(|rt| rt.download.as_deref())),
+            ("runtime_sha256", rt.and_then(|rt| rt.sha256.as_deref())),
+        ]
+    }
 }
 
 fn upload_single(client: &Client<'_>, version_url: &str, upload: &Upload<'_>) -> Result<()> {
     let name = &upload.asset.name;
     let mut url = format!("{version_url}/assets/{name}?sha256={}", upload.sha256);
-    for (key, value) in [
-        ("sig", upload.sig),
-        ("run", upload.run),
-        ("exec", upload.exec),
-    ] {
+    for (key, value) in upload.fields() {
         if let Some(value) = value {
             let _ = write!(url, "&{key}={}", percent_encode(value));
         }
@@ -386,11 +531,7 @@ fn upload_multipart(
     let name = &upload.asset.name;
     let size = upload.asset.size;
     let mut body = json!({ "asset": name, "size": size, "sha256": upload.sha256 });
-    for (key, value) in [
-        ("sig", upload.sig),
-        ("run", upload.run),
-        ("exec", upload.exec),
-    ] {
+    for (key, value) in upload.fields() {
         if let Some(value) = value {
             body[key] = json!(value);
         }

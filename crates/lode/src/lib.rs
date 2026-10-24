@@ -121,6 +121,7 @@ fn run_tool() -> anyhow::Result<ExitCode> {
             version,
             run,
             exec,
+            asset_runtime,
             key,
             key_env,
         } => authoring::sign(
@@ -129,6 +130,7 @@ fn run_tool() -> anyhow::Result<ExitCode> {
             &version,
             run.as_deref(),
             exec.as_deref(),
+            asset_runtime.spec()?.as_ref(),
             key.as_deref(),
             key_env.as_deref(),
         )?,
@@ -137,6 +139,7 @@ fn run_tool() -> anyhow::Result<ExitCode> {
             version,
             run,
             exec,
+            asset_runtime,
             pubkey,
             sig,
             delegation,
@@ -146,6 +149,7 @@ fn run_tool() -> anyhow::Result<ExitCode> {
             &version,
             run.as_deref(),
             exec.as_deref(),
+            asset_runtime.spec()?.as_ref(),
             &pubkey,
             &sig,
             delegation.as_deref(),
@@ -156,6 +160,7 @@ fn run_tool() -> anyhow::Result<ExitCode> {
             url,
             run,
             exec,
+            asset_runtime,
             size,
             channel,
             key,
@@ -175,6 +180,7 @@ fn run_tool() -> anyhow::Result<ExitCode> {
             &url,
             run.as_deref(),
             exec.as_deref(),
+            asset_runtime.spec()?.as_ref(),
             size,
             &channel,
             &key,
@@ -182,6 +188,8 @@ fn run_tool() -> anyhow::Result<ExitCode> {
             delegation.as_deref(),
         )?,
         ToolCommand::Publish(args) => return Ok(publish::command(&args)),
+        ToolCommand::Yank(args) => return Ok(publish::yank(&args)),
+        ToolCommand::Channel(args) => return Ok(publish::channel(&args)),
         ToolCommand::ManifestSign(a) => {
             authoring::manifest_sign(&a.into, &a.key, a.expires_in, a.delegation.as_deref())?;
         }

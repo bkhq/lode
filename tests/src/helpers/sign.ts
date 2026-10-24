@@ -12,6 +12,15 @@ import { join } from "node:path";
 
 import { LODE_CLI_BIN, run } from "./util.ts";
 
+/** An asset's `runtime` (signed into `lode.artifact.v3`; the URL is not signed). */
+export interface AssetRuntime {
+  runtime: string;
+  version?: string;
+  version_check?: string;
+  download?: string;
+  sha256?: string;
+}
+
 export interface Signature {
   sha256: string;
   sig: string;
@@ -51,10 +60,18 @@ export class Signer {
    * `name`/`run`/`exec`, so the name must equal this artifact's basename (and the
    * filename the test serves / selects via `[update].asset`) and any run/exec passed
    * here must be published verbatim in the manifest asset. */
-  async sign(artifactPath: string, version: string, opts: { run?: string; exec?: string; app?: string } = {}): Promise<Signature> {
+  async sign(artifactPath: string, version: string, opts: { run?: string; exec?: string; app?: string; runtime?: AssetRuntime } = {}): Promise<Signature> {
     const cmd = [LODE_CLI_BIN, "sign", artifactPath, "--app", opts.app ?? "e2e-app", "--version", version, "--key", this.privPath];
     if (opts.run) cmd.push("--run", opts.run);
     if (opts.exec) cmd.push("--exec", opts.exec);
+    const rt = opts.runtime;
+    if (rt) {
+      cmd.push("--asset-runtime", rt.runtime);
+      if (rt.version) cmd.push("--asset-runtime-version", rt.version);
+      if (rt.version_check) cmd.push("--asset-runtime-version-check", rt.version_check);
+      if (rt.download) cmd.push("--asset-runtime-download", rt.download);
+      if (rt.sha256) cmd.push("--asset-runtime-sha256", rt.sha256);
+    }
     const r = await run(cmd);
     if (r.exitCode !== 0) throw new Error(`lode sign failed (${r.exitCode}): ${r.stderr}\n${r.stdout}`);
     const sha = r.stdout.match(/sha256:\s*([0-9a-fA-F]{64})/)?.[1];

@@ -1,6 +1,7 @@
 use std::net::{TcpListener, TcpStream};
 use std::path::PathBuf;
 use std::sync::Mutex;
+use std::sync::atomic::AtomicUsize;
 
 use lode_core::verify::{artifact_message, verify_signature};
 
@@ -134,11 +135,23 @@ fn happy(request: &Seen, _: usize) -> (u16, String) {
             &json!({ "uploadId": "up1", "partSize": 4, "partCount": size.div_ceil(4) }),
         );
     }
+    if request.target.ends_with("/commits/head") {
+        return ok(&empty_head());
+    }
     match request.method.as_str() {
         "POST" if request.target.ends_with("/keys") => created(&json!({ "key_id": "k" })),
         "POST" | "PUT" => created(&json!({})),
         _ => ok(&json!({})),
     }
+}
+
+/// The head of a package without commits or published versions.
+fn empty_head() -> Value {
+    json!({
+        "commit": null,
+        "generation": 0,
+        "manifest": { "schema": "lode/v1", "name": "app", "channels": {}, "versions": {} },
+    })
 }
 
 fn scratch(label: &str) -> PathBuf {
@@ -165,6 +178,7 @@ fn request<'a>(registry: &'a str, files: &'a [String]) -> Request<'a> {
         key_env: None,
         run: None,
         exec: None,
+        runtime: None,
         allow_insecure: false,
         files,
     }
@@ -306,11 +320,67 @@ fn signs_every_asset_and_registers_the_key_first() {
         path: &files[0],
         run: Some("./app --serve"),
         exec: None,
+        runtime: None,
     };
     let message = artifact_message(&artifact, &param("sha256"));
     assert!(verify_signature(&public_key, &message, &param("sig")).unwrap());
     assert!(out.contains("publish: registered signing key "));
     assert!(out.contains("(11 bytes, signed)"));
+}
+
+#[test]
+fn an_asset_runtime_is_signed_and_sent() {
+    let registry = Registry::start(happy);
+    let dir = scratch("runtime");
+    let files = [file(&dir, "app.tar.gz", b"hello world")];
+    let secret = [7u8; 32];
+    let key_path = file(&dir, "signer.key", B64.encode(secret).as_bytes());
+    let rt = lode_core::manifest::RuntimeSpec {
+        runtime: "node".to_owned(),
+        version: Some("v22.".to_owned()),
+        version_check: None,
+        download: Some("https://x/node.tar.gz".to_owned()),
+        sha256: Some("c".repeat(64)),
+    };
+    let mut req = request(&registry.base, &files);
+    req.key = Some(&key_path);
+    req.runtime = Some(&rt);
+
+    publish_to(&req, 100).0.unwrap();
+
+    let seen = registry.seen();
+    let query = seen[2].target.split_once('?').unwrap().1;
+    let param = |name: &str| {
+        query
+            .split('&')
+            .find_map(|pair| pair.strip_prefix(&format!("{name}=")))
+            .map(ToOwned::to_owned)
+    };
+    assert_eq!(param("runtime").as_deref(), Some("node"));
+    assert_eq!(param("runtime_version").as_deref(), Some("v22."));
+    assert_eq!(param("runtime_version_check"), None);
+    assert_eq!(
+        param("runtime_download").as_deref(),
+        Some("https%3A%2F%2Fx%2Fnode.tar.gz")
+    );
+    assert_eq!(param("runtime_sha256"), rt.sha256);
+    let public_key = B64.encode(
+        ed25519_dalek::SigningKey::from_bytes(&secret)
+            .verifying_key()
+            .to_bytes(),
+    );
+    let artifact = Artifact {
+        app: "app",
+        name: "app.tar.gz",
+        version: "1.4.2",
+        path: &files[0],
+        run: None,
+        exec: None,
+        runtime: Some(&rt),
+    };
+    let message = artifact_message(&artifact, &param("sha256").unwrap());
+    let sig = param("sig").unwrap();
+    assert!(verify_signature(&public_key, &message, &sig).unwrap());
 }
 
 #[test]
@@ -331,7 +401,7 @@ fn a_key_that_is_already_registered_is_fine() {
     let (result, out) = publish_to(&req, 100);
     result.unwrap();
     assert!(out.starts_with("publish: signing key already registered\n"));
-    assert_eq!(registry.lines().len(), 4);
+    assert_eq!(registry.lines().len(), 5);
 }
 
 #[test]
@@ -748,4 +818,206 @@ fn an_unknown_option_does_not_echo_its_value() {
 fn percent_encodes_query_values() {
     assert_eq!(percent_encode("aZ0-._~"), "aZ0-._~");
     assert_eq!(percent_encode("a b&c=d/é"), "a%20b%26c%3Dd%2F%C3%A9");
+}
+
+// --- commits ----------------------------------------------------------------
+
+const SECRET: [u8; 32] = [7u8; 32];
+
+fn public_key() -> String {
+    B64.encode(
+        ed25519_dalek::SigningKey::from_bytes(&SECRET)
+            .verifying_key()
+            .to_bytes(),
+    )
+}
+
+/// The commits the stub received, parsed.
+fn commits(registry: &Registry) -> Vec<(Value, lode_core::manifest::Manifest)> {
+    registry
+        .seen()
+        .iter()
+        .filter(|r| r.method == "POST" && r.target.ends_with("/commits"))
+        .map(|r| {
+            (
+                serde_json::from_slice(&r.body).unwrap(),
+                lode_core::manifest::parse(&r.body).unwrap(),
+            )
+        })
+        .collect()
+}
+
+/// Both signatures of a commit verify under the test key.
+fn assert_signed(manifest: &lode_core::manifest::Manifest) {
+    let key = public_key();
+    let sig = manifest.sig.as_deref().unwrap();
+    assert!(verify_signature(&key, &manifest.signing_message(), sig).unwrap());
+    let commit_sig = manifest.commit_sig.as_deref().unwrap();
+    let message = manifest.commit_signing_message().unwrap();
+    assert!(verify_signature(&key, &message, commit_sig).unwrap());
+}
+
+#[test]
+fn a_signed_release_is_a_commit() {
+    let registry = Registry::start(happy);
+    let dir = scratch("commit");
+    let files = [file(&dir, "app.tar.gz", b"hello world")];
+    let key_path = file(&dir, "signer.key", B64.encode(SECRET).as_bytes());
+    let mut req = request(&registry.base, &files);
+    req.key = Some(&key_path);
+    req.notes = Some("first");
+
+    let (result, out) = publish_to(&req, 100);
+    result.unwrap();
+
+    let lines = registry.lines();
+    assert_eq!(
+        lines[3..],
+        [
+            "GET /api/registry/packages/acme/app/commits/head",
+            "POST /api/registry/packages/acme/app/commits",
+        ]
+    );
+    let commits = commits(&registry);
+    let (json, manifest) = &commits[0];
+    assert_eq!(manifest.generation, Some(1));
+    assert_eq!(manifest.parent, None);
+    assert_eq!(manifest.channels["stable"].latest, "1.4.2");
+    let version = &manifest.versions["1.4.2"];
+    assert_eq!(version.notes.as_deref(), Some("first"));
+    assert_eq!(version.assets[0].name, "app.tar.gz");
+    assert!(version.assets[0].sig.is_some());
+    assert_eq!(json["versions"]["1.4.2"]["assets"][0]["size"], 11);
+    assert_signed(manifest);
+    assert!(out.contains("publish: committed "));
+    assert!(out.ends_with("publish: published acme/app@1.4.2 to stable\n"));
+}
+
+#[test]
+fn a_conflict_builds_on_the_new_head() {
+    let parent = "b".repeat(64);
+    let head = json!({
+        "commit": parent,
+        "generation": 3,
+        "manifest": {
+            "schema": "lode/v1", "name": "app", "key_id": "old", "sig": "c2ln",
+            "channels": { "beta": { "latest": "1.0.0" } },
+            "versions": { "1.0.0": { "assets": [
+                { "name": "a.bin", "url": "https://r/a.bin", "sha256": "a".repeat(64) },
+            ] } },
+        },
+    });
+    let commit_posts = AtomicUsize::new(0);
+    let registry = Registry::start(move |request, n| {
+        if request.target.ends_with("/commits/head") {
+            // Empty until the first commit is refused.
+            return if commit_posts.load(Ordering::SeqCst) == 0 {
+                ok(&empty_head())
+            } else {
+                ok(&head)
+            };
+        }
+        if request.target.ends_with("/commits") && commit_posts.fetch_add(1, Ordering::SeqCst) == 0
+        {
+            return error(409, "COMMIT_CONFLICT", "the head moved");
+        }
+        happy(request, n)
+    });
+    let dir = scratch("conflict");
+    let files = [file(&dir, "app.tar.gz", b"hello world")];
+    let key_path = file(&dir, "signer.key", B64.encode(SECRET).as_bytes());
+    let mut req = request(&registry.base, &files);
+    req.key = Some(&key_path);
+
+    let (result, out) = publish_to(&req, 100);
+    result.unwrap();
+    assert!(out.contains("the manifest moved on"));
+    let commits = commits(&registry);
+    assert_eq!(commits.len(), 2);
+    let (_, manifest) = &commits[1];
+    assert_eq!(manifest.generation, Some(4));
+    assert_eq!(manifest.parent.as_deref(), Some(parent.as_str()));
+    assert_eq!(manifest.channels["beta"].latest, "1.0.0");
+    assert_eq!(manifest.channels["stable"].latest, "1.4.2");
+    assert!(manifest.versions.contains_key("1.0.0"));
+    assert_signed(manifest);
+}
+
+fn two_versions_head() -> Value {
+    let asset = |name: &str| json!({ "name": name, "url": "", "sha256": "a".repeat(64) });
+    json!({
+        "commit": "c".repeat(64),
+        "generation": 1,
+        "manifest": {
+            "schema": "lode/v1", "name": "app",
+            "channels": { "stable": { "latest": "2.0.0" } },
+            "versions": {
+                "1.0.0": { "assets": [asset("a.bin")] },
+                "2.0.0": { "assets": [asset("a.bin")] },
+            },
+        },
+    })
+}
+
+fn commit_to_stub(change: &commit::Change<'_>, dir: &Path) -> (Registry, Result<()>) {
+    let registry = Registry::start(|request, n| {
+        if request.target.ends_with("/commits/head") {
+            return ok(&two_versions_head());
+        }
+        happy(request, n)
+    });
+    let key_path = file(dir, "signer.key", B64.encode(SECRET).as_bytes());
+    let target = CommitTarget {
+        registry: registry.base.clone(),
+        package: PACKAGE.to_owned(),
+        key: Some(key_path),
+        key_env: None,
+        allow_insecure: false,
+    };
+    let interrupted = AtomicBool::new(false);
+    let env = Env {
+        token: TOKEN,
+        interrupted: &interrupted,
+        retry_pause: Duration::ZERO,
+        single_max: SINGLE_REQUEST_MAX,
+        asset_max: ASSET_MAX,
+    };
+    let result = commit_with(&target, change, &env, &mut Vec::new());
+    (registry, result)
+}
+
+#[test]
+fn yank_and_channel_commit_their_change() {
+    let dir = scratch("yank");
+    let (registry, result) = commit_to_stub(&commit::Change::Yank { version: "1.0.0" }, &dir);
+    result.unwrap();
+    let (_, manifest) = &commits(&registry)[0];
+    assert!(!manifest.versions.contains_key("1.0.0"));
+    assert_eq!(manifest.generation, Some(2));
+    assert_signed(manifest);
+
+    let (registry, result) = commit_to_stub(&commit::Change::Yank { version: "2.0.0" }, &dir);
+    let err = result.unwrap_err().to_string();
+    assert!(err.contains("channel stable points at 2.0.0"), "{err}");
+    assert!(commits(&registry).is_empty());
+
+    let change = commit::Change::Channel {
+        channel: "stable",
+        version: "1.0.0",
+    };
+    let (registry, result) = commit_to_stub(&change, &dir);
+    result.unwrap();
+    assert_eq!(commits(&registry)[0].1.channels["stable"].latest, "1.0.0");
+
+    let change = commit::Change::Channel {
+        channel: "stable",
+        version: "9.9.9",
+    };
+    let (_, result) = commit_to_stub(&change, &dir);
+    assert!(
+        result
+            .unwrap_err()
+            .to_string()
+            .contains("not in the manifest")
+    );
 }

@@ -101,6 +101,7 @@ zzci/ubase                 │  lode (Rust 静态二进制, 几 MB)   │
 - **不校验**:与应用产物不同,运行时下载**不带 `sha256`/`sig`,不做完整性/身份校验**。请锁版本、用可信源,若需凭据把其 host 加入 `[http].credential_hosts`。
 - **版本锁定**(`version` + `version_check`):设了 `version` 后,lode 对即将使用的运行时(PATH/缓存/刚下载)跑 `version_check`(默认 `--version`),要求输出**包含** `version`。PATH/缓存里版本不对会被绕过去重新下载;下载下来还不对则硬报错。
 - 最后把 `$LODE_DIR/runtime/` **前置到子进程 PATH**。
+- **版本自带的运行时**:manifest 资产可以带一个字段相同的 `runtime` 对象。经验证的签名覆盖它时(资产的 `lode.artifact.v3` 签名或目录签名),它替换该版本的 `[runtime]`,并记在该版本的 `.lode.json` 里。每次启动都解析所启动版本的运行时,所以热更新和回滚会随版本切换运行时。未被签名覆盖的 `runtime` 会被忽略并告警。
 
 ```toml
 [runtime]
@@ -159,7 +160,7 @@ target ≠ current 且可用(stop-start 模式):
 `lode` 启动(服务模式)在确定版本之前先做一遍清理:
 
 - **孤儿子进程**:上一个 lode 崩溃可能遗留仍在跑的 app 子进程。接管僵尸锁后,读 `state.json.pid`,若该进程还活着 → 优雅终止(SIGTERM→超时 SIGKILL)再起新的,避免端口/资源冲突与双实例。
-- **垃圾回收**:清理中断遗留的 `downloads/<v>/*.part`、`versions/<v>.tmp` 半成品(已校验的按版本下载缓存保留);按 `keep_versions` 保留 current + last_good + 最近 N 个版本,其余版本目录**连同其 `downloads/<v>/` 缓存**一起删除;`$LODE_DIR/runtime/` 同理只留当前在用的缓存 key。
+- **垃圾回收**:清理中断遗留的 `downloads/<v>/*.part`、`versions/<v>.tmp` 半成品(已校验的按版本下载缓存保留);按 `keep_versions` 保留 current + last_good + 最近 N 个版本,其余版本目录**连同其 `downloads/<v>/` 缓存**一起删除;`$LODE_DIR/runtime/` 同理只留 `[runtime]` 和已安装版本的运行时所用的缓存 key。
 - **校验落盘一致性**:`current` 软链指向的版本若缺失/损坏 → 回退到 last_good 或重新引导。
 
 ### 资源(`[[resource]]`)
@@ -247,9 +248,9 @@ lode.manifest-expiry.v1
 |---|---|
 | `off`(默认) | `sig` 与 `expires_sig` 存在则验证,都不强制。 |
 | `signed` | 必须带有效的 `sig`。 |
-| `fresh` | 必须带有效的 `sig`,以及已签名且未过期的 `expires`。 |
+| `fresh` | 已弃用:等同于 `signed`(lode 启动时告警)。过去还要求已签名的 `expires`。 |
 
-只有 `fresh` 能阻止源去掉 `expires`/`expires_sig` 后重放一份 `sig` 仍然有效的目录。`signed` 与 `fresh` 需要受信公钥和原生 manifest;GitHub 源没有可签名的 manifest,与它们同用会在配置阶段被拒绝。运行中的 lode 把被拒绝的 manifest 当作一次失败的更新检查:继续运行当前版本。
+`expires` 存在时总会验证,但不再强制:重放旧目录由 manifest 提交和禁降级 floor 拦截。`signed` 需要受信公钥和原生 manifest;GitHub 源没有可签名的 manifest,与它同用会在配置阶段被拒绝。运行中的 lode 把被拒绝的 manifest 当作一次失败的更新检查:继续运行当前版本。
 
 ### 受信公钥 / 强度
 
@@ -312,6 +313,20 @@ lode.delegation.v1
 - 由受信密钥签名,或由持有对 `[global].app` 有效且未被吊销的 delegation 的子密钥签名。
 - 每次验证 manifest 时拉取。更新的有效列表(`issued_at` 大于缓存)会**合并**进 `$LODE_DIR/revocations.json`;条目只增不减,列表无法取消吊销,旧列表被忽略。
 - 非强制:列表不可达、无效或过旧时只记日志,继续使用缓存。没有列表时,吊销只能依赖 delegation 的 `not_after`;delegation 有效期宜短。
+
+### manifest 提交(防回滚)
+
+原生 manifest 可以是一个**提交**:额外带 `generation`(≥ 1)、`parent`(上一个提交的 id;generation 1 没有)、`created` 和 `commit_sig`,由签 `sig` 的同一把密钥签名:
+```
+lode.manifest-commit.v1
+{name}
+{key_id}
+{generation}
+{parent}         # generation 1 为空
+{created}
+{canonical}      # 即 `sig` 所签的目录
+```
+该消息的 sha256 hex 即提交 id。配置了受信公钥时,lode 在 lode 目录的 `commits.json` 中按 manifest `name` 记录已接受的最新 `{generation, commit}`,并拒绝 generation 更低、同一 generation 但 id 不同、或在已接受过提交后不带签名提交的 manifest,从而阻止来源重放更旧但签名有效的 manifest。`sig` 不变,不支持提交的 lode 把提交当作普通签名 manifest 验证。删除 `commits.json` 会重置下限。`lode-cli publish --key`、`yank` 和 `channel` 向 lode-server registry 写入提交。
 
 ### CLI(发布者)
 
@@ -485,7 +500,7 @@ lode 发 `SIGTERM` 后,**在 `stop_timeout` 秒内绝不 SIGKILL**,给 app 充�
 | `LODE_ALLOW_INSECURE_HTTP` | `--allow-insecure-http` | `http.allow_insecure` | `false` | 允许明文 HTTP 拉取(loopback 始终允许;凭据将明文传输) |
 | **`[trust]` —— 验签** | | | | |
 | `LODE_REQUIRE_SIGNATURE` | `--require-signature <off\|auto\|enforce>` | `trust.require_signature` | `auto` | 验签强度,§6 |
-| `LODE_REQUIRE_MANIFEST` | `--require-manifest <off\|signed\|fresh>` | `trust.require_manifest` | `off` | manifest 必须证明什么(签名、过期时间),§6 |
+| `LODE_REQUIRE_MANIFEST` | `--require-manifest <off\|signed>` | `trust.require_manifest` | `off` | manifest 是否必须签名(`fresh` 是 `signed` 的弃用别名),§6 |
 | `LODE_TRUSTED_KEYS` | `--trusted-keys <list>` | `trust.trusted_keys` | — | 受信公钥 `key_id:base64`,逗号分隔 |
 | `LODE_TRUSTED_KEYS_FILE` | `--trusted-keys-file <path>` | `trust.trusted_keys_file` | — | 受信公钥文件 |
 | `LODE_REVOCATION_URL` | `--revocation-url <url>` | `trust.revocation_url` | — | 委托密钥的签名吊销列表(可选),§6 |

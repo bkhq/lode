@@ -21,7 +21,7 @@ pub fn run(cfg: &Config, version: Option<&str>) -> Result<()> {
     // Clear any interrupted downloads/staging before we begin.
     install::gc(cfg)?;
 
-    let manifest = manifest::fetch(cfg)?;
+    let mut manifest = manifest::fetch(cfg)?;
     if manifest.name != cfg.global.app {
         return Err(Error::Manifest(format!(
             "manifest name {:?} does not match configured app {:?}",
@@ -30,7 +30,7 @@ pub fn run(cfg: &Config, version: Option<&str>) -> Result<()> {
     }
     // Verify the catalog signature if it carries one (verify-if-present); a missing
     // catalog signature is fine — the per-artifact check below binds the download.
-    install::verify_manifest_identity(cfg, &manifest)?;
+    install::verify_manifest_identity(cfg, &mut manifest)?;
 
     // Anti-downgrade floor: the highest version we've already committed to. It gates
     // only the channel-`latest`-following resolution, so a tampered or replayed

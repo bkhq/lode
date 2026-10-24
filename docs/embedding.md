@@ -92,7 +92,7 @@ if let Outcome::Installed { version, .. } = update.apply()? {
 | `.version(id)` | no | Install exactly this version instead of the channel's latest. This is also the only way to downgrade. |
 | `.channel(name)` | no | Default `stable`. With a GitHub source any other channel follows the newest pre-release. |
 | `.header("Name: value")` | no | A request header for a private source. `${VAR}` is filled in from the environment when the request is made. Sent to the source's own hosts only. |
-| `.require_manifest(policy)` | no | `RequireManifest::Signed` or `Fresh`; see [Freeze attacks](#freeze-attacks-and-require_manifest). |
+| `.require_manifest(policy)` | no | `RequireManifest::Signed`; see [Signed manifests](#signed-manifests-and-require_manifest). |
 
 ### Sources
 
@@ -178,30 +178,28 @@ Every update, with no way to turn it off:
 The source cannot make your program install something your key did not sign,
 under a name or version your key did not sign it for.
 
-### Freeze attacks and `require_manifest`
+### Signed manifests and `require_manifest`
 
-The checks above do not stop a source from simply answering with an old
-manifest forever: every signature in it is valid, and your program stays on an
-old version. Per-asset signatures cannot detect that. A signed manifest with a
-signed expiry can:
+Per-asset signatures do not cover the manifest's channels. Requiring a signed
+manifest does:
 
 ```rust
-.require_manifest(RequireManifest::Fresh)
+.require_manifest(RequireManifest::Signed)
 ```
 
 | Policy | The manifest must |
 |---|---|
 | `Off` (default) | Nothing. A signature or expiry is verified when present, never required. |
 | `Signed` | Carry a valid signature over its channels and asset digests. |
-| `Fresh` | As `Signed`, and carry a signed expiry that has not passed. |
+| `Fresh` | Deprecated: the same as `Signed`. |
 
 This needs `Source::Manifest` and a publisher who signs the manifest
-(`lode-cli manifest-sign --expires-in 30d`) and signs it again before it
-expires. A GitHub source has no manifest to sign: combining it with `Signed` or
-`Fresh` is a configuration error.
+(`lode-cli manifest-sign`). A GitHub source has no manifest to sign: combining
+it with `Signed` is a configuration error.
 
-The expiry is compared with the local clock, with no tolerance: a manifest is
-refused from the second it expires. Publishers should re-sign well ahead.
+A manifest that carries a signed expiry (`--expires-in 30d`) is refused from
+the second it expires by the local clock, with no tolerance; publishers who
+stamp one re-sign well ahead.
 
 ### Windows
 

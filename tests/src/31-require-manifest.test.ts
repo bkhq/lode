@@ -41,8 +41,8 @@ async function runningV1(policy: "auto" | "off", requireManifest: "signed" | "fr
   return lode;
 }
 
-test("policy=auto does not follow an unsigned manifest under require_manifest=fresh", async () => {
-  const lode = await runningV1("auto", "fresh");
+test("policy=auto does not follow an unsigned manifest under require_manifest=signed", async () => {
+  const lode = await runningV1("auto", "signed");
 
   // The source stops signing its catalog and advances the channel. The artifact
   // itself is properly signed, so only the manifest policy stands in the way.
@@ -60,29 +60,27 @@ test("policy=auto does not follow an unsigned manifest under require_manifest=fr
   expect(lode.countMatches(/\[app\] starting version=0\.0\.2/)).toBe(0);
   expect(lode.exited).toBe(false);
 
-  // Signed and dated again: the same host now takes the update.
+  // Signed again: the same host now takes the update.
   h.server.resign(h.signer.privPath, ["--expires-in", "30d"]);
   const swapped = await lode.waitForState((s) => s.status === "running" && s.current === "0.0.2", {
     timeout: 20000,
-    label: "applied v0.0.2 once the manifest is fresh again",
+    label: "applied v0.0.2 once the manifest is signed again",
   });
   expect(swapped.current).toBe("0.0.2");
 });
 
-test("policy=auto does not follow a manifest whose expiry was stripped", async () => {
+test("the deprecated require_manifest=fresh is signed: a signed manifest without an expiry is followed", async () => {
   const lode = await runningV1("auto", "fresh");
+  expect(lode.countMatches(/require_manifest = "fresh" is deprecated/)).toBeGreaterThan(0);
 
-  // Signed catalog, no expiry: a replayable manifest. `signed` would accept it.
   h.server.resign(h.signer.privPath);
   await h.publish("0.0.2", { mode: "service", latest: true });
 
-  await lode.waitForState((s) => /no expiry/.test(s.last_error ?? ""), {
-    timeout: 15000,
-    label: "update check refused (no expiry)",
+  const swapped = await lode.waitForState((s) => s.status === "running" && s.current === "0.0.2", {
+    timeout: 20000,
+    label: "applied v0.0.2 from an undated signed manifest",
   });
-  await sleep(2000);
-  expect(lode.readState()?.current).toBe("0.0.1");
-  expect(lode.countMatches(/\[app\] starting version=0\.0\.2/)).toBe(0);
+  expect(swapped.current).toBe("0.0.2");
 });
 
 test("an app-requested target is not installed from an unsigned manifest", async () => {

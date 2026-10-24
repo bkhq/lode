@@ -101,6 +101,7 @@ When `run`/`exec` depends on a runtime (such as `bun`), it can be declared in th
 - **Unverified**: unlike an app artifact, a runtime download carries **no `sha256`/`sig`** and is **not** integrity/identity-checked. Pin a version, host on a trusted origin, and add its host to `[http].credential_hosts` if it needs credentials.
 - **Version pin** (`version` + `version_check`): when `version` is set, lode probes the runtime it's about to use (PATH/cache/downloaded) by running it with `version_check` (default `--version`) and requires the output to **contain** `version`. A wrong-version PATH/cache entry is bypassed for a fresh download; a downloaded mismatch is a hard error.
 - lode then **prepends `$LODE_DIR/runtime/` to the child's PATH**.
+- **Per-release runtime**: a manifest asset may carry a `runtime` object with the same fields. Once a verified signature covers it (the asset's `lode.artifact.v3` signature or the catalog signature), it replaces `[runtime]` for that version and is kept in the version's `.lode.json`. Each launch resolves the runtime of the version it starts, so a hot update or a rollback switches runtimes with the version. An uncovered `runtime` is ignored with a warning.
 
 ```toml
 [runtime]
@@ -159,7 +160,7 @@ target ≠ current and available (stop-start mode):
 `lode` startup (service mode) runs a cleanup pass before determining the version:
 
 - **Orphan child processes**: a previous lode crash may have left an app child process still running. After taking over the stale lock, read `state.json.pid`, and if that process is still alive → terminate it gracefully (SIGTERM → SIGKILL on timeout) before starting a new one, avoiding port/resource conflicts and dual instances.
-- **Garbage collection**: clean up interrupted `downloads/<v>/*.part` and `versions/<v>.tmp` half-finished artifacts left by interruptions (the verified per-version download cache is kept); per `keep_versions`, retain current + last_good + the most recent N versions, deleting the rest of the version directories **and their `downloads/<v>/` caches**; `$LODE_DIR/runtime/` likewise keeps only the cache key in use.
+- **Garbage collection**: clean up interrupted `downloads/<v>/*.part` and `versions/<v>.tmp` half-finished artifacts left by interruptions (the verified per-version download cache is kept); per `keep_versions`, retain current + last_good + the most recent N versions, deleting the rest of the version directories **and their `downloads/<v>/` caches**; `$LODE_DIR/runtime/` likewise keeps only the keys of `[runtime]` and of the installed versions' runtimes.
 - **Verify on-disk consistency**: if the version the `current` symlink points to is missing/corrupted → fall back to last_good or re-bootstrap.
 
 ### Resources (`[[resource]]`)
@@ -255,9 +256,9 @@ It is a second signature, not part of the `lode.manifest.v1` message: a lode tha
 |---|---|
 | `off` (default) | `sig` and `expires_sig` are verified when present; neither is required. |
 | `signed` | A valid `sig` is required. |
-| `fresh` | A valid `sig` and a signed, unexpired `expires` are required. |
+| `fresh` | Deprecated: the same as `signed` (lode warns at startup). It used to require a signed `expires` as well. |
 
-Only `fresh` stops a source from stripping `expires`/`expires_sig` and replaying a catalog whose `sig` is still valid. `signed` and `fresh` need trusted keys and a native manifest; a GitHub source has no manifest to sign and is rejected with them at config time. A running lode treats a rejected manifest as a failed update check: it keeps running the current version.
+An `expires` is verified whenever present but never required: replaying an older catalog is stopped by manifest commits and the downgrade floor instead. `signed` needs trusted keys and a native manifest; a GitHub source has no manifest to sign and is rejected with it at config time. A running lode treats a rejected manifest as a failed update check: it keeps running the current version.
 
 ### Trusted public keys / strength
 
@@ -320,6 +321,20 @@ Signed message: `lode.revocations.v1\n{key_id}\n{issued_at}` followed by each re
 - Signed by a trusted key, or by a sub-key with a valid, unrevoked delegation for `[global].app`.
 - Fetched whenever the manifest is verified. A newer valid list (`issued_at` greater than the cached one) is **merged** into `$LODE_DIR/revocations.json`; entries are never removed, so a list cannot un-revoke a key, and an older list is ignored.
 - Not mandatory: an unreachable, invalid or stale list is logged and the cached state stays in force. Without a list, revocation relies on the delegation's `not_after`; keep delegations short.
+
+### Manifest commits (anti-rollback)
+
+A native manifest may be a **commit**: it adds `generation` (≥ 1), `parent` (the previous commit's id; absent for generation 1), `created` and `commit_sig`, signed by the same key as `sig`:
+```
+lode.manifest-commit.v1
+{name}
+{key_id}
+{generation}
+{parent}         # empty for generation 1
+{created}
+{canonical}      # the catalog that `sig` signs
+```
+The sha256 hex of this message is the commit id. With trusted keys configured, lode keeps the newest accepted `{generation, commit}` per manifest `name` in `commits.json` in the lode directory and refuses a manifest with a lower generation, the same generation and another id, or no signed commit once one has been accepted. This stops a source from replaying an older, validly signed manifest. `sig` is unchanged, so lodes without commit support verify a commit as an ordinary signed manifest. Deleting `commits.json` resets the floor. `lode-cli publish --key`, `yank` and `channel` write commits to a lode-server registry.
 
 ### CLI (publisher)
 
@@ -493,7 +508,7 @@ Key names: `lode.toml` uses snake_case (see `docs/lode.example.toml`); environme
 | `LODE_ALLOW_INSECURE_HTTP` | `--allow-insecure-http` | `http.allow_insecure` | `false` | allow plain-HTTP fetches (loopback always allowed; credentials travel in the clear) |
 | **`[trust]` — signature verification** | | | | |
 | `LODE_REQUIRE_SIGNATURE` | `--require-signature <off\|auto\|enforce>` | `trust.require_signature` | `auto` | signature-verification strength, §6 |
-| `LODE_REQUIRE_MANIFEST` | `--require-manifest <off\|signed\|fresh>` | `trust.require_manifest` | `off` | what the manifest must prove (signature, expiry), §6 |
+| `LODE_REQUIRE_MANIFEST` | `--require-manifest <off\|signed>` | `trust.require_manifest` | `off` | whether the manifest must be signed (`fresh` is a deprecated alias of `signed`), §6 |
 | `LODE_TRUSTED_KEYS` | `--trusted-keys <list>` | `trust.trusted_keys` | — | trusted public keys `key_id:base64`, comma-separated |
 | `LODE_TRUSTED_KEYS_FILE` | `--trusted-keys-file <path>` | `trust.trusted_keys_file` | — | trusted public keys file |
 | `LODE_REVOCATION_URL` | `--revocation-url <url>` | `trust.revocation_url` | — | signed revocation list for delegated keys (optional), §6 |

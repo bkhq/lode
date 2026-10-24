@@ -10,7 +10,7 @@
 //! rename. Pruning keeps `current` + `last_good` + the newest `keep_versions`.
 
 use std::cmp::Ordering;
-use std::collections::{BTreeSet, HashSet, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashSet, VecDeque};
 use std::ffi::OsStr;
 use std::fs;
 use std::io::{self, Read as _};
@@ -21,7 +21,7 @@ use serde::{Deserialize, Serialize};
 use crate::config::{Config, RequireManifest, RequireSignature};
 use crate::error::{Error, Result};
 use crate::idval::validate_id;
-use crate::manifest::{Asset, Manifest, format_from_name, validate_command_override};
+use crate::manifest::{Asset, Manifest, RuntimeSpec, format_from_name, validate_command_override};
 
 /// Per-version metadata written to `versions/<ver>/.lode.json` so a version can
 /// be launched offline without re-consulting the manifest (design §15).
@@ -40,6 +40,10 @@ pub struct Marker {
     /// The asset's `exec` launch override.
     #[serde(default)]
     pub exec: Option<String>,
+    /// The asset's runtime, when a verified signature covered it; replaces
+    /// `[runtime]` for this version.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub runtime: Option<RuntimeSpec>,
     /// Packaging format the asset was installed from.
     pub format: String,
 }
@@ -72,7 +76,11 @@ pub fn install(
         validate_command_override("exec", exec)?;
     }
 
-    verify_download(cfg, version, asset, computed_sha)?;
+    let runtime = trusted_runtime(
+        version,
+        asset,
+        verify_download(cfg, version, asset, computed_sha)?,
+    );
 
     let versions_dir = install_root(cfg).join("versions");
     fs::create_dir_all(&versions_dir)?;
@@ -82,7 +90,7 @@ pub fn install(
 
     // Stage into the `.tmp` dir; tear it down on any failure so we never leave a
     // half-extracted version behind.
-    if let Err(e) = stage(cfg, asset, artifact_path, &staging, version) {
+    if let Err(e) = stage(cfg, asset, runtime, artifact_path, &staging, version) {
         let _ = fs::remove_dir_all(&staging);
         return Err(e);
     }
@@ -136,9 +144,11 @@ pub fn seed_local(cfg: &Config, version: &str, source: &Path, activate: bool) ->
         alg: None,
         run: None,
         exec: None,
+        runtime: None,
         size: None,
         auth: false,
         delegation: None,
+        catalog_signed: false,
     };
 
     let versions_dir = cfg.global.dir.join("versions");
@@ -146,7 +156,7 @@ pub fn seed_local(cfg: &Config, version: &str, source: &Path, activate: bool) ->
     let staging = versions_dir.join(format!("{version}.tmp"));
     let _ = fs::remove_dir_all(&staging);
     fs::create_dir_all(&staging)?;
-    if let Err(e) = stage(cfg, &asset, source, &staging, version) {
+    if let Err(e) = stage(cfg, &asset, None, source, &staging, version) {
         let _ = fs::remove_dir_all(&staging);
         return Err(e);
     }
@@ -182,6 +192,7 @@ pub fn seed_local(cfg: &Config, version: &str, source: &Path, activate: bool) ->
 fn stage(
     cfg: &Config,
     asset: &Asset,
+    runtime: Option<RuntimeSpec>,
     temp_path: &Path,
     staging: &Path,
     version: &str,
@@ -189,8 +200,24 @@ fn stage(
     let format = format_from_name(&asset.name);
     extract(asset, format, temp_path, staging)?;
     chmod_command_targets(cfg, asset, staging)?;
-    write_marker(staging, version, asset, format)?;
+    write_marker(staging, version, asset, runtime, format)?;
     Ok(())
+}
+
+/// The asset's runtime when a verified signature covers it — its own
+/// (`asset_signed`, `lode.artifact.v3`) or the catalog's — else `None`, logged:
+/// only signed data may replace the local `[runtime]`.
+fn trusted_runtime(version: &str, asset: &Asset, asset_signed: bool) -> Option<RuntimeSpec> {
+    let rt = asset.runtime.as_ref()?;
+    if asset_signed || asset.catalog_signed {
+        return Some(rt.clone());
+    }
+    tracing::warn!(
+        version,
+        runtime = rt.runtime,
+        "the asset's runtime is not covered by a verified signature; keeping [runtime]"
+    );
+    None
 }
 
 /// Auto `chmod +x` after extraction: for each of the *effective* run/exec
@@ -506,13 +533,14 @@ fn verify_integrity(asset: &Asset, computed_sha: &str) -> Result<()> {
 /// The full download gate — integrity ([`verify_integrity`]) then identity
 /// ([`verify_identity`]) — for a fetched artifact whose sha256 is `computed_sha`.
 /// [`install`] runs it before staging; the self-update path runs it before
-/// swapping the binary.
+/// swapping the binary. `Ok(true)` when the asset's own signature also covers
+/// its runtime.
 pub(crate) fn verify_download(
     cfg: &Config,
     version: &str,
     asset: &Asset,
     computed_sha: &str,
-) -> Result<()> {
+) -> Result<bool> {
     verify_integrity(asset, computed_sha)?;
     verify_identity(cfg, version, asset, computed_sha)
 }
@@ -528,11 +556,11 @@ pub(crate) fn verify_download(
 ///   would hand that source arbitrary execution. The operator's own `[command]`
 ///   is the only launch command an unverified catalog may rely on.
 /// - `enforce` => a valid signature (and trusted keys) is mandatory.
-fn verify_identity(cfg: &Config, version: &str, asset: &Asset, computed_sha: &str) -> Result<()> {
+fn verify_identity(cfg: &Config, version: &str, asset: &Asset, computed_sha: &str) -> Result<bool> {
     // Policy looks at the root keys only; the delegated key joins at the check.
     let keys = trusted_keys(cfg)?;
     match cfg.trust.require_signature {
-        RequireSignature::Off => Ok(()),
+        RequireSignature::Off => Ok(false),
         RequireSignature::Auto => {
             if keys.is_empty() {
                 if asset.run.is_some() || asset.exec.is_some() {
@@ -546,7 +574,7 @@ fn verify_identity(cfg: &Config, version: &str, asset: &Asset, computed_sha: &st
                     version,
                     "no trusted keys configured; asset is UNVERIFIED (require_signature=auto)"
                 );
-                return Ok(());
+                return Ok(false);
             }
             // Keys are configured ⇒ fail-closed: a missing signature is rejected,
             // just like an invalid one (no more warn-and-skip).
@@ -595,6 +623,10 @@ fn verify_identity(cfg: &Config, version: &str, asset: &Asset, computed_sha: &st
 /// (`[global].app`) + the asset filename (`asset.name`) + version + digest + the optional `run`/`exec` launch overrides
 /// — never `platform`/`format`/`url`. `roots` gain the asset's delegated key
 /// when its delegation is valid now.
+///
+/// An asset with a runtime is checked over `lode.artifact.v3` first (`Ok(true)`:
+/// the signature covers the runtime), then over v2 (`Ok(false)`: the asset is
+/// genuine, its runtime only as trusted as the catalog signature).
 fn check_sig(
     app: &str,
     version: &str,
@@ -603,20 +635,28 @@ fn check_sig(
     sig: &str,
     roots: &[String],
     revoked: &BTreeSet<String>,
-) -> Result<()> {
+) -> Result<bool> {
     let (keys, rejected) =
         crate::verify::effective_keys(roots, asset.delegation.as_ref(), app, unix_now(), revoked);
-    crate::verify::verify_artifact_sig(
-        app,
-        &asset.name,
-        version,
-        sha,
-        asset.run.as_deref(),
-        asset.exec.as_deref(),
-        sig,
-        &keys,
-    )
-    .map_err(|e| delegation_error(&e, rejected.as_deref()))
+    let verify = |runtime| {
+        crate::verify::verify_artifact_sig(
+            app,
+            &asset.name,
+            version,
+            sha,
+            asset.run.as_deref(),
+            asset.exec.as_deref(),
+            runtime,
+            sig,
+            &keys,
+        )
+    };
+    if asset.runtime.is_some() && verify(asset.runtime.as_ref()).is_ok() {
+        return Ok(true);
+    }
+    verify(None)
+        .map(|()| false)
+        .map_err(|e| delegation_error(&e, rejected.as_deref()))
 }
 
 /// A `verify:` error, naming why a present delegation was rejected.
@@ -652,12 +692,11 @@ fn delegation_error(e: &dyn std::fmt::Display, rejected: Option<&str>) -> Error 
 /// `[trust].require_manifest` ([`RequireManifest`]):
 /// - `expires` present => a manifest at or past it is rejected, under every policy
 ///   (it is a date, not a signature check). Its `expires_sig` is verified like `sig`.
-/// - `require_manifest = signed` => `sig` and trusted keys are required.
-/// - `require_manifest = fresh` => additionally a signed `expires` is required, so
-///   a source cannot hold this host on an old catalog by replaying it.
+/// - `require_manifest = signed` (or the deprecated `fresh`) => `sig` and trusted
+///   keys are required.
 ///
 /// Call this right after [`crate::manifest::fetch`], before resolving/downloading.
-pub fn verify_manifest_identity(cfg: &Config, manifest: &Manifest) -> Result<()> {
+pub fn verify_manifest_identity(cfg: &Config, manifest: &mut Manifest) -> Result<()> {
     refresh_revocations(cfg);
     verify_manifest_at(cfg, manifest, unix_now())
 }
@@ -670,7 +709,7 @@ fn unix_now() -> u64 {
 }
 
 /// [`verify_manifest_identity`] against an explicit clock (`now`, Unix seconds).
-fn verify_manifest_at(cfg: &Config, manifest: &Manifest, now: u64) -> Result<()> {
+fn verify_manifest_at(cfg: &Config, manifest: &mut Manifest, now: u64) -> Result<()> {
     let policy = cfg.trust.require_manifest;
     let required = policy != RequireManifest::Off;
     let keys = if required || cfg.trust.require_signature != RequireSignature::Off {
@@ -692,9 +731,15 @@ fn verify_manifest_at(cfg: &Config, manifest: &Manifest, now: u64) -> Result<()>
         now,
         &revoked_keys(cfg),
     );
-    match manifest.sig.as_deref() {
+    let sig = manifest.sig.clone();
+    match sig.as_deref() {
         Some(sig) if !keys.is_empty() => {
             check_manifest_sig(manifest, sig, &keys, rejected.as_deref())?;
+            for entry in manifest.versions.values_mut() {
+                for asset in &mut entry.assets {
+                    asset.catalog_signed = true;
+                }
+            }
         }
         Some(_) if cfg.trust.require_signature != RequireSignature::Off => tracing::warn!(
             manifest = manifest.name,
@@ -709,12 +754,11 @@ fn verify_manifest_at(cfg: &Config, manifest: &Manifest, now: u64) -> Result<()>
         _ => {}
     }
 
+    if !keys.is_empty() {
+        check_commit(cfg, manifest, &keys, rejected.as_deref())?;
+    }
+
     let Some(expires) = manifest.expires else {
-        if policy == RequireManifest::Fresh {
-            return Err(Error::Verify(
-                "require_manifest=fresh but the manifest has no expiry".to_owned(),
-            ));
-        }
         return Ok(());
     };
     match (
@@ -727,11 +771,6 @@ fn verify_manifest_at(cfg: &Config, manifest: &Manifest, now: u64) -> Result<()>
                     delegation_error(&format!("manifest expiry: {e}"), rejected.as_deref())
                 })?;
         }
-        (None, _) if policy == RequireManifest::Fresh => {
-            return Err(Error::Verify(
-                "require_manifest=fresh but the manifest's expiry is not signed".to_owned(),
-            ));
-        }
         _ => {}
     }
     if now >= expires {
@@ -740,6 +779,89 @@ fn verify_manifest_at(cfg: &Config, manifest: &Manifest, now: u64) -> Result<()>
              the source is serving a stale manifest or this host's clock is wrong",
             human_duration(now - expires)
         )));
+    }
+    Ok(())
+}
+
+/// The newest signed commit lode accepted, per manifest `name`, under
+/// `[global].dir`.
+const COMMITS_FILE: &str = "commits.json";
+
+/// A manifest's newest accepted commit.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct CommitFloor {
+    generation: u64,
+    commit: String,
+}
+
+fn read_commit_floors(cfg: &Config) -> BTreeMap<String, CommitFloor> {
+    fs::read(cfg.global.dir.join(COMMITS_FILE))
+        .ok()
+        .and_then(|bytes| serde_json::from_slice(&bytes).ok())
+        .unwrap_or_default()
+}
+
+fn write_commit_floors(cfg: &Config, floors: &BTreeMap<String, CommitFloor>) -> io::Result<()> {
+    let tmp = cfg.global.dir.join(format!("{COMMITS_FILE}.tmp"));
+    fs::write(
+        &tmp,
+        serde_json::to_vec_pretty(floors).map_err(io::Error::other)?,
+    )?;
+    fs::rename(&tmp, cfg.global.dir.join(COMMITS_FILE))
+}
+
+/// Verify the manifest's signed commit and refuse one older than the newest
+/// accepted for this manifest `name`: a lower `generation`, the same one with
+/// another id, or no signed commit at all once one was accepted. A newer
+/// commit becomes the floor.
+fn check_commit(
+    cfg: &Config,
+    manifest: &Manifest,
+    keys: &[String],
+    rejected: Option<&str>,
+) -> Result<()> {
+    let signed = match (
+        manifest.commit_sig.as_deref(),
+        manifest.commit_signing_message(),
+    ) {
+        (Some(sig), Some(message)) => {
+            crate::verify::verify_manifest_sig(keys, manifest.key_id.as_deref(), &message, sig)
+                .map_err(|e| delegation_error(&format!("manifest commit: {e}"), rejected))?;
+            manifest.generation.zip(manifest.commit_id())
+        }
+        _ => None,
+    };
+    let mut floors = read_commit_floors(cfg);
+    let floor = floors.get(&manifest.name);
+    let reset = format!("delete {COMMITS_FILE} in the lode dir to reset");
+    match (signed, floor) {
+        (None, None) => return Ok(()),
+        (None, Some(floor)) => {
+            return Err(Error::Verify(format!(
+                "manifest has no signed commit, but commit {} was accepted before ({reset})",
+                floor.generation
+            )));
+        }
+        (Some((generation, _)), Some(floor)) if generation < floor.generation => {
+            return Err(Error::Verify(format!(
+                "manifest commit {generation} is older than commit {} accepted before ({reset})",
+                floor.generation
+            )));
+        }
+        (Some((generation, commit)), Some(floor)) if generation == floor.generation => {
+            if commit != floor.commit {
+                return Err(Error::Verify(format!(
+                    "manifest commit {generation} differs from the commit {generation} accepted before ({reset})"
+                )));
+            }
+            return Ok(());
+        }
+        (Some((generation, commit)), _) => {
+            floors.insert(manifest.name.clone(), CommitFloor { generation, commit });
+        }
+    }
+    if let Err(e) = write_commit_floors(cfg, &floors) {
+        tracing::warn!(error = %e, "could not store the accepted manifest commit");
     }
     Ok(())
 }
@@ -917,7 +1039,7 @@ pub fn manifest_trust_posture(cfg: &Config, manifest: &Manifest) -> String {
     };
     let expiry = expiry_note(manifest, unix_now());
     match manifest.sig.as_deref() {
-        None => match verify_manifest_identity(cfg, manifest) {
+        None => match verify_manifest_identity(cfg, &mut manifest.clone()) {
             Ok(()) => {
                 format!("unsigned catalog (per-artifact signatures enforced per policy){expiry}")
             }
@@ -926,7 +1048,7 @@ pub fn manifest_trust_posture(cfg: &Config, manifest: &Manifest) -> String {
         Some(_) if keys.is_empty() => {
             "catalog signed but UNVERIFIED (no trusted keys configured)".to_owned()
         }
-        Some(_) => match verify_manifest_identity(cfg, manifest) {
+        Some(_) => match verify_manifest_identity(cfg, &mut manifest.clone()) {
             Ok(()) => format!("VERIFIED (catalog signature valid){expiry}"),
             Err(e) => format!("VERIFICATION FAILED: {e}"),
         },
@@ -1268,11 +1390,18 @@ fn chmod_x(_path: &Path) -> Result<()> {
 
 /// Write the per-version `.lode.json` marker into `dir`, copying the asset's
 /// launch overrides so an offline relaunch applies them without the manifest.
-fn write_marker(dir: &Path, version: &str, asset: &Asset, format: &str) -> Result<()> {
+fn write_marker(
+    dir: &Path,
+    version: &str,
+    asset: &Asset,
+    runtime: Option<RuntimeSpec>,
+    format: &str,
+) -> Result<()> {
     let marker = Marker {
         version: version.to_owned(),
         run: asset.run.clone(),
         exec: asset.exec.clone(),
+        runtime,
         format: format.to_owned(),
     };
     let json = serde_json::to_vec_pretty(&marker)?;
@@ -1461,6 +1590,8 @@ mod tests {
             size: None,
             auth: true,
             delegation: None,
+            runtime: None,
+            catalog_signed: false,
         }
     }
 
@@ -1836,6 +1967,65 @@ mod tests {
         let _ = fs::remove_dir_all(&dir2);
     }
 
+    fn node_runtime() -> RuntimeSpec {
+        RuntimeSpec {
+            runtime: "node".to_owned(),
+            version: Some("v22.".to_owned()),
+            version_check: None,
+            download: Some("https://x/node.tar.gz".to_owned()),
+            sha256: Some("b".repeat(64)),
+        }
+    }
+
+    /// The asset's runtime reaches the marker only when a verified signature
+    /// covers it: its own v3 signature, or the catalog signature.
+    #[test]
+    fn asset_runtime_needs_a_covering_signature() {
+        let signing = SigningKey::from_bytes(&[4u8; 32]);
+        let pub_b64 = B64.encode(signing.verifying_key().to_bytes());
+        let rt = node_runtime();
+        let body = b"payload";
+        let sign = |msg: String| B64.encode(signing.sign(msg.as_bytes()).to_bytes());
+        let run = |label: &str, sig: Option<String>, catalog_signed: bool, require| {
+            let dir = scratch(label);
+            let keys = vec![format!("kid:{pub_b64}")];
+            let cfg = cfg_for(dir.clone(), require, keys);
+            let (temp, sha) = stage_download(&cfg, "1.0.0", body);
+            let mut art = asset("app.bin", &sha);
+            art.runtime = Some(rt.clone());
+            art.catalog_signed = catalog_signed;
+            art.sig = sig.map(|s| s.replace("SHA", &sha)).map(sign);
+            install(&cfg, "1.0.0", &art, &temp, &sha).unwrap();
+            let got = read_marker(&dir, "1.0.0").runtime;
+            let _ = fs::remove_dir_all(&dir);
+            got
+        };
+        let v2 = "lode.artifact.v2\nmyapp\napp.bin\n1.0.0\nSHA\n\n".to_owned();
+        let v3 = format!(
+            "{}\n{}",
+            v2.replace(".v2\n", ".v3\n"),
+            rt.signed_fields().join("\n")
+        );
+
+        assert_eq!(
+            run("rt-v3", Some(v3), false, RequireSignature::Enforce),
+            Some(rt.clone())
+        );
+        assert_eq!(
+            run("rt-v2", Some(v2.clone()), false, RequireSignature::Enforce),
+            None
+        );
+        assert_eq!(
+            run("rt-catalog", Some(v2), true, RequireSignature::Enforce),
+            Some(rt.clone())
+        );
+        assert_eq!(run("rt-off", None, false, RequireSignature::Off), None);
+        assert_eq!(
+            run("rt-off-catalog", None, true, RequireSignature::Off),
+            Some(rt)
+        );
+    }
+
     #[test]
     fn enforce_without_signature_errors() {
         let dir = scratch("nosig");
@@ -1932,6 +2122,10 @@ mod tests {
             expires: None,
             expires_sig: None,
             delegation: None,
+            parent: None,
+            generation: None,
+            created: None,
+            commit_sig: None,
             channels,
             versions,
         }
@@ -1954,6 +2148,76 @@ mod tests {
         manifest.sig = Some(sig);
     }
 
+    /// Stamp a signed commit (`generation`, `parent`, `commit_sig`), mirroring
+    /// `lode-cli publish`. Call after [`sign_manifest`].
+    fn sign_commit(
+        manifest: &mut Manifest,
+        signing: &SigningKey,
+        generation: u64,
+        parent: Option<String>,
+    ) {
+        manifest.generation = Some(generation);
+        manifest.parent = parent;
+        manifest.created = Some("2026-10-24T00:00:00Z".to_owned());
+        let message = manifest.commit_signing_message().unwrap();
+        manifest.commit_sig = Some(B64.encode(signing.sign(&message).to_bytes()));
+    }
+
+    /// A signed commit older than the newest accepted one is refused.
+    #[test]
+    fn an_older_signed_commit_is_refused() {
+        let dir = scratch("commits");
+        let signing = SigningKey::from_bytes(&[22u8; 32]);
+        let id = crate::verify::key_id(&signing.verifying_key().to_bytes());
+        let trusted = vec![format!(
+            "{id}:{}",
+            B64.encode(signing.verifying_key().to_bytes())
+        )];
+        let cfg = cfg_for(dir.clone(), RequireSignature::Enforce, trusted);
+        let commit = |generation, parent, latest: &str| {
+            let mut m = manifest_fixture();
+            m.channels.get_mut("stable").unwrap().latest = latest.to_owned();
+            sign_manifest(&mut m, &signing);
+            sign_commit(&mut m, &signing, generation, parent);
+            m
+        };
+        let mut first = commit(1, None, "1.0.0");
+        let second = commit(2, first.commit_id(), "1.0.0");
+
+        verify_manifest_identity(&cfg, &mut first.clone()).unwrap();
+        verify_manifest_identity(&cfg, &mut second.clone()).unwrap();
+        // The same commit again is fine.
+        verify_manifest_identity(&cfg, &mut second.clone()).unwrap();
+
+        let err = verify_manifest_identity(&cfg, &mut first.clone()).unwrap_err();
+        assert!(err.to_string().contains("older than commit 2"), "{err}");
+        // Another commit 2 (a fork) is refused.
+        let mut fork = second.clone();
+        fork.created = Some("2026-10-25T00:00:00Z".to_owned());
+        let message = fork.commit_signing_message().unwrap();
+        fork.commit_sig = Some(B64.encode(signing.sign(&message).to_bytes()));
+        let err = verify_manifest_identity(&cfg, &mut fork).unwrap_err();
+        assert!(err.to_string().contains("differs"), "{err}");
+        // A manifest without a signed commit is refused once one was accepted.
+        let mut plain = manifest_fixture();
+        sign_manifest(&mut plain, &signing);
+        let err = verify_manifest_identity(&cfg, &mut plain).unwrap_err();
+        assert!(err.to_string().contains("no signed commit"), "{err}");
+        // A bad commit signature is refused.
+        let mut forged = commit(3, second.commit_id(), "1.0.0");
+        forged.commit_sig.clone_from(&second.commit_sig);
+        assert!(verify_manifest_identity(&cfg, &mut forged).is_err());
+
+        verify_manifest_identity(&cfg, &mut commit(3, second.commit_id(), "1.0.0")).unwrap();
+        let floors = read_commit_floors(&cfg);
+        assert_eq!(floors["myapp"].generation, 3);
+
+        // Without trusted keys nothing is verified, so nothing is enforced.
+        let nokeys = cfg_for(dir.clone(), RequireSignature::Auto, Vec::new());
+        verify_manifest_identity(&nokeys, &mut first).unwrap();
+        let _ = fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn verify_manifest_identity_verifies_if_present_never_requires() {
         let dir = scratch("manifestsig");
@@ -1969,8 +2233,8 @@ mod tests {
         let auto = cfg_for(dir.clone(), RequireSignature::Auto, trusted.clone());
 
         // A *present* valid signature is verified → ok under both enforce and auto.
-        assert!(verify_manifest_identity(&enforce, &m).is_ok());
-        assert!(verify_manifest_identity(&auto, &m).is_ok());
+        assert!(verify_manifest_identity(&enforce, &mut m.clone()).is_ok());
+        assert!(verify_manifest_identity(&auto, &mut m.clone()).is_ok());
         // …and the status posture reports VERIFIED.
         assert!(manifest_trust_posture(&enforce, &m).starts_with("VERIFIED"));
 
@@ -1982,32 +2246,32 @@ mod tests {
                 latest: "9.9.9".to_owned(),
             },
         );
-        assert!(verify_manifest_identity(&enforce, &tampered).is_err());
+        assert!(verify_manifest_identity(&enforce, &mut tampered.clone()).is_err());
         assert!(manifest_trust_posture(&enforce, &tampered).starts_with("VERIFICATION FAILED"));
 
         // §7 regression (catalog level): a tampered asset `run` under an otherwise
         // valid catalog signature is rejected too — the signature covers it.
         let mut run_tampered = m.clone();
         run_tampered.versions.get_mut("1.0.0").unwrap().assets[0].run = Some("./evil".to_owned());
-        assert!(verify_manifest_identity(&enforce, &run_tampered).is_err());
+        assert!(verify_manifest_identity(&enforce, &mut run_tampered.clone()).is_err());
 
         // A MISSING catalog signature is NEVER required — accepted under every policy
         // (the per-artifact check, gated by require_signature, still binds downloads).
         let mut unsigned = m.clone();
         unsigned.sig = None;
-        assert!(verify_manifest_identity(&auto, &unsigned).is_ok());
-        assert!(verify_manifest_identity(&enforce, &unsigned).is_ok());
+        assert!(verify_manifest_identity(&auto, &mut unsigned.clone()).is_ok());
+        assert!(verify_manifest_identity(&enforce, &mut unsigned.clone()).is_ok());
         // …and its posture is the benign "unsigned catalog" state, not a failure.
         assert!(manifest_trust_posture(&enforce, &unsigned).starts_with("unsigned catalog"));
 
         // off → skip even a present signature (all signature checks disabled).
         let off = cfg_for(dir.clone(), RequireSignature::Off, trusted);
-        assert!(verify_manifest_identity(&off, &tampered).is_ok());
+        assert!(verify_manifest_identity(&off, &mut tampered.clone()).is_ok());
 
         // Present sig but NO trusted keys → cannot verify → accept (warn); posture
         // reports the catalog is signed but UNVERIFIED.
         let nokeys = cfg_for(dir.clone(), RequireSignature::Auto, Vec::new());
-        assert!(verify_manifest_identity(&nokeys, &m).is_ok());
+        assert!(verify_manifest_identity(&nokeys, &mut m.clone()).is_ok());
         assert!(manifest_trust_posture(&nokeys, &m).contains("UNVERIFIED"));
         // An unsigned catalog with no keys is still just "unsigned catalog".
         assert!(manifest_trust_posture(&nokeys, &unsigned).starts_with("unsigned catalog"));
@@ -2023,7 +2287,7 @@ mod tests {
             RequireSignature::Enforce,
             vec![format!("x:{other_pub}")],
         );
-        assert!(verify_manifest_identity(&wrong, &m).is_err());
+        assert!(verify_manifest_identity(&wrong, &mut m.clone()).is_err());
 
         let _ = fs::remove_dir_all(&dir);
     }
@@ -2061,17 +2325,17 @@ mod tests {
         let (signing, trusted, m) = dated_manifest();
         let cfg = cfg_requiring(RequireManifest::Off, trusted.clone());
 
-        assert!(verify_manifest_at(&cfg, &m, NOW).is_ok());
-        assert!(verify_manifest_at(&cfg, &m, NOW + 3599).is_ok());
+        assert!(verify_manifest_at(&cfg, &mut m.clone(), NOW).is_ok());
+        assert!(verify_manifest_at(&cfg, &mut m.clone(), NOW + 3599).is_ok());
         // At and after the expiry the manifest is refused.
-        let err = verify_manifest_at(&cfg, &m, NOW + 3600).unwrap_err();
+        let err = verify_manifest_at(&cfg, &mut m.clone(), NOW + 3600).unwrap_err();
         assert!(err.to_string().contains("expired"), "got: {err}");
-        assert!(verify_manifest_at(&cfg, &m, NOW + 86_400).is_err());
+        assert!(verify_manifest_at(&cfg, &mut m.clone(), NOW + 86_400).is_err());
 
         // Pushing the expiry out without re-signing it is caught…
         let mut extended = m.clone();
         extended.expires = Some(NOW + 86_400 * 365);
-        assert!(verify_manifest_at(&cfg, &extended, NOW + 7200).is_err());
+        assert!(verify_manifest_at(&cfg, &mut extended, NOW + 7200).is_err());
         // …and so is a signed expiry carried over to a different catalog.
         let mut moved = manifest_fixture();
         moved.channels.insert(
@@ -2083,7 +2347,7 @@ mod tests {
         sign_manifest(&mut moved, &signing);
         moved.expires = m.expires;
         moved.expires_sig.clone_from(&m.expires_sig);
-        assert!(verify_manifest_at(&cfg, &moved, NOW).is_err());
+        assert!(verify_manifest_at(&cfg, &mut moved.clone(), NOW).is_err());
 
         // An expiry is a date, not a signature: it holds with signature checks off
         // and with no keys to authenticate it.
@@ -2092,10 +2356,10 @@ mod tests {
             RequireSignature::Off,
             trusted,
         );
-        assert!(verify_manifest_at(&off, &m, NOW).is_ok());
-        assert!(verify_manifest_at(&off, &m, NOW + 3600).is_err());
+        assert!(verify_manifest_at(&off, &mut m.clone(), NOW).is_ok());
+        assert!(verify_manifest_at(&off, &mut m.clone(), NOW + 3600).is_err());
         let nokeys = cfg_requiring(RequireManifest::Off, Vec::new());
-        assert!(verify_manifest_at(&nokeys, &m, NOW + 3600).is_err());
+        assert!(verify_manifest_at(&nokeys, &mut m.clone(), NOW + 3600).is_err());
     }
 
     #[test]
@@ -2106,28 +2370,28 @@ mod tests {
         // What every loader accepted before `expires` existed: signed, undated…
         let mut signed = manifest_fixture();
         sign_manifest(&mut signed, &signing);
-        assert!(verify_manifest_at(&cfg, &signed, NOW).is_ok());
+        assert!(verify_manifest_at(&cfg, &mut signed.clone(), NOW).is_ok());
         // …and entirely unsigned.
-        assert!(verify_manifest_at(&cfg, &manifest_fixture(), NOW).is_ok());
+        assert!(verify_manifest_at(&cfg, &mut manifest_fixture(), NOW).is_ok());
     }
 
     #[test]
     fn require_manifest_signed_needs_a_valid_catalog_signature() {
-        let (signing, trusted, m) = dated_manifest();
+        let (signing, trusted, mut m) = dated_manifest();
         let cfg = cfg_requiring(RequireManifest::Signed, trusted);
 
-        assert!(verify_manifest_at(&cfg, &m, NOW).is_ok());
+        assert!(verify_manifest_at(&cfg, &mut m.clone(), NOW).is_ok());
         // Signed but undated is enough for `signed`.
         let mut undated = manifest_fixture();
         sign_manifest(&mut undated, &signing);
-        assert!(verify_manifest_at(&cfg, &undated, NOW).is_ok());
+        assert!(verify_manifest_at(&cfg, &mut undated.clone(), NOW).is_ok());
 
-        let err = verify_manifest_at(&cfg, &manifest_fixture(), NOW).unwrap_err();
+        let err = verify_manifest_at(&cfg, &mut manifest_fixture(), NOW).unwrap_err();
         assert!(err.to_string().contains("no signature"), "got: {err}");
 
         // Nothing to verify against is a refusal, not a warning.
         let nokeys = cfg_requiring(RequireManifest::Signed, Vec::new());
-        let err = verify_manifest_at(&nokeys, &m, NOW).unwrap_err();
+        let err = verify_manifest_at(&nokeys, &mut m.clone(), NOW).unwrap_err();
         assert!(err.to_string().contains("no trusted keys"), "got: {err}");
 
         // It holds even with artifact signature checks switched off.
@@ -2137,34 +2401,26 @@ mod tests {
             Vec::new(),
         );
         off.trust.require_manifest = RequireManifest::Signed;
-        assert!(verify_manifest_at(&off, &m, NOW).is_err());
+        assert!(verify_manifest_at(&off, &mut m, NOW).is_err());
     }
 
     #[test]
-    fn require_manifest_fresh_needs_a_signed_unexpired_expiry() {
-        let (signing, trusted, m) = dated_manifest();
+    fn require_manifest_fresh_is_signed() {
+        let (signing, trusted, mut m) = dated_manifest();
         let cfg = cfg_requiring(RequireManifest::Fresh, trusted);
 
-        assert!(verify_manifest_at(&cfg, &m, NOW).is_ok());
-        assert!(verify_manifest_at(&cfg, &m, NOW + 3600).is_err());
+        // An expiry is still verified when present.
+        assert!(verify_manifest_at(&cfg, &mut m.clone(), NOW).is_ok());
+        assert!(verify_manifest_at(&cfg, &mut m, NOW + 3600).is_err());
 
-        // The freeze this closes: strip the expiry and replay the catalog, whose
-        // own signature is still valid.
-        let mut stripped = m.clone();
-        stripped.expires = None;
-        stripped.expires_sig = None;
-        let err = verify_manifest_at(&cfg, &stripped, NOW).unwrap_err();
-        assert!(err.to_string().contains("no expiry"), "got: {err}");
-
-        // An expiry nobody signed proves nothing.
-        let mut unsigned_expiry = m;
-        unsigned_expiry.expires_sig = None;
-        let err = verify_manifest_at(&cfg, &unsigned_expiry, NOW).unwrap_err();
-        assert!(err.to_string().contains("not signed"), "got: {err}");
-
+        // A signed manifest without one is accepted, as under `signed`.
         let mut undated = manifest_fixture();
         sign_manifest(&mut undated, &signing);
-        assert!(verify_manifest_at(&cfg, &undated, NOW).is_err());
+        verify_manifest_at(&cfg, &mut undated, NOW).unwrap();
+
+        let mut unsigned = manifest_fixture();
+        let err = verify_manifest_at(&cfg, &mut unsigned, NOW).unwrap_err();
+        assert!(err.to_string().contains("no signature"), "got: {err}");
     }
 
     #[test]
@@ -2263,24 +2519,24 @@ mod tests {
         m.delegation = Some(delegation(&root, &sub, "myapp", NOW - 60, NOW + 7200));
         sign_manifest(&mut m, &sub);
         sign_expiry(&mut m, &sub, NOW + 3600);
-        assert!(verify_manifest_at(&cfg, &m, NOW).is_ok());
+        assert!(verify_manifest_at(&cfg, &mut m.clone(), NOW).is_ok());
 
         // Past the delegation window the catalog no longer verifies.
-        let err = verify_manifest_at(&cfg, &m, NOW + 7200)
+        let err = verify_manifest_at(&cfg, &mut m.clone(), NOW + 7200)
             .unwrap_err()
             .to_string();
         assert!(err.contains("delegation"), "{err}");
         // A delegation scoped to another manifest name is refused.
         let mut scoped = m.clone();
         scoped.delegation = Some(delegation(&root, &sub, "other", NOW - 60, NOW + 7200));
-        assert!(verify_manifest_at(&cfg, &scoped, NOW).is_err());
+        assert!(verify_manifest_at(&cfg, &mut scoped, NOW).is_err());
         // A root-signed catalog still verifies with or without a delegation present.
         let mut direct = manifest_fixture();
         sign_manifest(&mut direct, &root);
         sign_expiry(&mut direct, &root, NOW + 3600);
-        assert!(verify_manifest_at(&cfg, &direct, NOW).is_ok());
+        assert!(verify_manifest_at(&cfg, &mut direct.clone(), NOW).is_ok());
         direct.delegation = m.delegation.clone();
-        assert!(verify_manifest_at(&cfg, &direct, NOW).is_ok());
+        assert!(verify_manifest_at(&cfg, &mut direct.clone(), NOW).is_ok());
     }
 
     #[test]

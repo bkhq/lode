@@ -15,7 +15,7 @@
 
 use std::collections::BTreeMap;
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 use crate::config::{Config, RequireSignature};
 use crate::error::{Error, Result};
@@ -67,6 +67,21 @@ pub struct Manifest {
     /// Root-signed delegation letting a sub-key sign this manifest and its assets.
     #[serde(default)]
     pub delegation: Option<Delegation>,
+    /// Commit id ([`Manifest::commit_id`]) of the manifest this one was built
+    /// on; absent for a first commit.
+    #[serde(default)]
+    pub parent: Option<String>,
+    /// Commit number: the parent's plus one, 1 for a first commit. A loader
+    /// refuses a signed commit older than one it has accepted.
+    #[serde(default)]
+    pub generation: Option<u64>,
+    /// When the commit was made (RFC 3339); informational.
+    #[serde(default)]
+    pub created: Option<String>,
+    /// Base64 signature over [`Manifest::commit_signing_message`], by the same
+    /// key as `sig`.
+    #[serde(default)]
+    pub commit_sig: Option<String>,
     /// Channels by name.
     pub channels: BTreeMap<String, Channel>,
     /// Published versions by id.
@@ -80,7 +95,9 @@ impl Manifest {
     /// both working from the parsed struct, produce identical bytes regardless of
     /// the JSON's key order or whitespace. Each line is a tab-separated record:
     /// `channel\t{name}\t{latest}`, `version\t{id}`, and per asset
-    /// `asset\t{name}\t{sha256}\t{run}\t{exec}` (`name` = the asset filename;
+    /// `asset\t{name}\t{sha256}\t{run}\t{exec}`, followed by
+    /// `\t{runtime}\t{version}\t{version_check}\t{sha256}` when the asset publishes
+    /// a [`RuntimeSpec`] (`name` = the asset filename;
     /// `run`/`exec` are the asset's optional launch overrides, empty when absent —
     /// they steer what the loader executes, so a present catalog signature must
     /// cover them; [`parse`] rejects control characters in them, keeping the
@@ -97,7 +114,7 @@ impl Manifest {
         for (id, entry) in &self.versions {
             let _ = writeln!(out, "version\t{id}");
             for a in &entry.assets {
-                let _ = writeln!(
+                let _ = write!(
                     out,
                     "asset\t{}\t{}\t{}\t{}",
                     a.name,
@@ -105,6 +122,12 @@ impl Manifest {
                     a.run.as_deref().unwrap_or(""),
                     a.exec.as_deref().unwrap_or("")
                 );
+                if let Some(rt) = &a.runtime {
+                    for field in rt.signed_fields() {
+                        let _ = write!(out, "\t{field}");
+                    }
+                }
+                out.push('\n');
             }
         }
         out
@@ -136,6 +159,30 @@ impl Manifest {
                 &self.canonical_catalog(),
             )
         })
+    }
+}
+
+impl Manifest {
+    /// The exact bytes signed/verified for [`Manifest::commit_sig`]
+    /// ([`crate::verify::manifest_commit_message`]). `None` without a
+    /// `generation`.
+    pub fn commit_signing_message(&self) -> Option<Vec<u8>> {
+        self.generation.map(|generation| {
+            crate::verify::manifest_commit_message(
+                &self.name,
+                self.key_id.as_deref().unwrap_or(""),
+                generation,
+                self.parent.as_deref().unwrap_or(""),
+                self.created.as_deref().unwrap_or(""),
+                &self.canonical_catalog(),
+            )
+        })
+    }
+
+    /// The commit id: lowercase-hex sha256 of [`Self::commit_signing_message`].
+    pub fn commit_id(&self) -> Option<String> {
+        self.commit_signing_message()
+            .map(|message| crate::verify::sha256_hex(&message))
     }
 }
 
@@ -196,6 +243,11 @@ pub struct Asset {
     /// present it OVERRIDES the operator's `[command].exec`. Signed like `run`.
     #[serde(default)]
     pub exec: Option<String>,
+    /// Optional runtime the asset needs; when a verified signature covers it
+    /// (the asset's `lode.artifact.v3` or the catalog's) it REPLACES the
+    /// operator's `[runtime]` for this version.
+    #[serde(default)]
+    pub runtime: Option<RuntimeSpec>,
     /// Expected byte size (an extra guard, checked at download).
     #[serde(default)]
     pub size: Option<u64>,
@@ -206,6 +258,58 @@ pub struct Asset {
     /// install-time signature check has it.
     #[serde(skip)]
     pub delegation: Option<Delegation>,
+    /// Set by [`crate::install::verify_manifest_identity`] when the catalog
+    /// signature verified, so the install step knows the catalog covers
+    /// [`Self::runtime`].
+    #[serde(skip)]
+    pub catalog_signed: bool,
+}
+
+/// A runtime published with an asset (`runtime` in the manifest asset): the
+/// fields of `[runtime]`. A `download` must come with its `sha256`, which the
+/// signature covers; the URL itself is not signed.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RuntimeSpec {
+    /// Runtime binary name the app needs on `PATH`.
+    pub runtime: String,
+    /// Expected runtime version (substring of its self-reported version).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub version: Option<String>,
+    /// Argument(s) that make the runtime print its version.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub version_check: Option<String>,
+    /// URL the runtime is downloaded from when it is missing.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub download: Option<String>,
+    /// Lowercase-hex sha256 of the `download` body.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sha256: Option<String>,
+}
+
+impl RuntimeSpec {
+    /// The signed fields in order (`runtime`, `version`, `version_check`,
+    /// `sha256`), empty when absent.
+    #[must_use]
+    pub fn signed_fields(&self) -> [&str; 4] {
+        [
+            &self.runtime,
+            self.version.as_deref().unwrap_or(""),
+            self.version_check.as_deref().unwrap_or(""),
+            self.sha256.as_deref().unwrap_or(""),
+        ]
+    }
+
+    /// As a `[runtime]` table.
+    #[must_use]
+    pub fn to_config(&self) -> crate::config::Runtime {
+        crate::config::Runtime {
+            runtime: Some(self.runtime.clone()),
+            download: self.download.clone(),
+            version: self.version.clone(),
+            version_check: self.version_check.clone(),
+            sha256: self.sha256.clone(),
+        }
+    }
 }
 
 const fn default_true() -> bool {
@@ -672,6 +776,10 @@ fn map_release(app: &str, release: GhRelease, channel: &str, private: bool) -> R
         expires: None,
         expires_sig: None,
         delegation: None,
+        parent: None,
+        generation: None,
+        created: None,
+        commit_sig: None,
         channels,
         versions,
     })
@@ -714,6 +822,8 @@ fn gh_asset_to_asset(a: GhAsset, private: bool) -> Asset {
         size: a.size,
         auth: true,
         delegation: None,
+        runtime: None,
+        catalog_signed: false,
     }
 }
 
@@ -782,6 +892,7 @@ pub fn parse(bytes: &[u8]) -> Result<Manifest> {
             "manifest has an `expires_sig` but no `expires`".to_owned(),
         ));
     }
+    validate_commit(&manifest)?;
     // `alg` is advisory (each trusted key pins the algorithm actually used), so an
     // unknown name — a publisher typo, or an algorithm a newer lode added — is
     // reported, not fatal.
@@ -798,11 +909,47 @@ pub fn parse(bytes: &[u8]) -> Result<Manifest> {
             if let Some(exec) = asset.exec.as_deref() {
                 validate_command_override("exec", exec)?;
             }
+            if let Some(rt) = &asset.runtime {
+                validate_runtime_spec(rt)?;
+            }
         }
     }
     let mut manifest = manifest;
     propagate_delegation(&mut manifest);
     Ok(manifest)
+}
+
+/// Check the commit fields: `generation` 1 has no `parent`, a later one names
+/// its parent's id; `commit_sig` needs a `generation`.
+fn validate_commit(manifest: &Manifest) -> Result<()> {
+    let bad = |why: &str| Err(Error::Manifest(format!("manifest commit: {why}")));
+    let Some(generation) = manifest.generation else {
+        if manifest.commit_sig.is_some() || manifest.parent.is_some() {
+            return bad("`commit_sig` and `parent` need a `generation`");
+        }
+        return Ok(());
+    };
+    match (generation, manifest.parent.as_deref()) {
+        (0, _) => return bad("`generation` starts at 1"),
+        (1, Some(_)) => return bad("generation 1 has no `parent`"),
+        (2.., None) => return bad("a `generation` after 1 needs its `parent`"),
+        (_, Some(p))
+            if !(p.len() == 64
+                && p.chars()
+                    .all(|c| c.is_ascii_digit() || matches!(c, 'a'..='f'))) =>
+        {
+            return bad("`parent` is not a commit id (64 lowercase hex)");
+        }
+        _ => {}
+    }
+    if manifest
+        .created
+        .as_deref()
+        .is_some_and(|c| c.chars().any(char::is_control))
+    {
+        return bad("`created` has a control character");
+    }
+    Ok(())
 }
 
 /// Copy the manifest's delegation onto every asset.
@@ -846,6 +993,47 @@ pub fn validate_command_override(kind: &str, value: &str) -> Result<()> {
         )));
     }
     Ok(())
+}
+
+/// Validate an asset's `runtime`: a plain binary name, no control characters
+/// in the signed fields, an http(s) `download` with a lowercase-hex `sha256`.
+pub fn validate_runtime_spec(rt: &RuntimeSpec) -> Result<()> {
+    let bad = |why: String| Err(Error::Manifest(format!("asset runtime: {why}")));
+    let name = rt.runtime.as_str();
+    if name.is_empty()
+        || name.starts_with('.')
+        || !name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'))
+    {
+        return bad(format!("{name:?} is not a plain binary name"));
+    }
+    for (field, value) in [
+        ("version", rt.version.as_deref()),
+        ("version_check", rt.version_check.as_deref()),
+        ("download", rt.download.as_deref()),
+    ] {
+        if let Some(v) = value
+            && (v.trim().is_empty() || v.chars().any(char::is_control))
+        {
+            return bad(format!("{field} {v:?} is blank or has a control character"));
+        }
+    }
+    if let Some(sha) = rt.sha256.as_deref()
+        && !(sha.len() == 64
+            && sha
+                .chars()
+                .all(|c| c.is_ascii_digit() || matches!(c, 'a'..='f')))
+    {
+        return bad(format!("sha256 {sha:?} is not 64 lowercase hex characters"));
+    }
+    match rt.download.as_deref() {
+        Some(url) if !(url.starts_with("https://") || url.starts_with("http://")) => {
+            bad(format!("download {url:?} is not an http(s) URL"))
+        }
+        Some(_) if rt.sha256.is_none() => bad("a download needs its sha256".to_owned()),
+        _ => Ok(()),
+    }
 }
 
 /// Resolve a target spec to a concrete version id present in `manifest.versions`.
@@ -1014,6 +1202,114 @@ mod tests {
         json["expires_sig"] = serde_json::json!("c2ln");
         let err = parse(&serde_json::to_vec(&json).unwrap()).unwrap_err();
         assert!(err.to_string().contains("expires_sig"), "got: {err}");
+    }
+
+    fn with_runtime(runtime: serde_json::Value) -> Result<Manifest> {
+        let mut json: serde_json::Value =
+            serde_json::from_slice(include_bytes!("../../../docs/manifest.example.json")).unwrap();
+        json["versions"]["1.5.0"]["assets"][0]["runtime"] = runtime;
+        parse(&serde_json::to_vec(&json).unwrap())
+    }
+
+    #[test]
+    fn an_asset_runtime_extends_its_catalog_line() {
+        let plain = example();
+        let sha = "a".repeat(64);
+        let m = with_runtime(serde_json::json!({
+            "runtime": "node", "version": "v22.", "download": "https://x/node.tar.gz",
+            "sha256": sha,
+        }))
+        .unwrap();
+        let asset = &m.versions["1.5.0"].assets[0];
+        assert_eq!(asset.runtime.as_ref().unwrap().runtime, "node");
+        let catalog = m.canonical_catalog();
+        assert!(
+            catalog.contains(&format!("\tnode\tv22.\t\t{sha}\n")),
+            "{catalog}"
+        );
+        assert!(!catalog.contains("https://x/node"), "the URL is not signed");
+        assert_ne!(m.signing_message(), plain.signing_message());
+        // Assets without a runtime keep their line, so old signatures still verify.
+        assert_eq!(
+            catalog.lines().filter(|l| l.contains("\tnode\t")).count(),
+            1
+        );
+    }
+
+    #[test]
+    fn rejects_a_malformed_asset_runtime() {
+        let sha = "a".repeat(64);
+        for (runtime, why) in [
+            (serde_json::json!({ "runtime": "" }), "runtime"),
+            (serde_json::json!({ "runtime": "../bin/sh" }), "runtime"),
+            (serde_json::json!({ "runtime": ".node" }), "runtime"),
+            (
+                serde_json::json!({ "runtime": "node", "download": "https://x/n" }),
+                "sha256",
+            ),
+            (
+                serde_json::json!({ "runtime": "node", "download": "file:///n", "sha256": sha }),
+                "download",
+            ),
+            (
+                serde_json::json!({ "runtime": "node", "sha256": "ABC" }),
+                "sha256",
+            ),
+            (
+                serde_json::json!({ "runtime": "node", "version": "1\n2" }),
+                "version",
+            ),
+        ] {
+            let err = with_runtime(runtime.clone()).unwrap_err().to_string();
+            assert!(err.contains(why), "{runtime}: {err}");
+        }
+        with_runtime(serde_json::json!({ "runtime": "bun", "sha256": sha })).unwrap();
+    }
+
+    #[test]
+    fn checks_the_commit_fields() {
+        let base: serde_json::Value =
+            serde_json::from_slice(include_bytes!("../../../docs/manifest.example.json")).unwrap();
+        let with = |fields: serde_json::Value| {
+            let mut json = base.clone();
+            for (k, v) in fields.as_object().unwrap() {
+                json[k] = v.clone();
+            }
+            parse(&serde_json::to_vec(&json).unwrap())
+        };
+        let parent = "a".repeat(64);
+        with(serde_json::json!({ "generation": 1 })).unwrap();
+        let m = with(serde_json::json!({ "generation": 2, "parent": parent, "created": "2026-10-24T00:00:00Z" }))
+            .unwrap();
+        let message = m.commit_signing_message().unwrap();
+        assert!(message.starts_with(b"lode.manifest-commit.v1\nmyapp\n"));
+        assert!(
+            String::from_utf8(message)
+                .unwrap()
+                .contains(&format!("\n2\n{parent}\n2026-10-24T00:00:00Z\nchannel\t"))
+        );
+        assert_eq!(m.commit_id().unwrap().len(), 64);
+        // Commits leave the catalog signature's bytes alone.
+        assert_eq!(m.signing_message(), example().signing_message());
+        for (fields, why) in [
+            (serde_json::json!({ "generation": 0 }), "starts at 1"),
+            (
+                serde_json::json!({ "generation": 1, "parent": parent }),
+                "no `parent`",
+            ),
+            (serde_json::json!({ "generation": 2 }), "needs its `parent`"),
+            (
+                serde_json::json!({ "generation": 2, "parent": "HEAD" }),
+                "commit id",
+            ),
+            (
+                serde_json::json!({ "commit_sig": "c2ln" }),
+                "need a `generation`",
+            ),
+        ] {
+            let err = with(fields).unwrap_err().to_string();
+            assert!(err.contains(why), "{err}");
+        }
     }
 
     #[test]

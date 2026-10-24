@@ -280,12 +280,10 @@ client-side by the downgrade floor, and a `pin` removes trust in the pointer
 entirely.
 
 Add `--expires-in 30d` to `manifest-sign` to stamp a signed expiry. lode refuses
-the manifest once it passes, so a source serving an old copy cannot keep hosts on
-an old version; operators make it mandatory with
-`[trust].require_manifest = "fresh"`. Re-run `manifest-sign` on a schedule shorter
-than the expiry (a CI cron job), or hosts stop taking updates when it lapses. A
-lode older than this feature ignores the expiry and keeps verifying the same
-manifest.
+the manifest once it passes, so re-run `manifest-sign` on a schedule shorter than
+the expiry (a CI cron job), or hosts stop taking updates when it lapses. An expiry
+is optional; `[trust].require_manifest = "signed"` requires the signature only
+(`"fresh"`, which also required an expiry, is now a deprecated alias of it).
 
 ### lode-server registry (`lode-cli publish`)
 
@@ -309,6 +307,7 @@ LODE_REGISTRY_TOKEN=pat_... lode-cli publish \
 | `--notes <text>` | Release notes, stored when the draft is created. |
 | `--key <file>` / `--key-env <VAR>` | ed25519 signing key, as `lode-cli sign` takes it. Without one the assets go up unsigned. |
 | `--run <cmd>` / `--exec <cmd>` | Launch overrides published with every asset and bound into each signature. |
+| `--asset-runtime <name>` (+ `--asset-runtime-version`, `-version-check`, `-download`, `-sha256`) | The runtime published with every asset ([A release's runtime](#a-releases-runtime)). |
 | `--allow-insecure` | Permit a plain-`http` registry that is not on loopback. |
 | `<file>...` | The assets. Each is stored under its file name, which is what `[update].asset` selects. |
 
@@ -325,9 +324,65 @@ LODE_REGISTRY_TOKEN=pat_... lode-cli publish \
 Operators then point lode at the package's read URL:
 `manifest = "https://lode.bk.io/r/<namespace>/<slug>/manifest.json"`.
 
+#### Manifest commits
+
+With a key, `publish` signs the manifest too. It reads the registry's current manifest,
+adds the version on its channel, signs the result and uploads it as a **commit**: a
+manifest with `parent`, `generation`, `created` and `commit_sig`. `commit_sig` signs
+`lode.manifest-commit.v1\n{name}\n{key_id}\n{generation}\n{parent}\n{created}\n{catalog}`
+and the sha256 of that message is the commit id; `sig` stays the ordinary catalog
+signature, so an older lode still verifies the manifest. The registry takes a commit only
+on top of its head; when another release got there first, `publish` builds again on the
+new head (up to five times). Once a package has a commit, every change is one:
+
+```bash
+LODE_REGISTRY_TOKEN=pat_... lode-cli channel --package <ns>/<slug> --channel stable --version 1.4.1 --key-env LODE_SIGNING_KEY
+LODE_REGISTRY_TOKEN=pat_... lode-cli yank    --package <ns>/<slug> --version 1.5.0 --key-env LODE_SIGNING_KEY
+```
+
+`channel` points a channel at a version in the manifest. `yank` drops a version from the
+manifest (no channel may point at it); its assets stay downloadable for hosts that run it.
+Both take `--registry`, `--key`/`--key-env` and `--allow-insecure` like `publish`.
+A commit carries no `expires`; hosts that want it signed set `require_manifest =
+"signed"`. To sign with a new key, commit without a change:
+`lode-cli channel` onto the version the channel already points at.
+
+With trusted keys configured, lode keeps the newest commit it accepted per manifest
+`name` in `commits.json` in its data directory and refuses a manifest with a lower
+`generation`, the same generation with another id, or no signed commit at all. A server
+cannot roll hosts back by serving an older manifest; a bad release is fixed by a new
+commit that moves the channel or publishes a fixed version. Deleting `commits.json`
+resets the floor (for example after moving to another registry).
+
+### A release's runtime
+
+A release can name the runtime it needs. `lode-cli sign`, `verify`, `manifest` and
+`publish` take `--asset-runtime <name>` with the optional
+`--asset-runtime-version`, `--asset-runtime-version-check`,
+`--asset-runtime-download` and `--asset-runtime-sha256`. The asset then carries a
+`runtime` object with the fields of `[runtime]`. It replaces the operator's
+`[runtime]` for that version: a hot update starts the new version under its runtime,
+and a rollback goes back to the old version's runtime.
+
+```bash
+lode-cli manifest "$f" --app myapp --version 1.6.0 --url "$URL" \
+    --asset-runtime bun --asset-runtime-version 1.3.14 \
+    --asset-runtime-download https://example.com/bun-1.3.14.zip \
+    --asset-runtime-sha256 "$(sha256sum bun-1.3.14.zip | cut -d' ' -f1)" \
+    --key private.key --into manifest.json
+```
+
+- The signature covers `runtime`, `version`, `version_check` and `sha256`, but not
+  the download URL. That is why a `download` must come with its `sha256`.
+- lode uses the runtime only when a verified signature covers it: the asset's own
+  signature, or the catalog signature. Without either, it warns and keeps
+  `[runtime]`.
+- A lode older than this feature cannot verify an asset signed with a runtime.
+  Upgrade lode on your hosts before you publish one.
+
 ### Signing model (all sources)
 
-- The artifact signature binds **`name` (filename) / `version` / `sha256` / `run` / `exec`**. `format` is derived from the filename extension (`.tar.gz`/`.tgz` → tar.gz, `.gz` → gz, `.zip` → zip, else raw). `run`/`exec` are bound into the signature when present (empty string otherwise) — a tampered catalog cannot inject malicious launch commands under `require_signature = auto` (with keys) or `enforce`.
+- The artifact signature binds **`name` (filename) / `version` / `sha256` / `run` / `exec`**, plus the asset's `runtime` when it has one. `format` is derived from the filename extension (`.tar.gz`/`.tgz` → tar.gz, `.gz` → gz, `.zip` → zip, else raw). `run`/`exec` are bound into the signature when present (empty string otherwise) — a tampered catalog cannot inject malicious launch commands under `require_signature = auto` (with keys) or `enforce`.
 - Under `require_signature = enforce`, every installed asset must carry a valid
   signature (github: a `<asset>.sig` sidecar asset or the `label`; native: the `sig`
   field or a `.sig` sidecar).

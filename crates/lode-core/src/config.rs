@@ -90,7 +90,8 @@ pub enum RequireManifest {
     Off,
     /// The manifest must carry a valid top-level signature.
     Signed,
-    /// As `signed`, and the manifest must carry a signed expiry that has not passed.
+    /// Deprecated: the same as `signed`. It used to require a signed expiry as
+    /// well; an expiry is still verified when the manifest carries one.
     Fresh,
 }
 
@@ -1280,6 +1281,12 @@ fn validate(cfg: &Config) -> Result<()> {
         ));
     }
     validate_report(&cfg.report, cfg.http.allow_insecure)?;
+    if cfg.trust.require_manifest == RequireManifest::Fresh {
+        tracing::warn!(
+            "trust.require_manifest = \"fresh\" is deprecated and now means \"signed\": \
+             an expiry is verified when present, no longer required"
+        );
+    }
     if cfg.supervise.restart_backoff_max < cfg.supervise.restart_backoff {
         return Err(Error::Config(format!(
             "supervise.restart_backoff_max ({}) must be >= restart_backoff ({})",

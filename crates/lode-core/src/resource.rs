@@ -66,7 +66,7 @@ pub fn current(cfg: &Config, name: &str) -> Option<String> {
 /// asset publishes a launch command, and its signature and expiry hold.
 pub fn fetch(cfg: &Config, res: &Resource) -> Result<Manifest> {
     let scoped = scoped(cfg, res);
-    let m = manifest::fetch(&scoped)?;
+    let mut m = manifest::fetch(&scoped)?;
     if m.name != scoped.global.app {
         return Err(Error::Manifest(format!(
             "resource manifest is for {:?}, not {:?}",
@@ -84,7 +84,7 @@ pub fn fetch(cfg: &Config, res: &Resource) -> Result<Manifest> {
             asset.name
         )));
     }
-    install::verify_manifest_identity(&scoped, &m)?;
+    install::verify_manifest_identity(&scoped, &mut m)?;
     Ok(m)
 }
 
@@ -200,6 +200,7 @@ mod tests {
                 path: "",
                 run: None,
                 exec: None,
+                runtime: None,
             },
             &sha,
         );

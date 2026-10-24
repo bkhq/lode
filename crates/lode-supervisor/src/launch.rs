@@ -7,7 +7,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use lode_core::config::Config;
-use lode_core::engine::{ensure_runtime, resolve_target};
+use lode_core::engine::{ensure_target_runtime, resolve_target};
 use lode_core::{Error, Result};
 
 /// CLI passthrough (`lode <args>`): `exec`-replace into `[command].exec` + `args`.
@@ -22,7 +22,7 @@ use lode_core::{Error, Result};
 /// version cannot be resolved/prepared or the `exec` itself fails.
 pub fn exec_passthrough(cfg: &Config, args: &[String]) -> Result<Infallible> {
     let target = resolve_target(cfg)?;
-    let runtime_dir = ensure_runtime(cfg)?;
+    let runtime_dir = ensure_target_runtime(cfg, &target)?;
     let instance = format!("{}-exec", std::process::id());
 
     let dir = target.dir.to_string_lossy();

@@ -25,7 +25,7 @@ signs the asset and the manifest, and serves them on loopback. As the installed
 
 | Step | API |
 |---|---|
-| Describe the update: source, asset, trusted key, manifest policy | `SelfUpdate::new(..).asset(..).trusted_keys(..).require_manifest(RequireManifest::Fresh).exe(..)` |
+| Describe the update: source, asset, trusted key, manifest policy | `SelfUpdate::new(..).asset(..).trusted_keys(..).require_manifest(RequireManifest::Signed).exe(..)` |
 | Look for a release and show its notes | `check()` → `Available { version, entry }` |
 | Download, verify and unpack it | `fetch()` → `Fetched` |
 | Take a file that ships beside the executable | `fetched.dir()` |

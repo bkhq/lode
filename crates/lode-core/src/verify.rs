@@ -213,6 +213,8 @@ pub struct Artifact<'a> {
     pub run: Option<&'a str>,
     /// Manifest-published passthrough launch override (signed; empty when absent).
     pub exec: Option<&'a str>,
+    /// Manifest-published runtime; when present the message is `lode.artifact.v3`.
+    pub runtime: Option<&'a crate::manifest::RuntimeSpec>,
 }
 
 /// Lowercase hex encoding.
@@ -246,17 +248,32 @@ pub fn key_id(public: &[u8]) -> String {
 /// runtime concern (§1/§3). `run`/`exec` may not contain control characters
 /// (rejected at manifest parse), so the field framing is unambiguous. The same
 /// bytes are signed under every [`Algorithm`].
+///
+/// An asset that publishes a runtime is signed over `lode.artifact.v3`: the v2
+/// fields followed by the runtime's `runtime`, `version`, `version_check` and
+/// `sha256` (the download URL is not signed; the digest pins the bytes). An
+/// asset without one keeps v2, byte for byte.
 pub fn artifact_message(a: &Artifact<'_>, sha256_hex: &str) -> Vec<u8> {
-    format!(
-        "lode.artifact.v2\n{}\n{}\n{}\n{}\n{}\n{}",
+    let fields = format!(
+        "{}\n{}\n{}\n{}\n{}\n{}",
         a.app,
         a.name,
         a.version,
         sha256_hex,
         a.run.unwrap_or(""),
         a.exec.unwrap_or("")
-    )
-    .into_bytes()
+    );
+    a.runtime
+        .map_or_else(
+            || format!("lode.artifact.v2\n{fields}"),
+            |rt| {
+                format!(
+                    "lode.artifact.v3\n{fields}\n{}",
+                    rt.signed_fields().join("\n")
+                )
+            },
+        )
+        .into_bytes()
 }
 
 /// Stream a file through sha256 and return the lowercase hex digest.
@@ -315,6 +332,7 @@ pub fn verify_artifact_sig(
     sha256_hex: &str,
     run: Option<&str>,
     exec: Option<&str>,
+    runtime: Option<&crate::manifest::RuntimeSpec>,
     sig_b64: &str,
     trusted_keys: &[String],
 ) -> Result<()> {
@@ -328,6 +346,7 @@ pub fn verify_artifact_sig(
         path: "",
         run,
         exec,
+        runtime,
     };
     let message = artifact_message(&artifact, sha256_hex);
     for key in trusted_keys {
@@ -366,6 +385,27 @@ pub fn manifest_message(name: &str, key_id: &str, canonical: &str) -> Vec<u8> {
 /// a loader predating expiry still verifies the unchanged `sig` of the same file.
 pub fn manifest_expiry_message(name: &str, key_id: &str, expires: u64, canonical: &str) -> Vec<u8> {
     format!("lode.manifest-expiry.v1\n{name}\n{key_id}\n{expires}\n{canonical}").into_bytes()
+}
+
+/// The exact bytes signed/verified for a manifest's `commit_sig`.
+///
+/// `lode.manifest-commit.v1\n{name}\n{key_id}\n{generation}\n{parent}\n{created}\n{canonical}`
+/// (`parent` empty for the first commit). Its sha256 is the commit id.
+///
+/// A separate signature, like [`manifest_expiry_message`], so a loader
+/// predating commits still verifies the unchanged `sig`.
+pub fn manifest_commit_message(
+    name: &str,
+    key_id: &str,
+    generation: u64,
+    parent: &str,
+    created: &str,
+    canonical: &str,
+) -> Vec<u8> {
+    format!(
+        "lode.manifest-commit.v1\n{name}\n{key_id}\n{generation}\n{parent}\n{created}\n{canonical}"
+    )
+    .into_bytes()
 }
 
 /// Verify a manifest's top-level signature over its canonical message against a
@@ -697,6 +737,7 @@ mod tests {
             path: "",
             run: None,
             exec: None,
+            runtime: None,
         };
         let msg = artifact_message(&artifact, "abc123");
         let sig_b64 = B64.encode(signing.sign(&msg).to_bytes());
@@ -727,6 +768,7 @@ mod tests {
             path: "",
             run: None,
             exec: None,
+            runtime: None,
         };
         // Absent overrides serialize as empty fields (stable framing).
         assert_eq!(
@@ -757,6 +799,31 @@ mod tests {
     }
 
     #[test]
+    fn artifact_message_appends_the_runtime_under_v3() {
+        let rt = crate::manifest::RuntimeSpec {
+            runtime: "node".to_owned(),
+            version: Some("v22.".to_owned()),
+            version_check: None,
+            download: Some("https://x/node.tar.gz".to_owned()),
+            sha256: Some("ff".to_owned()),
+        };
+        let a = Artifact {
+            app: "myapp",
+            name: "app.tar.gz",
+            version: "1.0.0",
+            path: "",
+            run: Some("./app"),
+            exec: None,
+            runtime: Some(&rt),
+        };
+        // The download URL is not signed; its sha256 is.
+        assert_eq!(
+            artifact_message(&a, "abc"),
+            b"lode.artifact.v3\nmyapp\napp.tar.gz\n1.0.0\nabc\n./app\n\nnode\nv22.\n\nff".to_vec()
+        );
+    }
+
+    #[test]
     fn key_id_is_stable_16_hex() {
         let id = key_id(&[7u8; 32]);
         assert_eq!(id.len(), 16);
@@ -773,6 +840,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::too_many_lines)]
     fn verify_artifact_sig_happy_and_tampered() {
         let mut seed = [0u8; 32];
         getrandom::fill(&mut seed).unwrap();
@@ -790,12 +858,13 @@ mod tests {
             path: "",
             run: None,
             exec: None,
+            runtime: None,
         };
         let sig = B64.encode(signing.sign(&artifact_message(&artifact, sha)).to_bytes());
 
         // Fixed identity (name + version, no overrides); vary digest + key set.
         let check = |sha: &str, keys: &[String]| {
-            verify_artifact_sig("myapp", name, "1.5.0", sha, None, None, &sig, keys)
+            verify_artifact_sig("myapp", name, "1.5.0", sha, None, None, None, &sig, keys)
         };
 
         // CLI/TOML form `key_id:base64` and bare base64 both validate.
@@ -821,6 +890,7 @@ mod tests {
                 sha,
                 None,
                 None,
+                None,
                 &sig,
                 &keys_colon
             )
@@ -835,6 +905,7 @@ mod tests {
                 sha,
                 None,
                 None,
+                None,
                 &sig,
                 &keys_colon
             )
@@ -842,8 +913,18 @@ mod tests {
         );
         // …and under a different version.
         assert!(
-            verify_artifact_sig("myapp", name, "9.9.9", sha, None, None, &sig, &keys_colon)
-                .is_err()
+            verify_artifact_sig(
+                "myapp",
+                name,
+                "9.9.9",
+                sha,
+                None,
+                None,
+                None,
+                &sig,
+                &keys_colon
+            )
+            .is_err()
         );
         // …and with an injected run/exec override the signer never saw.
         assert!(
@@ -854,6 +935,7 @@ mod tests {
                 sha,
                 Some("./evil"),
                 None,
+                None,
                 &sig,
                 &keys_colon
             )
@@ -867,6 +949,7 @@ mod tests {
                 sha,
                 None,
                 Some("./evil"),
+                None,
                 &sig,
                 &keys_colon
             )
@@ -920,6 +1003,7 @@ mod tests {
             path: "",
             run: Some("./myapp serve"),
             exec: None,
+            runtime: None,
         };
         let message = artifact_message(&artifact, sha);
 
@@ -933,7 +1017,7 @@ mod tests {
         for (sig, entry) in [(&p256_sig, &p256_entry), (&p384_sig, &p384_entry)] {
             let keys = vec![entry.clone()];
             let check = |sha: &str, run: Option<&str>| {
-                verify_artifact_sig("myapp", name, "1.5.0", sha, run, None, sig, &keys)
+                verify_artifact_sig("myapp", name, "1.5.0", sha, run, None, None, sig, &keys)
             };
             assert!(check(sha, Some("./myapp serve")).is_ok());
             // The same bindings as ed25519: digest and launch override are covered.
@@ -949,6 +1033,7 @@ mod tests {
                 "1.5.0",
                 sha,
                 Some("./myapp serve"),
+                None,
                 None,
                 &p384_sig,
                 std::slice::from_ref(&p256_entry)
@@ -968,6 +1053,7 @@ mod tests {
                 "1.5.0",
                 sha,
                 Some("./myapp serve"),
+                None,
                 None,
                 &p256_sig,
                 &[ed, p384_entry, p256_entry]

@@ -38,6 +38,11 @@ lode.artifact.v2
 | `run` | manifest-published bare-run launch override (empty string when absent) | the asset's `run` field, or `""` |
 | `exec` | manifest-published passthrough launch override (empty string when absent) | the asset's `exec` field, or `""` |
 
+An asset with a `runtime` is signed over `lode.artifact.v3` instead: the v2 fields,
+then `{runtime}`, `{runtime_version}`, `{runtime_version_check}` and
+`{runtime_sha256}` (empty when absent). The runtime's download URL is not signed;
+its `sha256` is. An asset without a runtime keeps v2, so its signature is unchanged.
+
 `name` is the **asset filename, not the application name**; `app` is the
 application. Together they bind *which* artifact of *which* app a signature
 authorises, so one artifact's signature cannot be replayed under another asset
@@ -99,9 +104,9 @@ is an *optional* tamper-evidence layer, **never required** and **not** gated by
 - **absent** → accepted under every policy, including `enforce`.
 
 An operator can opt in to requiring it: `[trust].require_manifest = "signed"` rejects
-a manifest without a valid `sig`, and `"fresh"` also requires a signed, unexpired
-`expires` (`lode-cli manifest-sign --expires-in`), which stops a source from holding
-a host on an old catalog. See [architecture §6](architecture.md).
+a manifest without a valid `sig` (`"fresh"` is a deprecated alias). An `expires`
+(`lode-cli manifest-sign --expires-in`) is verified when present. See
+[architecture §6](architecture.md).
 
 What enforces trust is therefore *not* the catalog signature but two source-agnostic
 layers that always apply: the **per-artifact** signature (§1), which `require_signature`
@@ -120,8 +125,13 @@ lode.manifest.v1
 ```
 
 `canonical` lists, in sorted order, each `channel\t{name}\t{latest}` and per
-version each `asset\t{name}\t{sha256}`. GitHub has no catalog signature — its
+version each `asset\t{name}\t{sha256}` (followed by the asset's runtime fields when
+it has one). GitHub has no catalog signature — its
 freshness comes from tag authority (§5).
+
+A catalog may also be a **commit** (`generation`, `parent`, `created`, `commit_sig`):
+lode then refuses an older generation of it than one it already accepted. See
+[architecture §6](architecture.md) (Manifest commits).
 
 ### 2a. Client-side downgrade floor (`latest` rollback protection)
 
@@ -298,6 +308,7 @@ Schema `lode/v1`; per-version `assets[]` keyed by `name`:
 | `alg` | | advisory: the signing key's algorithm (`ed25519` when absent); verification always uses the trusted key's own algorithm |
 | `run` | | optional literal launch command override (signature-bound; overrides `[command].run`; see §4) |
 | `exec` | | optional CLI-passthrough command override (signature-bound; overrides `[command].exec`; see §4) |
+| `runtime` | | optional `{runtime, version, version_check, download, sha256}`: replaces `[runtime]` for this version once a verified signature covers it (§1); a `download` needs its `sha256` |
 | `size` | | expected byte count (extra integrity check) |
 | `auth` | | default `true`; `false` = don't attach `[http].headers` to this URL |
 

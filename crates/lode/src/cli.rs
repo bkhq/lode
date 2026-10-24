@@ -65,7 +65,7 @@ pub(crate) enum RequireManifestArg {
     Off,
     /// The manifest must carry a valid top-level signature.
     Signed,
-    /// As `signed`, and the manifest must carry a signed expiry that has not passed.
+    /// Deprecated: the same as `signed`.
     Fresh,
 }
 
@@ -481,6 +481,8 @@ pub(crate) enum ToolCommand {
         /// signature; the loader uses it instead of `[command].exec`).
         #[arg(long)]
         exec: Option<String>,
+        #[command(flatten)]
+        asset_runtime: AssetRuntimeArgs,
         /// Path to the private key file (from `keygen`: base64 seed, or
         /// `<alg>:<base64>` for an ECDSA key).
         #[arg(long)]
@@ -503,6 +505,8 @@ pub(crate) enum ToolCommand {
         /// The asset's published `exec` override, if any (part of the signed message).
         #[arg(long)]
         exec: Option<String>,
+        #[command(flatten)]
+        asset_runtime: AssetRuntimeArgs,
         /// Public key: base64 (ed25519), or `<alg>:<base64>` as printed by `keygen`.
         // base64url values may start with `-`.
         #[arg(long, allow_hyphen_values = true)]
@@ -533,6 +537,8 @@ pub(crate) enum ToolCommand {
         /// overrides the operator's `[command].exec`).
         #[arg(long)]
         exec: Option<String>,
+        #[command(flatten)]
+        asset_runtime: AssetRuntimeArgs,
         /// Expected byte size (optional integrity guard).
         #[arg(long)]
         size: Option<u64>,
@@ -554,6 +560,13 @@ pub(crate) enum ToolCommand {
     /// upload every asset and publish it to a channel. The token is read from
     /// `LODE_REGISTRY_TOKEN`. Re-running after a failure continues the draft.
     Publish(PublishArgs),
+    /// Drop a version from a lode-server package's manifest, as a signed
+    /// commit. Its assets stay downloadable; a channel must not point at it.
+    Yank(YankArgs),
+    /// Point a channel of a lode-server package at a version, as a signed
+    /// commit. A bad release is fixed this way, by moving the channel forward
+    /// or back to a good version.
+    Channel(ChannelArgs),
     /// Sign a complete `lode/v1` manifest in place (set its top-level `key_id` + `sig`).
     ManifestSign(ManifestSignArgs),
     /// Delegate signing for `--app` to a sub-key: sign, with the root key, a
@@ -569,6 +582,63 @@ pub(crate) enum ToolCommand {
         /// Destination path; prints to stdout if omitted.
         path: Option<String>,
     },
+}
+
+/// The runtime an asset is published with (`lode-cli sign` / `verify` /
+/// `manifest` / `publish`): signed into the asset, it replaces the loader's
+/// `[runtime]` for that version.
+#[derive(Debug, Default, Args)]
+pub(crate) struct AssetRuntimeArgs {
+    /// Runtime binary the asset needs on `PATH` (signed).
+    #[arg(id = "asset_runtime", long = "asset-runtime")]
+    pub(crate) runtime: Option<String>,
+    /// Expected runtime version, a substring of its self-reported one (signed).
+    #[arg(
+        id = "asset_runtime_version",
+        long = "asset-runtime-version",
+        requires = "asset_runtime"
+    )]
+    pub(crate) version: Option<String>,
+    /// Arg(s) that print the runtime version (signed).
+    #[arg(
+        id = "asset_runtime_version_check",
+        long = "asset-runtime-version-check",
+        requires = "asset_runtime"
+    )]
+    pub(crate) version_check: Option<String>,
+    /// URL the runtime is downloaded from when missing (not signed; needs
+    /// `--asset-runtime-sha256`).
+    #[arg(
+        id = "asset_runtime_download",
+        long = "asset-runtime-download",
+        requires = "asset_runtime"
+    )]
+    pub(crate) download: Option<String>,
+    /// Lowercase-hex sha256 of the runtime download (signed).
+    #[arg(
+        id = "asset_runtime_sha256",
+        long = "asset-runtime-sha256",
+        requires = "asset_runtime"
+    )]
+    pub(crate) sha256: Option<String>,
+}
+
+impl AssetRuntimeArgs {
+    /// The validated runtime, or `None` without `--asset-runtime`.
+    pub(crate) fn spec(&self) -> anyhow::Result<Option<lode_core::manifest::RuntimeSpec>> {
+        let Some(runtime) = &self.runtime else {
+            return Ok(None);
+        };
+        let spec = lode_core::manifest::RuntimeSpec {
+            runtime: runtime.clone(),
+            version: self.version.clone(),
+            version_check: self.version_check.clone(),
+            download: self.download.clone(),
+            sha256: self.sha256.clone(),
+        };
+        lode_core::manifest::validate_runtime_spec(&spec).map_err(|e| anyhow::anyhow!("{e}"))?;
+        Ok(Some(spec))
+    }
 }
 
 /// Arguments of `lode-cli publish`.
@@ -601,12 +671,57 @@ pub(crate) struct PublishArgs {
     /// Passthrough-command override published with every asset (signed).
     #[arg(long)]
     pub(crate) exec: Option<String>,
+    #[command(flatten)]
+    pub(crate) asset_runtime: AssetRuntimeArgs,
     /// Permit a plain-`http` registry that is not on loopback.
     #[arg(long = "allow-insecure")]
     pub(crate) allow_insecure: bool,
     /// The asset files; each is stored under its file name.
     #[arg(required = true)]
     pub(crate) files: Vec<String>,
+}
+
+/// The package and signing key of a `lode-cli yank` / `channel` commit.
+#[derive(Debug, Args)]
+pub(crate) struct CommitTarget {
+    /// Base URL of the registry, including a base path if it has one.
+    #[arg(long, default_value = crate::publish::DEFAULT_REGISTRY)]
+    pub(crate) registry: String,
+    /// The package, as `<namespace>/<slug>`.
+    #[arg(long)]
+    pub(crate) package: String,
+    /// Path to an ed25519 private key file (from `keygen`); signs the commit.
+    #[arg(long)]
+    pub(crate) key: Option<String>,
+    /// Read the ed25519 private key from this env var instead of a file.
+    #[arg(long = "key-env")]
+    pub(crate) key_env: Option<String>,
+    /// Permit a plain-`http` registry that is not on loopback.
+    #[arg(long = "allow-insecure")]
+    pub(crate) allow_insecure: bool,
+}
+
+/// Arguments of `lode-cli yank`.
+#[derive(Debug, Args)]
+pub(crate) struct YankArgs {
+    #[command(flatten)]
+    pub(crate) target: CommitTarget,
+    /// The version to drop.
+    #[arg(long = "version")]
+    pub(crate) version: String,
+}
+
+/// Arguments of `lode-cli channel`.
+#[derive(Debug, Args)]
+pub(crate) struct ChannelArgs {
+    #[command(flatten)]
+    pub(crate) target: CommitTarget,
+    /// The channel to move.
+    #[arg(long)]
+    pub(crate) channel: String,
+    /// The version it points at.
+    #[arg(long = "version")]
+    pub(crate) version: String,
 }
 
 /// `lode-cli manifest-sign` arguments.

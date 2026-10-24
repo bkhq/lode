@@ -6,6 +6,7 @@
 import { chmodSync, copyFileSync, existsSync, mkdirSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import { dirname, join, normalize, sep } from "node:path";
 
+import type { AssetRuntime } from "./sign.ts";
 import { LODE_CLI_BIN, mkTmp, rmTmp } from "./util.ts";
 
 // One per-version asset, keyed by its filename (`name`) — the source-agnostic
@@ -19,6 +20,7 @@ interface Asset {
   key_id?: string;
   run?: string;
   exec?: string;
+  runtime?: AssetRuntime;
   size?: number;
 }
 
@@ -42,6 +44,8 @@ export interface PublishOpts {
   run?: string;
   /** Manifest-published launch override for `lode <args>` passthrough (signed). */
   exec?: string;
+  /** The asset's runtime (signed). */
+  runtime?: AssetRuntime;
   /** Point channels.stable.latest at this version (default true). */
   latest?: boolean;
 }
@@ -120,6 +124,7 @@ export class ManifestServer {
     if (opts.keyId) asset.key_id = opts.keyId;
     if (opts.run) asset.run = opts.run;
     if (opts.exec) asset.exec = opts.exec;
+    if (opts.runtime) asset.runtime = opts.runtime;
 
     this.#manifest.versions[version] = {
       // min_lode must be satisfied by the loader under test (0.0.1).

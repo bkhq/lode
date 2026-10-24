@@ -6,7 +6,7 @@ use std::time::{Duration, Instant, SystemTime};
 
 use lode_core::config::{Config, Notify, Policy, Readiness, Resource, RestartPolicy};
 use lode_core::engine::{
-    Target, ensure_runtime, locate, required_asset, resolve_target, version_installed,
+    Target, ensure_target_runtime, locate, required_asset, resolve_target, version_installed,
 };
 use lode_core::report::Reporter;
 use lode_core::state::{self, HistoryEntry, HistoryResult, State, Status};
@@ -179,7 +179,7 @@ pub fn serve_core(
         if let Some(code) = bootstrap_terminated(signals, &cfg) {
             return Ok(code);
         }
-        let runtime_dir = ensure_runtime(&cfg)?;
+        let runtime_dir = ensure_target_runtime(&cfg, &target)?;
         ensure_resources(&cfg)?;
         if let Some(code) = bootstrap_terminated(signals, &cfg) {
             return Ok(code);
@@ -782,7 +782,7 @@ fn push_history(history: &mut Vec<HistoryEntry>, version: &str, result: HistoryR
 /// Current wall-clock time as an RFC 3339 UTC timestamp (`YYYY-MM-DDThh:mm:ssZ`),
 /// used for `state.last_check` and `history[].at`. Falls back to the epoch if the
 /// clock is before `UNIX_EPOCH` (never panics).
-fn now_timestamp() -> String {
+pub fn now_timestamp() -> String {
     let secs = SystemTime::now()
         .duration_since(SystemTime::UNIX_EPOCH)
         .map_or(0, |d| d.as_secs());
@@ -868,7 +868,9 @@ struct Observe {
 pub struct Supervisor<'c> {
     cfg: &'c Config,
     target: Target,
-    runtime_dir: Option<PathBuf>,
+    /// The runtime dir prepended to the child's PATH, and the version it was
+    /// resolved for: a spawn of another version resolves that version's own.
+    runtime: (String, Option<PathBuf>),
     forward: Vec<Signal>,
     restart: Option<Signal>,
     /// The live child, or `None` while backing off before a restart.
@@ -949,8 +951,8 @@ impl<'c> Supervisor<'c> {
             forward: forward_signals(&cfg.signals.forward),
             restart: cfg.signals.restart.as_deref().and_then(parse_signal),
             cfg,
+            runtime: (target.version.clone(), runtime_dir),
             target,
-            runtime_dir,
             child: None,
             spawn_at: Instant::now(),
             restart_count: 0,
@@ -1110,13 +1112,19 @@ impl<'c> Supervisor<'c> {
             "run",
         )?;
         let argv = build_run_argv(&run, &dir)?;
+        if self.runtime.0 != self.target.version {
+            self.runtime = (
+                self.target.version.clone(),
+                ensure_target_runtime(self.cfg, &self.target)?,
+            );
+        }
         let mut env = child_env(
             std::env::vars(),
             &self.cfg.env,
             &self.target.version,
             &self.cfg.global.dir,
             &instance,
-            self.runtime_dir.as_deref(),
+            self.runtime.1.as_deref(),
         );
         // Tell the app which readiness contract is in force so it knows whether to
         // run the `state.ready` handshake (design §8); a self-introspection var,
@@ -1521,11 +1529,11 @@ impl<'c> Supervisor<'c> {
     /// Resolve the channel-latest version from a freshly-fetched manifest
     /// (best-effort; any fetch/parse/mismatch error yields `None`).
     fn resolve_latest(&self) -> Option<String> {
-        let manifest = manifest::fetch(self.cfg).ok()?;
+        let mut manifest = manifest::fetch(self.cfg).ok()?;
         if manifest.name != self.cfg.global.app {
             return None;
         }
-        install::verify_manifest_identity(self.cfg, &manifest).ok()?;
+        install::verify_manifest_identity(self.cfg, &mut manifest).ok()?;
         // No `floor` here: the periodic poll's own `is_newer` gate (against the
         // running version) already refuses a downgrade, so resolving the raw latest
         // and filtering downstream keeps a benign older `latest` from logging as an
@@ -2069,7 +2077,7 @@ impl<'c> Supervisor<'c> {
     /// A `requested` check (see [`requested_policy_action`]) also reports under
     /// `off` or a `pin`. `Err` carries the reason no answer was obtained.
     fn run_update_check(&mut self, requested: bool) -> std::result::Result<(), String> {
-        let manifest = match manifest::fetch(self.cfg) {
+        let mut manifest = match manifest::fetch(self.cfg) {
             Ok(m) => m,
             Err(e) => {
                 tracing::warn!(error = %e, "update check: manifest fetch failed");
@@ -2093,7 +2101,7 @@ impl<'c> Supervisor<'c> {
         }
         // The manifest's own signature, expiry and `[trust].require_manifest`: a
         // manifest that fails them is never acted on, whatever the policy.
-        if let Err(e) = install::verify_manifest_identity(self.cfg, &manifest) {
+        if let Err(e) = install::verify_manifest_identity(self.cfg, &mut manifest) {
             tracing::warn!(error = %e, "update check: manifest rejected");
             let message = format!("update check: {e}");
             self.note_error(&message);
@@ -2255,14 +2263,14 @@ impl<'c> Supervisor<'c> {
             return Ok(());
         }
         tracing::info!(version, "update target not installed; downloading");
-        let manifest = manifest::fetch(self.cfg)?;
+        let mut manifest = manifest::fetch(self.cfg)?;
         if manifest.name != self.cfg.global.app {
             return Err(Error::Manifest(format!(
                 "manifest name {:?} does not match configured app {:?}",
                 manifest.name, self.cfg.global.app
             )));
         }
-        install::verify_manifest_identity(self.cfg, &manifest)?;
+        install::verify_manifest_identity(self.cfg, &mut manifest)?;
         let entry = manifest::version_entry(&manifest, version)?;
         let asset = manifest::select_asset(entry, required_asset(self.cfg)?)?;
         let (artifact, sha256) =
@@ -3781,6 +3789,7 @@ mod tests {
             dir: dir.to_path_buf(),
             run: None,
             exec: None,
+            runtime: None,
         }
     }
 

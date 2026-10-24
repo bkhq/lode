@@ -245,10 +245,9 @@ manifest 形状 + 逐资产字段表见 [source-adapters.zh-CN.md §6](source-ad
 禁降级 floor 拦截,`pin` 则彻底不再信任指针。
 
 给 `manifest-sign` 加上 `--expires-in 30d` 可写入已签名的过期时间。过期后 lode 拒绝该
-manifest,因此返回旧副本的源无法把主机留在旧版本;运维可用
-`[trust].require_manifest = "fresh"` 把它设为强制。请以短于有效期的周期重新执行
-`manifest-sign`(例如 CI 定时任务),否则到期后主机将不再接收更新。早于此功能的 lode 会忽略
-过期时间,照常验证同一份 manifest。
+manifest,因此请以短于有效期的周期重新执行 `manifest-sign`(例如 CI 定时任务),否则到期后
+主机将不再接收更新。过期时间是可选的;`[trust].require_manifest = "signed"` 只强制签名
+(过去还强制过期时间的 `"fresh"` 现在是它的弃用别名)。
 
 ### lode-server registry(`lode-cli publish`)
 
@@ -271,6 +270,7 @@ LODE_REGISTRY_TOKEN=pat_... lode-cli publish \
 | `--notes <text>` | 发布说明,创建草稿时写入。 |
 | `--key <file>` / `--key-env <VAR>` | ed25519 签名密钥,形式与 `lode-cli sign` 相同。不给则制品不签名。 |
 | `--run <cmd>` / `--exec <cmd>` | 随每个制品发布的启动命令覆盖项,并绑定进每个签名。 |
+| `--asset-runtime <name>`(及 `--asset-runtime-version`、`-version-check`、`-download`、`-sha256`) | 随每个制品发布的运行时(见[版本自带的运行时](#版本自带的运行时))。 |
 | `--allow-insecure` | 允许非回环地址的明文 `http` registry。 |
 | `<file>...` | 制品文件。每个文件以其文件名存储,也就是 `[update].asset` 选择的名字。 |
 
@@ -285,9 +285,57 @@ LODE_REGISTRY_TOKEN=pat_... lode-cli publish \
 运维方把 lode 指向该软件包的读取地址:
 `manifest = "https://lode.bk.io/r/<namespace>/<slug>/manifest.json"`。
 
+#### manifest 提交
+
+带密钥时,`publish` 也会签名 manifest:读取 registry 当前的 manifest,把版本加到它的通道上,
+签名后作为**提交**上传。提交是带 `parent`、`generation`、`created` 和 `commit_sig` 的
+manifest。`commit_sig` 签名
+`lode.manifest-commit.v1\n{name}\n{key_id}\n{generation}\n{parent}\n{created}\n{catalog}`,
+该消息的 sha256 即提交 id;`sig` 仍是普通的目录签名,旧版 lode 照样能验证。registry 只接受
+建立在当前 head 上的提交;若别的发布先到,`publish` 会基于新 head 重建(最多五次)。软件包一旦
+有了提交,所有变更都以提交进行:
+
+```bash
+LODE_REGISTRY_TOKEN=pat_... lode-cli channel --package <ns>/<slug> --channel stable --version 1.4.1 --key-env LODE_SIGNING_KEY
+LODE_REGISTRY_TOKEN=pat_... lode-cli yank    --package <ns>/<slug> --version 1.5.0 --key-env LODE_SIGNING_KEY
+```
+
+`channel` 把通道指向 manifest 中的某个版本。`yank` 从 manifest 中移除一个版本(不能有通道指向它);
+其制品仍可下载,正在运行它的主机不受影响。两者都和 `publish` 一样接受 `--registry`、
+`--key`/`--key-env` 和 `--allow-insecure`。提交不带 `expires`;需要签名的主机设置
+`require_manifest = "signed"`。要换新密钥签名,就提交一个无变更的提交:
+用 `lode-cli channel` 把通道指向它当前已指向的版本。
+
+配置了受信公钥时,lode 在数据目录的 `commits.json` 中按 manifest `name` 记录已接受的最新提交,
+并拒绝 `generation` 更低、同一 generation 但 id 不同、或完全没有签名提交的 manifest。服务端无法
+通过提供旧 manifest 让主机回滚;修复坏版本要靠新的提交:移动通道或发布修复版本。删除
+`commits.json` 会重置这一下限(例如迁移到另一个 registry 之后)。
+
+### 版本自带的运行时
+
+一个版本可以声明它需要的运行时。`lode-cli sign`、`verify`、`manifest` 和 `publish` 接受
+`--asset-runtime <name>`,以及可选的 `--asset-runtime-version`、`--asset-runtime-version-check`、
+`--asset-runtime-download`、`--asset-runtime-sha256`。资产随之带上一个 `runtime` 对象,字段与
+`[runtime]` 相同。对该版本,它替换运维的 `[runtime]`:热更新时新版本在它自己的运行时下启动,
+回滚时回到旧版本的运行时。
+
+```bash
+lode-cli manifest "$f" --app myapp --version 1.6.0 --url "$URL" \
+    --asset-runtime bun --asset-runtime-version 1.3.14 \
+    --asset-runtime-download https://example.com/bun-1.3.14.zip \
+    --asset-runtime-sha256 "$(sha256sum bun-1.3.14.zip | cut -d' ' -f1)" \
+    --key private.key --into manifest.json
+```
+
+- 签名覆盖 `runtime`、`version`、`version_check` 和 `sha256`,不覆盖下载 URL,所以 `download`
+  必须带上它的 `sha256`。
+- 只有经过验证的签名覆盖了它,lode 才使用这个运行时:资产自己的签名,或目录签名。两者都没有时,
+  lode 告警并继续用 `[runtime]`。
+- 早于此功能的 lode 无法验证带运行时签名的资产。发布前先升级主机上的 lode。
+
 ### 签名模型(各来源通用)
 
-- artifact 签名绑定 **`name`(文件名)/ `version` / `sha256` / `run` / `exec`**。`format` 从文件名后缀推导(`.tar.gz`/`.tgz` → tar.gz、`.gz` → gz、`.zip` → zip、否则 raw)。`run`/`exec` 在存在时绑入签名(缺省为空字符串)——在 `require_signature=auto`(有密钥)或 `enforce` 下,被篡改的目录无法注入恶意启动命令。
+- artifact 签名绑定 **`name`(文件名)/ `version` / `sha256` / `run` / `exec`**,资产带 `runtime` 时也绑定它。`format` 从文件名后缀推导(`.tar.gz`/`.tgz` → tar.gz、`.gz` → gz、`.zip` → zip、否则 raw)。`run`/`exec` 在存在时绑入签名(缺省为空字符串)——在 `require_signature=auto`(有密钥)或 `enforce` 下,被篡改的目录无法注入恶意启动命令。
 - `require_signature = enforce` 下,每个安装的资产都必须带有效签名(github:`<asset>.sig`
   sidecar 资产或 `label`;native:`sig` 字段或 `.sig` sidecar)。`auto` 一旦配置了任一受信公钥即 fail-closed;无公钥时安装为
   **UNVERIFIED** 并告警。

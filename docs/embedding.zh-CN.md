@@ -85,7 +85,7 @@ if let Outcome::Installed { version, .. } = update.apply()? {
 | `.version(id)` | 否 | 安装指定版本,而不是通道的最新版。这也是降级的唯一途径。 |
 | `.channel(name)` | 否 | 默认 `stable`。GitHub 源下,其他通道跟随最新的 pre-release。 |
 | `.header("Name: value")` | 否 | 私有源的请求头。`${VAR}` 在发请求时从环境变量取。只发给源自己的主机。 |
-| `.require_manifest(policy)` | 否 | `RequireManifest::Signed` 或 `Fresh`,见[冻结攻击](#冻结攻击与-require_manifest)。 |
+| `.require_manifest(policy)` | 否 | `RequireManifest::Signed`,见[签名清单](#签名清单与-require_manifest)。 |
 
 ### 源
 
@@ -157,25 +157,25 @@ if let Some(fetched) = update.fetch()? {
 
 源无法让你的程序安装一个你的密钥没有签过的东西,也无法把它换到你的密钥没有签过的名字或版本上。
 
-### 冻结攻击与 `require_manifest`
+### 签名清单与 `require_manifest`
 
-上面的校验挡不住一种情况:源一直返回一份旧清单。里面每个签名都有效,你的程序却永远停在旧版本上,
-而逐个资产的签名发现不了这一点。带已签名有效期的已签名清单可以:
+逐个资产的签名不覆盖清单里的通道。要求清单签名可以覆盖:
 
 ```rust
-.require_manifest(RequireManifest::Fresh)
+.require_manifest(RequireManifest::Signed)
 ```
 
 | 策略 | 对清单的要求 |
 |---|---|
 | `Off`(默认) | 无。签名或有效期存在时会校验,但不强制要求。 |
 | `Signed` | 必须带有对通道和资产摘要的有效签名。 |
-| `Fresh` | 在 `Signed` 之上,还必须带有尚未到期的已签名有效期。 |
+| `Fresh` | 已弃用:等同于 `Signed`。 |
 
-这需要使用 `Source::Manifest`,并且发布者对清单签名(`lode-cli manifest-sign --expires-in 30d`),
-还要在到期之前重新签名。GitHub 源没有可签名的清单:把它和 `Signed` 或 `Fresh` 组合是配置错误。
+这需要使用 `Source::Manifest`,并且发布者对清单签名(`lode-cli manifest-sign`)。GitHub 源没有可签名的
+清单:把它和 `Signed` 组合是配置错误。
 
-有效期与本机时钟比较,没有宽限:到期的那一秒起清单就被拒绝。发布者应当留足余量提前续签。
+带已签名有效期(`--expires-in 30d`)的清单按本机时钟比较,没有宽限,到期的那一秒起即被拒绝;
+写入有效期的发布者应当留足余量提前续签。
 
 ### Windows
 

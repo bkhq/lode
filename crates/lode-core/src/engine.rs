@@ -15,11 +15,12 @@
 //! [`install`](Engine::install), [`rollback`](Engine::rollback),
 //! [`versions`](Engine::versions), [`restart`](Engine::restart)).
 
+use std::collections::HashSet;
 use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use crate::config::Config;
+use crate::config::{Config, Runtime};
 use crate::error::{Error, Result};
 use crate::{commands, download, idval, install, manifest, state, verify};
 
@@ -54,6 +55,9 @@ pub struct Target {
     pub run: Option<String>,
     /// Resolved base command for exec passthrough.
     pub exec: Option<String>,
+    /// The version's own runtime (signed, from its manifest asset); replaces
+    /// `[runtime]` when present.
+    pub runtime: Option<manifest::RuntimeSpec>,
 }
 
 /// Decide which version to run and load its launch metadata. Bootstraps the
@@ -80,6 +84,7 @@ pub fn locate(cfg: &Config, version: &str) -> Result<Target> {
         dir,
         run: m.run,
         exec: m.exec,
+        runtime: m.runtime,
     })
 }
 
@@ -168,7 +173,7 @@ fn cmp_desc(a: &str, b: &str) -> std::cmp::Ordering {
 /// channel latest), download + verify + install it, and activate it (design §5).
 fn bootstrap(cfg: &Config, requested: Option<&str>) -> Result<String> {
     install::gc(cfg)?;
-    let manifest = manifest::fetch(cfg)?;
+    let mut manifest = manifest::fetch(cfg)?;
     if manifest.name != cfg.global.app {
         return Err(Error::Manifest(format!(
             "manifest name {:?} does not match configured app {:?}",
@@ -177,7 +182,7 @@ fn bootstrap(cfg: &Config, requested: Option<&str>) -> Result<String> {
     }
     // Verify the catalog signature if it carries one (verify-if-present); absence is
     // fine — the per-artifact check binds each download.
-    install::verify_manifest_identity(cfg, &manifest)?;
+    install::verify_manifest_identity(cfg, &mut manifest)?;
     // Anti-downgrade floor from any prior state (a clean bootstrap has none, so this
     // never blocks the first install); it only gates a `latest`-following resolution.
     // Lenient: a boot path (reached directly when pinned) — a corrupt state.json
@@ -276,12 +281,14 @@ fn runtime_cache_key(version: Option<&str>, download: Option<&str>) -> String {
 /// older `[runtime]` config, and the flat `runtime/<name>` binary left by a
 /// pre-cache-key lode. Best-effort — an entry that cannot be removed is a stale
 /// directory, never a launch failure, so it is logged and skipped.
-fn prune_runtime_cache(runtime_root: &Path, keep: &str) {
+fn prune_runtime_cache(cfg: &Config, runtime_root: &Path, keep: &str) {
     let Ok(entries) = std::fs::read_dir(runtime_root) else {
         return;
     };
+    let referenced = referenced_runtime_keys(cfg);
     for entry in entries.flatten() {
-        if entry.file_name() == OsStr::new(keep) {
+        let name = entry.file_name();
+        if name == OsStr::new(keep) || name.to_str().is_some_and(|n| referenced.contains(n)) {
             continue;
         }
         let path = entry.path();
@@ -300,6 +307,41 @@ fn prune_runtime_cache(runtime_root: &Path, keep: &str) {
     }
 }
 
+/// Cache keys of the runtimes still in use: `[runtime]` and every installed
+/// version's own runtime, so a rollback finds its runtime without a download.
+fn referenced_runtime_keys(cfg: &Config) -> HashSet<String> {
+    let mut keys = HashSet::from([runtime_cache_key(
+        cfg.runtime.version.as_deref(),
+        cfg.runtime.download.as_deref(),
+    )]);
+    let Ok(entries) = std::fs::read_dir(cfg.global.dir.join("versions")) else {
+        return keys;
+    };
+    for entry in entries.flatten() {
+        if let Some(rt) = entry
+            .file_name()
+            .to_str()
+            .and_then(|v| install::marker(cfg, v).ok())
+            .and_then(|m| m.runtime)
+        {
+            keys.insert(runtime_cache_key(
+                rt.version.as_deref(),
+                rt.download.as_deref(),
+            ));
+        }
+    }
+    keys
+}
+
+/// [`ensure_runtime`] for `target`: its own runtime when it has one, else
+/// `[runtime]`.
+pub fn ensure_target_runtime(cfg: &Config, target: &Target) -> Result<Option<PathBuf>> {
+    target.runtime.as_ref().map_or_else(
+        || ensure_runtime(cfg),
+        |rt| ensure_runtime_with(cfg, &rt.to_config()),
+    )
+}
+
 /// Ensure a configured runtime is available for the child.
 ///
 /// It is downloaded into `$LODE_DIR/runtime/<key>/` when absent from PATH and not
@@ -313,10 +355,15 @@ fn prune_runtime_cache(runtime_root: &Path, keep: &str) {
 /// cost — but only for the *same* `[runtime]` config: repointing `version`/`download`
 /// changes the key, which forces a fresh download and reclaims the previous cache.
 pub fn ensure_runtime(cfg: &Config) -> Result<Option<PathBuf>> {
-    let runtime = cfg.runtime.runtime.as_deref();
-    let download_url = cfg.runtime.download.as_deref();
-    let expected = cfg.runtime.version.as_deref();
-    let probe_args = runtime_probe_args(cfg.runtime.version_check.as_deref());
+    ensure_runtime_with(cfg, &cfg.runtime)
+}
+
+/// [`ensure_runtime`] for an explicit runtime table `rt`.
+fn ensure_runtime_with(cfg: &Config, rt: &Runtime) -> Result<Option<PathBuf>> {
+    let runtime = rt.runtime.as_deref();
+    let download_url = rt.download.as_deref();
+    let expected = rt.version.as_deref();
+    let probe_args = runtime_probe_args(rt.version_check.as_deref());
     let path_var = std::env::var("PATH").unwrap_or_default();
     let runtime_root = cfg.global.dir.join("runtime");
     let cache_key = runtime_cache_key(expected, download_url);
@@ -361,7 +408,7 @@ pub fn ensure_runtime(cfg: &Config) -> Result<Option<PathBuf>> {
                 dir = %runtime_dir.display(),
                 "runtime served from cache; skipping download"
             );
-            prune_runtime_cache(&runtime_root, &cache_key);
+            prune_runtime_cache(cfg, &runtime_root, &cache_key);
             Ok(Some(runtime_dir))
         }
         RuntimePlan::Fetch => {
@@ -374,7 +421,7 @@ pub fn ensure_runtime(cfg: &Config) -> Result<Option<PathBuf>> {
                 format,
                 "runtime missing from PATH and cache; downloading"
             );
-            let asset = runtime_asset(url, name, cfg.runtime.sha256.as_deref());
+            let asset = runtime_asset(url, name, rt.sha256.as_deref());
             // The runtime download has no manifest origin to be same-origin with,
             // so credentials ride it only when its host is explicitly allowlisted
             // via `[http].credential_hosts`; otherwise they are dropped.
@@ -383,11 +430,11 @@ pub fn ensure_runtime(cfg: &Config) -> Result<Option<PathBuf>> {
             // `[runtime].sha256` is the runtime's only integrity check (there is no
             // publisher signature): a mismatching body never reaches the child's
             // PATH, and the bytes are dropped so a later launch re-fetches.
-            if let Some(want) = cfg.runtime.sha256.as_deref() {
+            if let Some(want) = rt.sha256.as_deref() {
                 if !sha.eq_ignore_ascii_case(want.trim()) {
                     let _ = std::fs::remove_file(&archive);
                     return Err(Error::Verify(format!(
-                        "runtime download sha256 mismatch: [runtime].sha256 {want}, downloaded {sha}"
+                        "runtime download sha256 mismatch: expected {want}, downloaded {sha}"
                     )));
                 }
                 tracing::info!(runtime = name, "runtime download sha256 verified");
@@ -413,7 +460,7 @@ pub fn ensure_runtime(cfg: &Config) -> Result<Option<PathBuf>> {
                 let bin = runtime_dir.join(install::runtime_file_name(name));
                 verify_runtime_version(&bin, &probe_args, want)?;
             }
-            prune_runtime_cache(&runtime_root, &cache_key);
+            prune_runtime_cache(cfg, &runtime_root, &cache_key);
             Ok(Some(runtime_dir))
         }
     }
@@ -487,6 +534,8 @@ fn runtime_asset(url: &str, name: &str, sha256: Option<&str>) -> manifest::Asset
         size: None,
         auth: true,
         delegation: None,
+        runtime: None,
+        catalog_signed: false,
     }
 }
 
@@ -580,8 +629,8 @@ impl Engine {
     /// downloading or installing. Fetches the manifest and runs the same
     /// anti-downgrade-floored resolution as a real install would.
     pub fn check(&self) -> Result<CheckResult> {
-        let manifest = manifest::fetch(&self.cfg)?;
-        install::verify_manifest_identity(&self.cfg, &manifest)?;
+        let mut manifest = manifest::fetch(&self.cfg)?;
+        install::verify_manifest_identity(&self.cfg, &mut manifest)?;
         // Mirror the bootstrap resolution: apply the anti-downgrade floor so the
         // reported version matches what an install would actually pick.
         let prior =
@@ -831,6 +880,84 @@ mod tests {
         ))
         .unwrap();
         assert!(ensure_runtime(&bumped).is_err());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A target's own runtime replaces `[runtime]`, and the cache prune keeps
+    /// the runtime of every installed version.
+    #[cfg(unix)]
+    #[test]
+    fn a_target_runtime_replaces_the_configured_one_and_survives_the_prune() {
+        use unix_ext::fs::PermissionsExt as _;
+
+        let dir = std::env::temp_dir().join(format!("lode-rttarget-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let cfg = Config::from_toml(&format!(
+            "[global]\ndir = {dir:?}\n\n[runtime]\nruntime = \"lodefakert4\"\n\
+             download = \"https://x/lodefakert4-1\"\n"
+        ))
+        .unwrap();
+        let spec = manifest::RuntimeSpec {
+            runtime: "lodefakert4".to_owned(),
+            version: None,
+            version_check: None,
+            download: Some("https://x/lodefakert4-2".to_owned()),
+            sha256: Some("d".repeat(64)),
+        };
+        // Both runtimes are already cached, so nothing is fetched or probed.
+        let cached = |url: &str| {
+            let keyed = dir.join("runtime").join(runtime_cache_key(None, Some(url)));
+            std::fs::create_dir_all(&keyed).unwrap();
+            let bin = keyed.join("lodefakert4");
+            std::fs::write(&bin, b"#!/bin/sh\n").unwrap();
+            std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+            keyed
+        };
+        let base = cached("https://x/lodefakert4-1");
+        let own = cached("https://x/lodefakert4-2");
+        let target = |runtime| Target {
+            version: "2.0.0".to_owned(),
+            dir: dir.join("versions/2.0.0"),
+            run: None,
+            exec: None,
+            runtime,
+        };
+
+        // Version 2.0.0 is installed with its own runtime.
+        let marker_dir = dir.join("versions/2.0.0");
+        std::fs::create_dir_all(&marker_dir).unwrap();
+        let marker = install::Marker {
+            version: "2.0.0".to_owned(),
+            run: None,
+            exec: None,
+            runtime: Some(spec.clone()),
+            format: "raw".to_owned(),
+        };
+        std::fs::write(
+            marker_dir.join(".lode.json"),
+            serde_json::to_vec(&marker).unwrap(),
+        )
+        .unwrap();
+
+        assert_eq!(
+            ensure_target_runtime(&cfg, &target(Some(spec))).unwrap(),
+            Some(own.clone())
+        );
+        assert!(base.is_dir(), "[runtime]'s cache is kept");
+        assert_eq!(
+            ensure_target_runtime(&cfg, &target(None)).unwrap(),
+            Some(base)
+        );
+        assert!(own.is_dir(), "an installed version's runtime is kept");
+
+        std::fs::remove_dir_all(&marker_dir).unwrap();
+        ensure_runtime(&cfg).unwrap();
+        assert!(
+            !own.exists(),
+            "an uninstalled version's runtime is reclaimed"
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }
