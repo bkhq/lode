@@ -53,6 +53,15 @@ type ResourceState struct {
 	Error     string `json:"error,omitempty"`
 }
 
+// LodeInfo is the lode supervising the app (state.json lode): its version, the
+// git commit it was built from (when known) and the app-contract features it
+// supports.
+type LodeInfo struct {
+	Version  string   `json:"version"`
+	Commit   string   `json:"commit,omitempty"`
+	Features []string `json:"features,omitempty"`
+}
+
 // State is the parsed state.json. lode writes the top group; the app writes
 // Target/RestartNonce/CheckNonce/Ready. CheckedNonce is the highest CheckNonce
 // lode has answered; CheckError is why the last requested check failed.
@@ -66,6 +75,7 @@ type State struct {
 	LastCheck        string         `json:"last_check,omitempty"`
 	LastError        string         `json:"last_error,omitempty"`
 	History          []HistoryEntry `json:"history,omitempty"`
+	Lode             *LodeInfo      `json:"lode,omitempty"`
 	ConfigGeneration uint64         `json:"config_generation,omitempty"`
 	CheckedNonce     uint64         `json:"checked_nonce,omitempty"`
 	CheckError       string         `json:"check_error,omitempty"`
@@ -461,6 +471,36 @@ func ResourcePath(name string) string {
 
 // InstanceID is this launch's unique id (LODE_INSTANCE, "{pid}-{nanoid}").
 func InstanceID() string { return os.Getenv("LODE_INSTANCE") }
+
+// LodeVersion is the supervising lode's version (LODE_VERSION).
+func LodeVersion() string { return os.Getenv("LODE_VERSION") }
+
+// LodeCommit is the git commit the supervising lode was built from
+// (LODE_COMMIT); empty when unknown.
+func LodeCommit() string { return os.Getenv("LODE_COMMIT") }
+
+// LodeFeatures lists the app-contract features the supervising lode supports
+// (LODE_FEATURES).
+func LodeFeatures() []string {
+	var out []string
+	for _, f := range strings.Split(os.Getenv("LODE_FEATURES"), ",") {
+		if f != "" {
+			out = append(out, f)
+		}
+	}
+	return out
+}
+
+// HasFeature reports whether the supervising lode supports feature name
+// (e.g. "check", "staged-cutover").
+func HasFeature(name string) bool {
+	for _, f := range LodeFeatures() {
+		if f == name {
+			return true
+		}
+	}
+	return false
+}
 
 // Readiness is the readiness mode in force ("none" | "state").
 func Readiness() string { return os.Getenv("LODE_READINESS") }

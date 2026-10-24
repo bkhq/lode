@@ -350,6 +350,9 @@ fn resource(id: &Identity, version: Option<&str>) -> Value {
         ("lode.channel", string(&id.channel)),
         ("lode.report.interval", int(id.interval)),
     ]);
+    if let Some(commit) = crate::build_info::COMMIT {
+        attrs.push(("lode.commit", string(commit)));
+    }
     for (key, value) in &id.attributes {
         if !attrs.iter().any(|(k, _)| k == key) {
             attrs.push((key, string(value)));
@@ -573,6 +576,10 @@ mod tests {
         assert_eq!(a["os.type"], string(os_type()));
         assert_eq!(a["process.pid"], int(42));
         assert_eq!(a["lode.version"], string(LODE_VERSION));
+        assert_eq!(
+            a.get("lode.commit"),
+            crate::build_info::COMMIT.map(string).as_ref()
+        );
         assert_eq!(a["lode.channel"], string("stable"));
         assert_eq!(a["lode.report.interval"], json!({ "intValue": "300" }));
         assert_eq!(a["region"], string("hk"));

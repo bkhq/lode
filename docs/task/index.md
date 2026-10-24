@@ -39,3 +39,4 @@ Each task is a single line linking to its detail file. All detailed information 
 - [x] [**20261022-1915-status-report Report host status over OTLP/HTTP**](20261022-1915-status-report.md) `P2`
 - [x] [**20261023-0630-github-private-token Read private GitHub releases with a token**](20261023-0630-github-private-token.md) `P2`
 - [x] [**20261023-0848-embedded-report Full status reporting for embedded hosts**](20261023-0848-embedded-report.md) `P2`
+- [x] [**20261024-1505-lode-build-info Expose lode's version, commit and features to the app**](20261024-1505-lode-build-info.md) `P2`

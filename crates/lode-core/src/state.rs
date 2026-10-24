@@ -80,6 +80,34 @@ pub struct ResourceState {
     pub error: Option<String>,
 }
 
+/// Which lode supervises the app: `state.json`'s `lode` object.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LodeInfo {
+    /// lode's version.
+    pub version: String,
+    /// The git commit lode was built from, when known.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub commit: Option<String>,
+    /// App-contract features this lode supports ([`crate::build_info::FEATURES`]).
+    #[serde(default)]
+    pub features: Vec<String>,
+}
+
+impl LodeInfo {
+    /// This build's info.
+    #[must_use]
+    pub fn current() -> Self {
+        Self {
+            version: crate::build_info::VERSION.to_owned(),
+            commit: crate::build_info::COMMIT.map(str::to_owned),
+            features: crate::build_info::FEATURES
+                .iter()
+                .map(|f| (*f).to_owned())
+                .collect(),
+        }
+    }
+}
+
 /// Contents of `$LODE_DIR/state.json`. Fields default to empty so a partial file
 /// (or one written only by the app) still deserialises.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -112,6 +140,9 @@ pub struct State {
     /// Rollout history, oldest first.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub history: Vec<HistoryEntry>,
+    /// The lode supervising the app, written when the loop starts.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lode: Option<LodeInfo>,
     /// Monotonic counter lode bumps each time it detects an edited `lode.toml` while
     /// the app is RUNNING. lode never auto-restarts on a config edit — it only bumps
     /// this so the app learns a restart is needed to apply the change; the app picks
@@ -398,6 +429,27 @@ mod tests {
         assert!(back.hold);
         assert_eq!(back.status, Some(Status::Held));
         let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn lode_info_serialises_build_info() {
+        let state = State {
+            lode: Some(LodeInfo::current()),
+            ..State::default()
+        };
+        let json = serde_json::to_value(&state).unwrap();
+        assert_eq!(json["lode"]["version"], crate::build_info::VERSION);
+        assert_eq!(
+            json["lode"]["features"],
+            serde_json::json!(crate::build_info::FEATURES)
+        );
+        match crate::build_info::COMMIT {
+            Some(commit) => assert_eq!(json["lode"]["commit"], commit),
+            None => assert!(json["lode"].get("commit").is_none()),
+        }
+        // Absent until lode writes it.
+        let json = serde_json::to_value(State::default()).unwrap();
+        assert!(json.get("lode").is_none());
     }
 
     // --- locked_update (P2-14 RMW serialisation) ---

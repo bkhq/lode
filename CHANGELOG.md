@@ -7,6 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **lode tells the app who it is.** The app gets `LODE_VERSION`, `LODE_COMMIT`
+  (the git commit lode was built from) and `LODE_FEATURES` (stable,
+  append-only names of the app-contract features this lode supports — `target`,
+  `restart`, `check`, `hold`, `readiness-state`, `staged-cutover`,
+  `config-generation`, `resources`, `resource-target`, `report`), and the same
+  in `state.json`'s new `lode` object. The SDKs read them (`lodeVersion()`,
+  `lodeCommit()`, `lodeFeatures()`, `hasFeature(name)`, `State.lode`).
+- `lode --version` / `lode-cli --version` show the commit
+  (`lode 0.3.0 (0123456789ab)`), and status reports carry `lode.commit`.
+  A build takes the commit from `LODE_BUILD_COMMIT`, else from `git` in the
+  lode checkout.
+
 ### Security
 
 - Update `ctutils` to 0.4.5 (RUSTSEC-2026-0385).

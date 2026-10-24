@@ -72,7 +72,8 @@ Your **app** keeps its own directory convention (works with or without lode): se
 | `watch(...)` | poll loop with a change callback for every notification (config / version / status / available / error / prepare) |
 
 Plus free helpers: `isSupervised()`, `activeVersion()`, `instanceId()`,
-`readiness()`, `resourcePath(name)` (`LODE_RESOURCE_<NAME>`), the directory helpers `dataDir()` (resolves `DATA_DIR` > `LODE_DIR` >
+`readiness()`, lode's build info `lodeVersion()` / `lodeCommit()` / `lodeFeatures()` /
+`hasFeature(name)` (`LODE_VERSION` / `LODE_COMMIT` / `LODE_FEATURES`; also `read().lode`), `resourcePath(name)` (`LODE_RESOURCE_<NAME>`), the directory helpers `dataDir()` (resolves `DATA_DIR` > `LODE_DIR` >
 `ROOT_DIR`) / `rootDir()` / `lodeDir()` / `workdir()`, read-only config access
 `configPath()` / `readConfig()` (raw `lode.toml` text), and a graceful-stop handler
 (`onTerminate` in TS/Go; `install_term_handler()` + `terminating()` in Rust).

@@ -361,7 +361,7 @@ pub(crate) struct Globals {
 /// The **loader** CLI (`lode`). No subcommands: bare `lode` starts the supervised
 /// service; `lode <args>` forwards everything to the app via exec passthrough.
 #[derive(Debug, Parser)]
-#[command(name = "lode", version, about, long_about = None)]
+#[command(name = "lode", version = lode_core::build_info::LONG_VERSION, about, long_about = None)]
 pub(crate) struct LoaderCli {
     #[command(flatten)]
     pub(crate) globals: Globals,
@@ -375,7 +375,12 @@ pub(crate) struct LoaderCli {
 /// The **`lode-cli`** multitool (a symlink to the `lode` binary). Management +
 /// publisher subcommands; same global options as the loader.
 #[derive(Debug, Parser)]
-#[command(name = "lode-cli", version, about = "lode operator + publisher toolkit", long_about = None)]
+#[command(
+    name = "lode-cli",
+    version = lode_core::build_info::LONG_VERSION,
+    about = "lode operator + publisher toolkit",
+    long_about = None
+)]
 pub(crate) struct ToolCli {
     #[command(flatten)]
     pub(crate) globals: Globals,

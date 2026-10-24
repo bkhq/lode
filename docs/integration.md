@@ -79,8 +79,11 @@ What *your app* implements. Any language — read/write one JSON file and handle
 (lode's dir — `state.json` lives at `$LODE_DIR/state.json`), `LODE_WORKDIR` (the app's
 run dir, i.e. its cwd), `LODE_CONFIG` (path to the `lode.toml` lode loaded — read it
 read-only to see lode's config), `LODE_INSTANCE` (unique id for this launch — write it
-to `state.ready`), `LODE_READINESS` (`none`|`state`), and `LODE_RESOURCE_<NAME>` per
-installed `[[resource]]` (its active path). The host env (e.g. `PORT`) passes
+to `state.ready`), `LODE_READINESS` (`none`|`state`), `LODE_RESOURCE_<NAME>` per
+installed `[[resource]]` (its active path), and lode's own build info:
+`LODE_VERSION` (lode's version), `LODE_COMMIT` (the git commit lode was built from;
+absent when unknown) and `LODE_FEATURES` (comma-separated
+[features](#lode-features)). The host env (e.g. `PORT`) passes
 through; internal `LODE_*` are stripped. The operator can add more via the `[env]`
 table — those are **defaults**: an inherited host env var of the same name (e.g. a
 per-deploy `-e PORT`) wins over them, and lode's injected vars always win over everything.
@@ -98,6 +101,7 @@ See [Data directories & persistence](#data-directories--persistence) for the
   "config_generation": 0,     // lode bumps this on a lode.toml edit while you run => restart to apply
   "checked_nonce": 0,         // the check_nonce lode last answered; "check_error" says why that check failed
   "resources": {},            // per [[resource]]: { current, available, path, error }
+  "lode": { "version": "0.3.0", "commit": "…", "features": ["target", "…"] },  // the supervising lode
   // app writes (requests / readiness):
   "target": null,             // a version or "latest" => request up/down-grade
   "restart_nonce": 0,          // increment => restart the current version
@@ -107,6 +111,27 @@ See [Data directories & persistence](#data-directories--persistence) for the
   "ready": null               // set to LODE_INSTANCE => "I can serve now"
 }
 ```
+
+<a id="lode-features"></a>**Which lode is this?** `LODE_VERSION` / `LODE_COMMIT` /
+`LODE_FEATURES` and `state.json`'s `lode` object (written when the loop starts) name
+the supervising lode. Check a feature before relying on the part of this contract
+it covers, rather than comparing versions. Names are stable and only ever added:
+
+| Feature | Covers |
+|---|---|
+| `target` | `target` requests (a version or `"latest"`) |
+| `restart` | `restart_nonce` |
+| `check` | `check_nonce` / `checked_nonce` / `check_error` |
+| `hold` | `hold` and `status = "held"` |
+| `readiness-state` | `readiness = "state"` (`ready = LODE_INSTANCE`) |
+| `staged-cutover` | the phased `-0` / `-1` / `-2` prepare handshake |
+| `config-generation` | `config_generation` bumps on a `lode.toml` edit |
+| `resources` | `[[resource]]`, `LODE_RESOURCE_<NAME>`, `resources` |
+| `resource-target` | `resource_target` requests |
+| `report` | `[report]` status reporting over OTLP/HTTP |
+
+SDK: `lodeVersion()`, `lodeCommit()`, `lodeFeatures()`, `hasFeature(name)`, and
+`read().lode`.
 
 Implement these (all but `SIGTERM` are optional, but recommended):
 

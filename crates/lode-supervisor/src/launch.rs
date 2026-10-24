@@ -187,6 +187,15 @@ pub(crate) fn child_env(
     set_env(&mut env, "LODE_ACTIVE_VERSION", version);
     set_env(&mut env, "LODE_DIR", &dir.display().to_string());
     set_env(&mut env, "LODE_INSTANCE", instance);
+    set_env(&mut env, "LODE_VERSION", lode_core::build_info::VERSION);
+    if let Some(commit) = lode_core::build_info::COMMIT {
+        set_env(&mut env, "LODE_COMMIT", commit);
+    }
+    set_env(
+        &mut env,
+        "LODE_FEATURES",
+        &lode_core::build_info::FEATURES.join(","),
+    );
     env
 }
 

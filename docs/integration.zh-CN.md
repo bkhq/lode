@@ -72,7 +72,9 @@ restart      = "on-failure" # on-failure(默认,keep-alive:重试后暂停)| alw
 **lode 注入的环境变量:** `LODE_ACTIVE_VERSION`(当前版本)、`LODE_DIR`(lode 自己的目录 ——
 `state.json` 在 `$LODE_DIR/state.json`)、`LODE_WORKDIR`(app 的运行目录,即其 cwd)、
 `LODE_CONFIG`(lode 加载的 `lode.toml` 路径 —— 只读它即可看到 lode 的配置)、
-`LODE_INSTANCE`(本次启动唯一号 —— 写入 `state.ready`)、`LODE_READINESS`(`none`|`state`),以及每个已安装 `[[resource]]` 的 `LODE_RESOURCE_<NAME>`(其激活路径)。
+`LODE_INSTANCE`(本次启动唯一号 —— 写入 `state.ready`)、`LODE_READINESS`(`none`|`state`)、每个已安装 `[[resource]]` 的 `LODE_RESOURCE_<NAME>`(其激活路径),
+以及 lode 自身的构建信息:`LODE_VERSION`(lode 版本)、`LODE_COMMIT`(构建 lode 的 git commit;未知时不注入)、
+`LODE_FEATURES`(逗号分隔的[功能列表](#lode-features))。
 宿主环境(如 `PORT`)原样透传;内部 `LODE_*` 已剥离。operator 还可用 `[env]` 表追加变量——
 它们是**默认值**:同名的宿主 env(如部署时 `-e PORT`)会覆盖它们,而 lode 注入的变量始终最高。
 `LODE_DIR`/`LODE_WORKDIR` 与 app 自有的 `ROOT_DIR`/`DATA_DIR` 的关系见[数据目录与持久化](#数据目录与持久化)。
@@ -88,6 +90,7 @@ restart      = "on-failure" # on-failure(默认,keep-alive:重试后暂停)| alw
   "config_generation": 0,     // 运行中编辑 lode.toml 时 lode 递增它 => 重启才生效
   "checked_nonce": 0,         // lode 最近应答的 check_nonce;该次检查失败的原因在 "check_error"
   "resources": {},            // 每个 [[resource]]:{ current, available, path, error }
+  "lode": { "version": "0.3.0", "commit": "…", "features": ["target", "…"] },  // 监管它的 lode
   // 应用写(请求 / 就绪):
   "target": null,             // 某版本或 "latest" => 请求升/降级
   "restart_nonce": 0,          // 递增 => 重启当前版本
@@ -97,6 +100,25 @@ restart      = "on-failure" # on-failure(默认,keep-alive:重试后暂停)| alw
   "ready": null               // 写成 LODE_INSTANCE => "我能服务了"
 }
 ```
+
+<a id="lode-features"></a>**是哪个 lode?** `LODE_VERSION` / `LODE_COMMIT` / `LODE_FEATURES` 以及
+`state.json` 的 `lode` 对象(循环启动时写入)标明了监管它的 lode。依赖下面某部分契约前先检查对应功能,
+不要比较版本号。功能名稳定,只增不删:
+
+| 功能 | 覆盖 |
+|---|---|
+| `target` | `target` 请求(版本或 `"latest"`) |
+| `restart` | `restart_nonce` |
+| `check` | `check_nonce` / `checked_nonce` / `check_error` |
+| `hold` | `hold` 与 `status = "held"` |
+| `readiness-state` | `readiness = "state"`(`ready = LODE_INSTANCE`) |
+| `staged-cutover` | 相位 `-0` / `-1` / `-2` 准备握手 |
+| `config-generation` | 编辑 `lode.toml` 时递增 `config_generation` |
+| `resources` | `[[resource]]`、`LODE_RESOURCE_<NAME>`、`resources` |
+| `resource-target` | `resource_target` 请求 |
+| `report` | `[report]` 经 OTLP/HTTP 的状态上报 |
+
+SDK:`lodeVersion()`、`lodeCommit()`、`lodeFeatures()`、`hasFeature(name)` 以及 `read().lode`。
 
 实现以下契约(除 `SIGTERM` 外均可选,但推荐):
 

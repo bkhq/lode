@@ -62,6 +62,18 @@ pub struct ResourceState {
     pub error: Option<String>,
 }
 
+/// The lode supervising the app (state.json `lode`).
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct LodeInfo {
+    pub version: String,
+    /// The git commit lode was built from, when known.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub commit: Option<String>,
+    /// App-contract features this lode supports (see [`has_feature`]).
+    #[serde(default)]
+    pub features: Vec<String>,
+}
+
 /// Parsed state.json. lode writes the top group; the app writes
 /// `target`/`restart_nonce`/`check_nonce`/`ready`.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -84,6 +96,9 @@ pub struct State {
     pub last_error: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub history: Vec<HistoryEntry>,
+    /// The lode supervising the app, once its loop has started.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lode: Option<LodeInfo>,
     #[serde(default)]
     pub config_generation: u64,
     /// The highest `check_nonce` lode has answered (see [`Lode::request_check`]).
@@ -326,7 +341,7 @@ impl Lode {
             interval
         };
         let seed = self.read().ok().flatten();
-        let mut gen = seed.as_ref().map_or(0, |s| s.config_generation);
+        let mut generation = seed.as_ref().map_or(0, |s| s.config_generation);
         let mut status = seed.as_ref().and_then(|s| s.status);
         let mut available = seed.as_ref().and_then(|s| s.available.clone());
         let mut last_error = seed.as_ref().and_then(|s| s.last_error.clone());
@@ -339,10 +354,10 @@ impl Lode {
                 if let Some(cb) = handlers.on_state.as_mut() {
                     cb(&s);
                 }
-                if s.config_generation > gen {
-                    gen = s.config_generation;
+                if s.config_generation > generation {
+                    generation = s.config_generation;
                     if let Some(cb) = handlers.on_config_change.as_mut() {
-                        cb(gen, &s);
+                        cb(generation, &s);
                     }
                 }
                 if s.available != available {
@@ -525,6 +540,31 @@ pub fn resource_path(name: &str) -> Option<String> {
 /// This launch's unique id (`LODE_INSTANCE`, `{pid}-{nanoid}`).
 pub fn instance_id() -> String {
     std::env::var("LODE_INSTANCE").unwrap_or_default()
+}
+
+/// The supervising lode's version (`LODE_VERSION`).
+pub fn lode_version() -> Option<String> {
+    std::env::var("LODE_VERSION").ok().filter(|s| !s.is_empty())
+}
+
+/// The git commit the supervising lode was built from (`LODE_COMMIT`), when known.
+pub fn lode_commit() -> Option<String> {
+    std::env::var("LODE_COMMIT").ok().filter(|s| !s.is_empty())
+}
+
+/// App-contract features the supervising lode supports (`LODE_FEATURES`).
+pub fn lode_features() -> Vec<String> {
+    std::env::var("LODE_FEATURES")
+        .unwrap_or_default()
+        .split(',')
+        .filter(|f| !f.is_empty())
+        .map(str::to_owned)
+        .collect()
+}
+
+/// True when the supervising lode supports feature `name` (e.g. `"check"`).
+pub fn has_feature(name: &str) -> bool {
+    lode_features().iter().any(|f| f == name)
 }
 
 /// The readiness mode in force (`"none"` | `"state"`).

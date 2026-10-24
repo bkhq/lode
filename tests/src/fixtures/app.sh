@@ -7,8 +7,9 @@
 # e2e orchestration is bun+TypeScript. Pure POSIX sh, no jq/python/etc.
 #
 # lode injects (design §10): LODE_ACTIVE_VERSION, LODE_DIR, LODE_INSTANCE,
-# LODE_READINESS. errexit is intentionally NOT used (a trap-driven supervise loop
-# must survive the signal-interrupted `wait`); `set -u` catches unset-var typos.
+# LODE_READINESS, LODE_VERSION, LODE_COMMIT, LODE_FEATURES. errexit is
+# intentionally NOT used (a trap-driven supervise loop must survive the
+# signal-interrupted `wait`); `set -u` catches unset-var typos.
 set -u
 
 # --- baked by the builder (keep these six lines simple: `NAME="value"`) ---
@@ -28,6 +29,12 @@ log() { printf '[app] %s\n' "$*"; }
 case "${1:-}" in
   version | --version | -v)
     printf '%s\n' "$VERSION"
+    exit 0
+    ;;
+  lode-env)
+    # The build info lode injects, one `NAME=value` per line.
+    printf 'LODE_VERSION=%s\nLODE_COMMIT=%s\nLODE_FEATURES=%s\n' \
+      "${LODE_VERSION:-}" "${LODE_COMMIT:-}" "${LODE_FEATURES:-}"
     exit 0
     ;;
   print)
@@ -72,7 +79,7 @@ set_state_field() {
   _v="$2"
   _s="$LODE_DIR/state.json"
   _t="$_s.$_k.$$"
-  if [ -f "$_s" ] && grep -q "\"$_k\"" "$_s"; then
+  if [ -f "$_s" ] && grep -q "\"$_k\"[[:space:]]*:" "$_s"; then
     sed 's/"'"$_k"'"[[:space:]]*:[^,}]*/"'"$_k"'": "'"$_v"'"/' "$_s" > "$_t"
   elif [ -f "$_s" ]; then
     sed '1 s/{/{ "'"$_k"'": "'"$_v"'",/' "$_s" > "$_t"

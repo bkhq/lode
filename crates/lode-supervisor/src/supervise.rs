@@ -164,6 +164,9 @@ pub fn serve_core(
         }
         let target = resolve_target(&cfg)?;
         install::switch_current(&cfg, &target.version)?;
+        state::locked_update_lenient(&cfg.global.dir.join("state.json"), |st| {
+            st.lode = Some(state::LodeInfo::current());
+        });
         if let Some(r) = &reporter.0
             && !std::mem::replace(&mut announced, true)
         {
@@ -2776,6 +2779,19 @@ mod tests {
         );
         assert_eq!(map.get("LODE_DIR").map(String::as_str), Some("/data"));
         assert_eq!(map.get("LODE_INSTANCE").map(String::as_str), Some("inst-9"));
+        // ...and so is lode's own build info.
+        assert_eq!(
+            map.get("LODE_VERSION").map(String::as_str),
+            Some(lode_core::build_info::VERSION)
+        );
+        assert_eq!(
+            map.get("LODE_COMMIT").map(String::as_str),
+            lode_core::build_info::COMMIT
+        );
+        assert_eq!(
+            map.get("LODE_FEATURES").cloned(),
+            Some(lode_core::build_info::FEATURES.join(","))
+        );
     }
 
     #[test]

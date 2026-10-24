@@ -31,6 +31,15 @@ export interface ResourceState {
   error?: string;
 }
 
+/** The lode supervising the app (state.json `lode`). */
+export interface LodeInfo {
+  version: string;
+  /** The git commit lode was built from, when known. */
+  commit?: string;
+  /** App-contract features this lode supports (see {@link hasFeature}). */
+  features: string[];
+}
+
 /** Parsed state.json. lode writes the top group; the app writes target/restartNonce/checkNonce/ready. */
 export interface State {
   current?: string;
@@ -42,6 +51,8 @@ export interface State {
   lastCheck?: string;
   lastError?: string;
   history: HistoryEntry[];
+  /** The lode supervising the app, once its loop has started. */
+  lode?: LodeInfo;
   configGeneration: number;
   /** The highest checkNonce lode has answered (see {@link Lode.requestCheck}). */
   checkedNonce: number;
@@ -58,6 +69,17 @@ export interface State {
   resourceTarget: Record<string, string>;
 }
 
+function toLodeInfo(v: unknown): LodeInfo | undefined {
+  if (!v || typeof v !== "object") return undefined;
+  const o = v as Record<string, unknown>;
+  if (typeof o.version !== "string") return undefined;
+  return {
+    version: o.version,
+    commit: typeof o.commit === "string" ? o.commit : undefined,
+    features: Array.isArray(o.features) ? o.features.filter((f): f is string => typeof f === "string") : [],
+  };
+}
+
 function toState(raw: Record<string, unknown>): State {
   const num = (v: unknown): number | undefined => (typeof v === "number" ? v : undefined);
   const str = (v: unknown): string | undefined => (typeof v === "string" ? v : undefined);
@@ -72,6 +94,7 @@ function toState(raw: Record<string, unknown>): State {
     lastCheck: str(raw.last_check),
     lastError: str(raw.last_error),
     history: Array.isArray(raw.history) ? (raw.history as HistoryEntry[]) : [],
+    lode: toLodeInfo(raw.lode),
     configGeneration: num(raw.config_generation) ?? 0,
     checkedNonce: num(raw.checked_nonce) ?? 0,
     checkError: str(raw.check_error),
@@ -442,12 +465,12 @@ export function readConfig(): string | undefined {
   }
 }
 
-/** This launch's instance id ({pid}-{nanoid}), or "". */
 /** The active path of [[resource]] `name` (LODE_RESOURCE_<NAME>), when installed. */
 export function resourcePath(name: string): string | undefined {
   return env[`LODE_RESOURCE_${name.toUpperCase().replace(/[-.]/g, "_")}`];
 }
 
+/** This launch's instance id ({pid}-{nanoid}), or "". */
 export function instanceId(): string {
   return env.LODE_INSTANCE ?? "";
 }
@@ -455,6 +478,26 @@ export function instanceId(): string {
 /** The version lode launched, or undefined. */
 export function activeVersion(): string | undefined {
   return env.LODE_ACTIVE_VERSION || undefined;
+}
+
+/** The supervising lode's version (LODE_VERSION), or undefined. */
+export function lodeVersion(): string | undefined {
+  return env.LODE_VERSION || undefined;
+}
+
+/** The git commit the supervising lode was built from (LODE_COMMIT), when known. */
+export function lodeCommit(): string | undefined {
+  return env.LODE_COMMIT || undefined;
+}
+
+/** App-contract features the supervising lode supports (LODE_FEATURES). */
+export function lodeFeatures(): string[] {
+  return (env.LODE_FEATURES ?? "").split(",").filter((f) => f.length > 0);
+}
+
+/** True when the supervising lode supports feature `name` (e.g. "check", "staged-cutover"). */
+export function hasFeature(name: string): boolean {
+  return lodeFeatures().includes(name);
 }
 
 /** Readiness mode in force ("none" | "state"), or undefined. */

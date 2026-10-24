@@ -15,6 +15,7 @@ export interface HistoryEntry {
 }
 
 export interface LodeState {
+  lode?: { version: string; commit?: string; features: string[] };
   current?: string;
   last_good?: string;
   available?: string;

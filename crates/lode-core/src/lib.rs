@@ -27,6 +27,7 @@
 //! # }
 //! ```
 
+pub mod build_info;
 pub mod commands;
 pub mod config;
 pub mod download;

@@ -331,7 +331,7 @@ lode.delegation.v1
 
 通信全走 **`state.json`**(双向,各自单写字段 + 原子写 temp+rename;lode 轮询其 mtime):
 
-- **lode 写**:`current`/`last_good`/`available`/`status`/`pid`/`last_check`/`last_error`/`history`/`channel`/`config_generation`/`checked_nonce`/`check_error`。
+- **lode 写**:`current`/`last_good`/`available`/`status`/`pid`/`last_check`/`last_error`/`history`/`channel`/`config_generation`/`checked_nonce`/`check_error`,以及 `lode`(监管它的 lode 的 `version`/`commit`/`features`,循环启动时写入)。
   - **`last_error` 只报告持续性失败**:网络层失败(连接/TLS/重定向/状态码,或响应体没收全)下次检查就会重试,因此要**连续失败 3 次**才写入,且下一次拉取成功即清除——单次失败只记日志,不同步给 app。不会自愈的失败(manifest 格式错、签名不对、磁盘满、新版本起不来)第一次就上报。
 - **app 写**(请求):`target`(想升/降到的版本,或 `"latest"`)、`restart_nonce`(递增=请求重启)、`check_nonce`(递增=立即检查更新;lode 把 `checked_nonce` 升到该值作为应答,检查失败则写 `check_error`,否则更新 `available` —— `off` 或有 `pin` 时也一样,只通告不应用)。
 - **app 拥有** `hold`:设为 `true` 请求 lode **不要**(重新)启动进程 —— 用于必须在 app 起来之前完成的计划维护。lode 报告 `status = held` 并等待(开机时、子进程退出后、以及 `restart_nonce`/`target` 请求期间都不启动),直到它被清除。它只挡"启动";正在运行的子进程绝不会因此被杀。
@@ -521,7 +521,7 @@ lode 发 `SIGTERM` 后,**在 `stop_timeout` 秒内绝不 SIGKILL**,给 app 充�
 | — | — | `report.instance_id` | 主机名 | `service.instance.id` |
 | — | — | `report.attributes`(表) | — | 额外的 OpenTelemetry resource 属性 |
 
-子进程环境:透传宿主环境并**剥离配置类 `LODE_*`**;把 operator 的 `[env]` 表作为**默认值**应用(仅对宿主 env 没有的 key);把运行时目录前置到 PATH;再注入只读自省变量 `LODE_ACTIVE_VERSION`、`LODE_DIR`、`LODE_WORKDIR`(解析后的 cwd)、`LODE_CONFIG`(加载的 `lode.toml` 路径,仅在加载了配置文件时)、`LODE_READINESS`(`none`|`state`)与 `LODE_INSTANCE`(`{pid}-{nanoid}`,本次启动唯一 id,由 app 拼上握手相位,§8)。优先级 低→高:`[env]` 默认值 < 继承的宿主 env < 运行时 PATH 前置 < 注入的 `LODE_*`。
+子进程环境:透传宿主环境并**剥离配置类 `LODE_*`**;把 operator 的 `[env]` 表作为**默认值**应用(仅对宿主 env 没有的 key);把运行时目录前置到 PATH;再注入只读自省变量 `LODE_ACTIVE_VERSION`、`LODE_DIR`、`LODE_WORKDIR`(解析后的 cwd)、`LODE_CONFIG`(加载的 `lode.toml` 路径,仅在加载了配置文件时)、`LODE_READINESS`(`none`|`state`)、`LODE_INSTANCE`(`{pid}-{nanoid}`,本次启动唯一 id,由 app 拼上握手相位,§8),以及 lode 构建信息 `LODE_VERSION`、`LODE_COMMIT`(构建时已知才有)与 `LODE_FEATURES`(逗号分隔的应用契约功能;见[集成文档](integration.zh-CN.md#lode-features))。优先级 低→高:`[env]` 默认值 < 继承的宿主 env < 运行时 PATH 前置 < 注入的 `LODE_*`。
 
 ---
 
