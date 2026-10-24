@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-10-24
+
 ### Added
 
 - **lode tells the app who it is.** The app gets `LODE_VERSION`, `LODE_COMMIT`
@@ -21,9 +23,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   A build takes the commit from `LODE_BUILD_COMMIT`, else from `git` in the
   lode checkout.
 
+### Fixed
+
+- The Rust SDK (`sdks/lode.rs`) builds under edition 2024 too.
+
 ### Security
 
 - Update `ctutils` to 0.4.5 (RUSTSEC-2026-0385).
+- Update `crypto-bigint` to 0.7.7 (RUSTSEC-2026-0387).
 
 ## [0.2.1] - 2026-10-23
 

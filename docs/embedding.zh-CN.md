@@ -18,8 +18,8 @@
 
 ```toml
 [dependencies]
-lode-core       = { git = "https://github.com/bkhq/lode", tag = "v0.2.1" }
-lode-supervisor = { git = "https://github.com/bkhq/lode", tag = "v0.2.1" }   # 仅在监管子进程时需要
+lode-core       = { git = "https://github.com/bkhq/lode", tag = "v0.3.0" }
+lode-supervisor = { git = "https://github.com/bkhq/lode", tag = "v0.3.0" }   # 仅在监管子进程时需要
 ```
 
 ### 进程级副作用需要显式开启
