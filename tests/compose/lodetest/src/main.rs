@@ -427,7 +427,7 @@ fn set_state_field(key: &str, value: &str) {
     };
     let state_path = Path::new(&dir).join("state.json");
     let content = match fs::read_to_string(&state_path) {
-        Ok(existing) if existing.contains(&format!("\"{key}\"")) => {
+        Ok(existing) if key_at(&existing, key).is_some() => {
             replace_field(&existing, key, value).unwrap_or_else(|| minimal(key, value))
         }
         Ok(existing) if !existing.trim().is_empty() => {
@@ -452,8 +452,7 @@ fn minimal(key: &str, value: &str) -> String {
 /// Replace the value of an existing `"key"` (runs to the next `,` or `}`), keeping
 /// every other field byte-for-byte.
 fn replace_field(content: &str, key: &str, value: &str) -> Option<String> {
-    let k = content.find(&format!("\"{key}\""))?;
-    let colon = content[k..].find(':')? + k;
+    let colon = key_at(content, key)?;
     let end_rel = content[colon + 1..].find([',', '}'])?;
     let end = colon + 1 + end_rel;
     let mut out = String::with_capacity(content.len() + value.len());
@@ -461,6 +460,19 @@ fn replace_field(content: &str, key: &str, value: &str) -> Option<String> {
     out.push_str(&format!(" \"{value}\""));
     out.push_str(&content[end..]);
     Some(out)
+}
+
+/// Byte offset of the `:` after `"key"` used as an object key (not the same
+/// text as a string value, e.g. `"target"` in lode's `features` list).
+fn key_at(content: &str, key: &str) -> Option<usize> {
+    let needle = format!("\"{key}\"");
+    content.match_indices(&needle).find_map(|(at, _)| {
+        let rest = &content[at + needle.len()..];
+        let gap = rest.len() - rest.trim_start().len();
+        rest.trim_start()
+            .starts_with(':')
+            .then_some(at + needle.len() + gap)
+    })
 }
 
 /// Insert `"key": "value"` into an existing JSON object that lacks the key.
@@ -476,4 +488,18 @@ fn inject_field(content: &str, key: &str, value: &str) -> Option<String> {
     ));
     out.push_str(after);
     Some(out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn replace_field_skips_the_key_name_used_as_a_value() {
+        let state = "{\n  \"lode\": { \"features\": [\"target\", \"check\"] },\n  \"target\": null\n}\n";
+        let out = replace_field(state, "target", "0.0.5").unwrap();
+        assert!(out.contains("\"features\": [\"target\", \"check\"]"), "{out}");
+        assert!(out.contains("\"target\": \"0.0.5\""), "{out}");
+        assert!(key_at("{\"lode\": {\"features\": [\"target\"]}}", "target").is_none());
+    }
 }
